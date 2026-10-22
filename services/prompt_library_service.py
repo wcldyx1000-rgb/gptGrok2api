@@ -11,7 +11,7 @@ from threading import RLock
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-from curl_cffi import requests as curl_requests
+from utils.remote_image import fetch_public_text
 
 from services.config import BASE_DIR, DATA_DIR
 from services.json_file import read_json_file, write_json_file
@@ -35,6 +35,7 @@ PROMPT_SOURCE_TIMEOUT = 8
 PROMPT_SOURCE_MAX_BYTES = 4 * 1024 * 1024
 PROMPT_SOURCE_FETCH_WORKERS = 4
 PROMPT_SOURCE_FETCH_ATTEMPTS = 2
+PROMPT_SOURCE_MAX_REDIRECTS = 3
 PROMPT_COMPOSE_MODES = {"image", "chat", "search"}
 PROMPT_SOURCE_FALLBACK_URLS: dict[str, list[str]] = {}
 
@@ -522,19 +523,16 @@ class PromptLibraryService:
             for fetch_url in _source_fetch_urls(source):
                 for _attempt in range(PROMPT_SOURCE_FETCH_ATTEMPTS):
                     try:
-                        response = curl_requests.get(
+                        # SSRF 防护：逐跳公网校验、连接固定、流式限长（超限即中止，不整体下载）。
+                        fetched = fetch_public_text(
                             fetch_url,
-                            headers={
-                                "Accept": "application/json,text/markdown,text/html,text/plain,*/*",
-                                "User-Agent": "chatgpt2api-prompt-library/3.0",
-                            },
+                            max_bytes=PROMPT_SOURCE_MAX_BYTES,
                             timeout=PROMPT_SOURCE_TIMEOUT,
+                            user_agent="chatgpt2api-prompt-library/3.0",
+                            max_redirects=PROMPT_SOURCE_MAX_REDIRECTS,
                         )
-                        response.raise_for_status()
-                        content_type = response.headers.get("content-type", "")
-                        payload = response.content[: PROMPT_SOURCE_MAX_BYTES + 1]
-                        if len(payload) > PROMPT_SOURCE_MAX_BYTES:
-                            raise ValueError("prompt source too large")
+                        content_type = fetched.content_type
+                        payload = fetched.data
                         source_for_items = {**source, "url": fetch_url}
                         adapter_name, raw_items = parse_prompt_source_payload(payload, source_for_items, content_type=content_type)
                         items = sorted(

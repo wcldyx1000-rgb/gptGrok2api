@@ -86,7 +86,7 @@ async def verify_admin_key(
     if token is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing authentication token.")
 
-    if not hmac.compare_digest(token, key):
+    if not hmac.compare_digest(token.encode("utf-8"), key.encode("utf-8")):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid authentication token.")
 
 
@@ -105,7 +105,7 @@ async def verify_webui_key(
     if token is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing authentication token.")
 
-    if not hmac.compare_digest(token, webui_key):
+    if not hmac.compare_digest(token.encode("utf-8"), webui_key.encode("utf-8")):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid authentication token.")
 
 __all__ = [

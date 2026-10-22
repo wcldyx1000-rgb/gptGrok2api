@@ -26,7 +26,7 @@ class GrokDispatchValidationTest(unittest.IsolatedAsyncioTestCase):
 
 
 class GrokDispatchErrorResponseTest(unittest.TestCase):
-    def test_invalid_root_grok_payload_returns_openai_422(self) -> None:
+    def test_invalid_root_grok_payload_returns_openai_400(self) -> None:
         app = FastAPI()
         install_exception_handlers(app)
 
@@ -36,7 +36,7 @@ class GrokDispatchErrorResponseTest(unittest.TestCase):
 
         response = TestClient(app).post("/v1/chat/completions")
 
-        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
 
 

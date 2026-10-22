@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 from pathlib import Path
 from threading import Event, Thread
 
@@ -20,9 +21,14 @@ def extract_bearer_token(authorization: str | None) -> str:
     return value.strip()
 
 
+def secure_equals(left: object, right: object) -> bool:
+    """常量时间比较（统一转 bytes，避免非 ASCII 抛 TypeError）。"""
+    return hmac.compare_digest(str(left or "").encode("utf-8"), str(right or "").encode("utf-8"))
+
+
 def _legacy_admin_identity(token: str) -> dict[str, object] | None:
     auth_key = str(config.auth_key or "").strip()
-    if auth_key and token == auth_key:
+    if auth_key and secure_equals(token, auth_key):
         return {"id": "admin", "name": "管理员", "role": "admin"}
     return None
 
@@ -105,7 +111,9 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
             try:
-                limited_tokens = account_service.list_limited_tokens()
+                # 限流号到恢复时间只在本地乐观放回（零请求），由下一次真实选号预检确认；不再每周期远程复查。
+                account_service.release_recovered_limited_accounts()
+                limited_tokens: list[str] = []
                 normal_tokens = account_service.list_normal_tokens()
                 expiring_tokens = account_service.list_expiring_access_tokens()
                 keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()

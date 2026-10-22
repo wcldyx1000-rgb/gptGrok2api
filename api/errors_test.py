@@ -29,6 +29,14 @@ class EmbeddedGrokErrorCompatibilityTest(unittest.TestCase):
         async def grok_validation_error(_: _RequiredBody):
             return {"ok": True}
 
+        @app.post("/v1/images/generations")
+        async def v1_validation_error(_: _RequiredBody):
+            return {"ok": True}
+
+        @app.post("/api/anything")
+        async def admin_validation_error(_: _RequiredBody):
+            return {"ok": True}
+
         @app.post("/grok/v1/messages")
         async def grok_anthropic_app_error(_: _RequiredBody):
             raise ValidationError("invalid message", param="messages")
@@ -48,8 +56,25 @@ class EmbeddedGrokErrorCompatibilityTest(unittest.TestCase):
     def test_grok_validation_errors_use_openai_shape(self) -> None:
         response = self.client.post("/grok/v1/images/generations", json={})
 
-        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
+        self.assertEqual(response.json()["error"]["param"], "value")
+        self.assertEqual(response.json()["error"]["code"], "missing_required_parameter")
+
+    def test_admin_validation_errors_keep_422(self) -> None:
+        response = self.client.post("/api/anything", json={})
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("detail", response.json())
+
+    def test_v1_validation_errors_return_openai_400(self) -> None:
+        response = self.client.post("/v1/images/generations", json={})
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()["error"]
+        self.assertEqual(body["type"], "invalid_request_error")
+        self.assertEqual(body["param"], "value")
+        self.assertIn("message", body)
 
     def test_grok_messages_app_errors_use_anthropic_shape(self) -> None:
         response = self.client.post("/grok/v1/messages", json={"value": "ok"})
@@ -62,7 +87,7 @@ class EmbeddedGrokErrorCompatibilityTest(unittest.TestCase):
     def test_grok_messages_validation_errors_use_anthropic_shape(self) -> None:
         response = self.client.post("/grok/v1/messages", json={})
 
-        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["type"], "error")
         self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
 

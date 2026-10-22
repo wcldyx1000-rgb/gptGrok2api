@@ -62,6 +62,112 @@ class ConfigPatchRequest(RootModel[dict[str, Any]]):
     """Loose config patch payload with explicit root typing."""
 
 
+# ---------------------------------------------------------------------------
+# Sensitive config redaction (GET returns blanks + has_* markers; POST keeps
+# stored secrets when the field is left empty, clear_* removes them).
+# ---------------------------------------------------------------------------
+
+_SECRET_SCALAR_PATHS = (
+    "app.app_key",
+    "app.api_key",
+    "app.webui_key",
+    "proxy.cf_cookies",
+    "proxy.cf_clearance",
+    "proxy.clearance.cf_cookies",
+    "proxy.clearance.cf_clearance",
+)
+# URL-ish fields: only treated as secret when they embed credentials.
+_CREDENTIAL_URL_PATHS = (
+    "proxy.egress.proxy_url",
+    "proxy.egress.resource_proxy_url",
+    "proxy.egress.proxy_pool",
+    "proxy.egress.resource_proxy_pool",
+    "proxy.proxy_url",
+    "proxy.base_proxy_url",
+    "proxy.asset_proxy_url",
+)
+_ALL_SECRET_PATHS = _SECRET_SCALAR_PATHS + _CREDENTIAL_URL_PATHS
+_CREDENTIAL_URL_RE = re.compile(r"://[^/\s@]*@")
+
+
+def _is_empty_secret(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple)):
+        return not any(not _is_empty_secret(v) for v in value)
+    return False
+
+
+def _value_is_secret(path: str, value: Any) -> bool:
+    if _is_empty_secret(value):
+        return False
+    if path in _SECRET_SCALAR_PATHS:
+        return True
+    if isinstance(value, (list, tuple)):
+        return any(_value_is_secret(path, v) for v in value)
+    return bool(_CREDENTIAL_URL_RE.search(str(value)))
+
+
+def _split_path(path: str) -> tuple[list[str], str]:
+    parts = path.split(".")
+    return parts[:-1], parts[-1]
+
+
+def _walk(data: Any, parents: list[str]) -> dict[str, Any] | None:
+    node = data
+    for key in parents:
+        if not isinstance(node, dict) or not isinstance(node.get(key), dict):
+            return None
+        node = node[key]
+    return node if isinstance(node, dict) else None
+
+
+def _get_path(data: Any, path: str) -> Any:
+    parents, leaf = _split_path(path)
+    node = _walk(data, parents)
+    return None if node is None else node.get(leaf)
+
+
+def redact_config_for_admin(raw: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy *raw* with secrets blanked and ``has_<field>`` flags added."""
+    import copy
+
+    out = copy.deepcopy(raw)
+    for path in _ALL_SECRET_PATHS:
+        parents, leaf = _split_path(path)
+        node = _walk(out, parents)
+        if node is None or leaf not in node:
+            continue
+        if _value_is_secret(path, node[leaf]):
+            node[leaf] = [] if isinstance(node[leaf], list) else ""
+            node[f"has_{leaf}"] = True
+        elif path in _SECRET_SCALAR_PATHS:
+            node[f"has_{leaf}"] = False
+    return out
+
+
+def merge_config_patch_secrets(patch: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Drop blank secret fields (keep stored value); honor ``clear_<field>``."""
+    import copy
+
+    out = copy.deepcopy(patch)
+    for path in _ALL_SECRET_PATHS:
+        parents, leaf = _split_path(path)
+        node = _walk(out, parents)
+        if node is None:
+            continue
+        clear = bool(node.pop(f"clear_{leaf}", False))
+        node.pop(f"has_{leaf}", None)
+        if clear:
+            node[leaf] = [] if isinstance(_get_path(current, path), list) else ""
+        elif leaf in node and _is_empty_secret(node[leaf]):
+            if _value_is_secret(path, _get_path(current, path)):
+                node.pop(leaf)
+    return out
+
+
 def _sanitize_text(value: Any, *, remove_all_spaces: bool = False) -> str:
     text = "" if value is None else str(value)
     text = text.translate(_CFG_CHAR_REPLACEMENTS)
@@ -185,7 +291,7 @@ async def admin_verify():
 @router.get("/config", tags=[_TAG_ADMIN_SYSTEM])
 async def get_config_endpoint():
     return Response(
-        content=orjson.dumps(config.raw()),
+        content=orjson.dumps(redact_config_for_admin(config.raw())),
         media_type="application/json",
     )
 
@@ -194,7 +300,8 @@ async def get_config_endpoint():
 async def update_config(req: ConfigPatchRequest):
     from app.control.account.runtime import reconcile_refresh_runtime
 
-    patch = _sanitize_proxy_config(req.root)
+    patch = merge_config_patch_secrets(req.root, config.raw())
+    patch = _sanitize_proxy_config(patch)
     _ensure_runtime_patch_allowed(patch)
     cache_local_changed = _patch_touches_prefix(patch, "cache.local")
     await config.update(patch)

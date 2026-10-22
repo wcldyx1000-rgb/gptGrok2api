@@ -33,6 +33,17 @@ def _compatible_error_response(
     return openai_error_response(detail, status_code, headers=headers)
 
 
+def _validation_param_and_code(errors: list[dict]) -> tuple[str | None, str]:
+    """取第一条校验错误的字段路径（去掉 body/query 前缀）和 OpenAI 风格 code。"""
+    for item in errors:
+        if not isinstance(item, dict):
+            continue
+        loc = [str(part) for part in item.get("loc", ()) if part not in ("body", "query", "path", "header")]
+        code = "missing_required_parameter" if item.get("type") == "missing" else "invalid_value"
+        return (".".join(loc) or None), code
+    return None, "invalid_value"
+
+
 def install_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
@@ -47,5 +58,12 @@ def install_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
         if _is_openai_compatible_path(request.url.path):
-            return _compatible_error_response(request, exc.errors(), 422)
+            # OpenAI 兼容路由的参数校验失败统一为 400 invalid_request_error（管理 API 仍保持 422）。
+            errors = exc.errors()
+            if _is_anthropic_messages_path(request.url.path):
+                return anthropic_error_response(errors, 400)
+            param, code = _validation_param_and_code(errors)
+            return openai_error_response(
+                errors, 400, error_type="invalid_request_error", code=code, param=param
+            )
         return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
