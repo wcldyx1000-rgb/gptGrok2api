@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,33 +12,38 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from api.support import require_admin, require_identity, resolve_image_base_url
+from api.support import extract_bearer_token, require_admin, require_identity, resolve_image_base_url
 from app.platform.update_check import get_latest_release_info
 from services.account_service import account_service
 from services.backup_service import BackupError, backup_service
-from services.config import config
+from services.login_throttle import client_key, login_throttle
+from services.config import SETTINGS_UPDATE_KEYS, SettingsRevisionConflictError, config
 from services.image_service import (
-    cleanup_image_retention,
     compress_images,
     delete_images,
-    delete_to_target,
     download_images_zip,
     get_image_download_response,
     get_image_response,
     get_thumbnail_response,
     list_images,
-    preview_image_retention_cleanup,
     storage_stats,
 )
+from services.retention_cleanup_service import retention_cleanup_coordinator
+from services.runtime_environment_service import snapshot as runtime_environment_snapshot
+from services.update_contracts import UpdateStatusView, UpdateTaskView
+from services.update_service import UpdateInstallError, update_service
+from services.update_status_service import update_status_service
+from services.genbox_push_service import GenBoxPushError, push_gallery_image
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
-from services.dashboard_metrics_service import dashboard_metrics_service
-from services.log_service import LOG_TYPE_CALL, log_service
+from services.dashboard_metrics_service import dashboard_metrics_service, rebuild_dashboard_metrics
+from services.log_service import LOG_TYPE_CALL, compact_log_page, log_service
 from services.model_catalog_service import get_model_catalog
-from services.proxy_service import proxy_settings, test_clearance, test_proxy, test_proxy_list_sample
+from services.proxy_service import import_proxy_nodes, proxy_settings, test_clearance, test_proxy, test_proxy_list_sample
 from services.provider_account_stats import get_provider_account_stats
 from services.realtime_monitor_service import realtime_monitor_service
 from services.runtime_log_service import list_runtime_logs
+from utils.locale_env import normalize_locale_fields
 from utils.timezone import beijing_now, parse_to_beijing_naive
 
 
@@ -47,43 +53,57 @@ CHANGELOG_PATH = PROJECT_ROOT / "CHANGELOG.md"
 
 class SettingsUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
+    # 乐观并发：客户端读取设置时拿到的 revision；不带则保持旧行为（后写覆盖）。
+    revision: int | None = None
 
 
-SETTINGS_UPDATE_KEYS = {
-    "proxy",
-    "fallback_proxy",
-    "proxy_runtime",
-    "base_url",
-    "refresh_account_interval_minute",
-    "image_retention_days",
-    "log_retention_days",
-    "image_poll_timeout_secs",
-    "image_stream_timeout_secs",
-    "image_poll_interval_secs",
-    "image_poll_initial_wait_secs",
-    "image_account_concurrency",
-    "image_parallel_generation",
-    "image_remove_conversation_after_result",
-    "image_error_friendly_enabled",
-    "image_error_messages",
-    "image_settle_enabled",
-    "image_check_before_hit_enabled",
-    "image_settle_secs",
-    "image_timeout_retry_secs",
-    "auto_remove_invalid_accounts",
-    "auto_remove_rate_limited_accounts",
-    "log_levels",
-    "global_system_prompt",
-    "sensitive_words",
-    "ai_review",
-    "image_generation",
-    "quota_limits",
-    "runtime_capacity",
-    "image_storage",
-    "backup",
-    "chat_completion_cache",
-    "third_party_apps",
-}
+def _settings_read_only_fields() -> dict[str, dict[str, str]]:
+    """被环境变量覆盖、保存后不会生效的设置项（前端据此置灰并提示）。"""
+    fields: dict[str, dict[str, str]] = {}
+    if str(os.getenv("CHATGPT2API_BASE_URL") or "").strip():
+        fields["base_url"] = {
+            "source": "environment",
+            "env": "CHATGPT2API_BASE_URL",
+            "message": "接口地址由环境变量 CHATGPT2API_BASE_URL 指定，在此修改不会生效。",
+        }
+    return fields
+
+
+class DirectLocaleInput(BaseModel):
+    timezone: str = ""
+    language: str = ""
+
+
+class ProxyDefaultsRequest(BaseModel):
+    """None 表示不修改该项；direct_locale 两项都留空表示清除。"""
+
+    proxy: str | None = None
+    fallback_proxy: str | None = None
+    direct_locale: DirectLocaleInput | None = None
+
+
+def _direct_locale_view() -> dict[str, Any] | None:
+    from utils.locale_env import LocaleEnv
+
+    saved = config.get_direct_locale()
+    locale = LocaleEnv.from_config(saved)
+    if locale is None:
+        return None
+    return {
+        "timezone": locale.timezone,
+        "language": locale.language,
+        "timezone_offset_min": locale.offset_min(),
+    }
+
+
+def _proxy_view_payload() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "revision": config.revision,
+        "proxy": config.mask_public(config.get_proxy_settings()),
+        "fallback_proxy": config.mask_public(config.get_proxy_fallback_settings()),
+        "direct_locale": _direct_locale_view(),
+    }
 
 
 class ProxyTestRequest(BaseModel):
@@ -92,6 +112,11 @@ class ProxyTestRequest(BaseModel):
 
 class ProxySampleTestRequest(BaseModel):
     urls: str = Field(default="", max_length=500_000)
+
+
+class ProxyNodeImportRequest(BaseModel):
+    text: str = Field(default="", max_length=1_000_000)
+    existing_urls: list[str] = Field(default_factory=list, max_length=10_000)
 
 
 class ClearanceTestRequest(BaseModel):
@@ -105,6 +130,8 @@ class ProxyProfileRequest(BaseModel):
     no_proxy: str = ""
     enabled: bool = True
     notes: str = ""
+    timezone: str = ""
+    language: str = ""
     create_only: bool = False
 
 
@@ -136,6 +163,12 @@ class ImageDeleteRequest(BaseModel):
     end_date: str = ""
     all_matching: bool = False
 
+class GenBoxPushRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=1024)
+
+
 class ImageDownloadRequest(BaseModel):
     paths: list[str]
 
@@ -150,8 +183,15 @@ class BackupDeleteRequest(BaseModel):
 
 
 class RetentionCleanupRequest(BaseModel):
+    log_retention_hours: int | None = None
+    image_retention_hours: int | None = None
+    # 兼容旧前端：按天传入时换算为小时。
     log_retention_days: int | None = None
     image_retention_days: int | None = None
+
+
+class SystemUpdateRequest(BaseModel):
+    confirm: bool = False
 
 
 class AccountCleanupRequest(BaseModel):
@@ -235,7 +275,7 @@ def _slug_id(value: object) -> str:
 
 
 def _config_dict_list(key: str) -> list[dict[str, Any]]:
-    raw = config.get().get(key)
+    raw = config.get_internal().get(key)
     if not isinstance(raw, list):
         return []
     return [dict(item) for item in raw if isinstance(item, dict)]
@@ -249,21 +289,21 @@ def _config_write_error_message(exc: OSError) -> str:
     )
 
 
+def _request_hours(hours: int | None, days: int | None) -> int | None:
+    if hours:
+        return int(hours)
+    if days:
+        return int(days) * 24
+    return None
+
+
 def _retention_cleanup_payload(body: RetentionCleanupRequest | None = None, *, dry_run: bool) -> dict[str, Any]:
     body = body or RetentionCleanupRequest()
-    log_days = body.log_retention_days or config.log_retention_days
-    image_days = body.image_retention_days or config.image_retention_days
-    logs = log_service.preview_cleanup_old(log_days) if dry_run else log_service.cleanup_old(log_days)
-    images = preview_image_retention_cleanup(image_days) if dry_run else cleanup_image_retention(image_days)
-    total_removed = int(logs.get("removed") or 0) + int(images.get("removed") or 0)
-    total_size = int(logs.get("removed_size_bytes") or 0) + int(images.get("removed_size_bytes") or 0)
-    return {
-        "dry_run": dry_run,
-        "logs": {**logs, "retention_days": int(log_days)},
-        "images": {**images, "retention_days": int(image_days)},
-        "total_removed": total_removed,
-        "total_size_bytes": total_size,
-    }
+    return retention_cleanup_coordinator.run_retention(
+        log_retention_hours=_request_hours(body.log_retention_hours, body.log_retention_days),
+        image_retention_hours=_request_hours(body.image_retention_hours, body.image_retention_days),
+        dry_run=dry_run,
+    )
 
 
 def _account_cleanup_payload(body: AccountCleanupRequest | None = None, *, dry_run: bool) -> dict[str, Any]:
@@ -292,11 +332,11 @@ def _proxy_group_id(value: object) -> str:
 
 
 def _proxy_profiles_payload() -> dict[str, Any]:
-    return {"profiles": _config_dict_list("proxy_profiles")}
+    return config.mask_public({"profiles": _config_dict_list("proxy_profiles")})
 
 
 def _proxy_groups_payload() -> dict[str, Any]:
-    return {"groups": _config_dict_list("proxy_groups")}
+    return config.mask_public({"groups": _config_dict_list("proxy_groups")})
 
 
 def _upsert_proxy_profile(body: ProxyProfileRequest) -> dict[str, Any]:
@@ -307,6 +347,7 @@ def _upsert_proxy_profile(body: ProxyProfileRequest) -> dict[str, Any]:
     exists = any(profile.get("id") == profile_id for profile in profiles)
     if body.create_only and exists:
         raise ValueError("proxy profile already exists")
+    locale_timezone, locale_language = normalize_locale_fields(body.timezone, body.language)
     item = {
         "id": profile_id,
         "name": body.name or profile_id,
@@ -314,12 +355,14 @@ def _upsert_proxy_profile(body: ProxyProfileRequest) -> dict[str, Any]:
         "no_proxy": body.no_proxy,
         "enabled": body.enabled,
         "notes": body.notes,
+        "timezone": locale_timezone,
+        "language": locale_language,
     }
     next_profiles = [profile for profile in profiles if profile.get("id") != profile_id]
     next_profiles.append(item)
     updated = config.update({"proxy_profiles": next_profiles})
     profiles = [dict(profile) for profile in updated.get("proxy_profiles", []) if isinstance(profile, dict)]
-    return {"profile": item, "profiles": profiles}
+    return {"profile": config.mask_public(item), "profiles": profiles}
 
 
 def _upsert_proxy_group(body: ProxyGroupRequest) -> dict[str, Any]:
@@ -335,6 +378,10 @@ def _upsert_proxy_group(body: ProxyGroupRequest) -> dict[str, Any]:
         if not isinstance(node, dict):
             continue
         node_id = _slug_id(node.get("id") or node.get("name") or f"node-{index + 1}") or f"node-{index + 1}"
+        try:
+            locale_timezone, locale_language = normalize_locale_fields(node.get("timezone"), node.get("language"))
+        except ValueError as exc:
+            raise ValueError(f"proxy node {node_id}: {exc}") from exc
         nodes.append(
             {
                 **node,
@@ -342,6 +389,8 @@ def _upsert_proxy_group(body: ProxyGroupRequest) -> dict[str, Any]:
                 "name": _clean_text(node.get("name")) or node_id,
                 "url": _clean_text(node.get("url")),
                 "enabled": bool(node.get("enabled", True)),
+                "timezone": locale_timezone,
+                "language": locale_language,
                 "image_concurrency_limit": _coerce_proxy_node_image_concurrency_limit(
                     node.get("image_concurrency_limit")
                     if node.get("image_concurrency_limit") is not None
@@ -362,7 +411,7 @@ def _upsert_proxy_group(body: ProxyGroupRequest) -> dict[str, Any]:
     next_groups.append(item)
     updated = config.update({"proxy_groups": next_groups})
     groups = [dict(group) for group in updated.get("proxy_groups", []) if isinstance(group, dict)]
-    return {"group": item, "groups": groups}
+    return {"group": config.mask_public(item), "groups": groups}
 
 
 def _resolve_profile_proxy(profile_id: str) -> str:
@@ -394,6 +443,15 @@ def _parse_log_time(value: object) -> datetime | None:
 
 def _beijing_now_naive() -> datetime:
     return beijing_now().replace(tzinfo=None)
+
+
+def _recent_failure_rows(limit: int = 10) -> list[dict[str, Any]]:
+    """最近失败的调用（旧 /api/dashboard 的 recent_failures），只按失败状态取 limit 条，不扫全量日志。"""
+    page = log_service.list_page(type=LOG_TYPE_CALL, status="failed", limit=limit, offset=0)
+    items = page.get("items") if isinstance(page, dict) else None
+    if not isinstance(items, list):
+        return []
+    return _dashboard_log_summary(items, time_range="24h").get("recent_failures", [])
 
 
 def _dashboard_log_summary(items: list[dict[str, Any]], *, time_range: str) -> dict[str, Any]:
@@ -522,12 +580,40 @@ def _dashboard_log_summary(items: list[dict[str, Any]], *, time_range: str) -> d
     }
 
 
+def _authenticate_with_throttle(
+    request: Request,
+    authorization: str | None,
+    *,
+    count_anonymous: bool = True,
+) -> dict[str, object]:
+    """登录入口的密钥校验：按来源 IP 做失败节流（连续失败超限返回 429 + Retry-After，成功后清零）。
+
+    只用于 /auth/login 与 /auth/status；普通 API 的 Bearer 校验不经过这里。
+    """
+    key = client_key(request)
+    wait = login_throttle.retry_after(key)
+    if wait:
+        raise HTTPException(
+            status_code=429,
+            detail={"error": "密钥错误次数过多，请稍后再试", "code": "too_many_login_attempts"},
+            headers={"Retry-After": str(wait)},
+        )
+    try:
+        identity = require_identity(authorization)
+    except HTTPException as exc:
+        if exc.status_code == 401 and (count_anonymous or extract_bearer_token(authorization)):
+            login_throttle.record_failure(key)
+        raise
+    login_throttle.clear(key)
+    return identity
+
+
 def create_router(app_version: str) -> APIRouter:
     router = APIRouter()
 
     @router.post("/auth/login")
-    async def login(authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
+    async def login(request: Request, authorization: str | None = Header(default=None)):
+        identity = _authenticate_with_throttle(request, authorization)
         return {
             "ok": True,
             "authenticated": True,
@@ -538,10 +624,12 @@ def create_router(app_version: str) -> APIRouter:
         }
 
     @router.get("/auth/status")
-    async def auth_status(authorization: str | None = Header(default=None)):
+    async def auth_status(request: Request, authorization: str | None = Header(default=None)):
         try:
-            identity = require_identity(authorization)
-        except HTTPException:
+            identity = _authenticate_with_throttle(request, authorization, count_anonymous=False)
+        except HTTPException as exc:
+            if exc.status_code == 429:
+                raise
             return {
                 "ok": False,
                 "authenticated": False,
@@ -559,6 +647,35 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/version")
     async def get_version():
         return {"version": app_version}
+
+    @router.get("/api/system/runtime")
+    async def get_runtime_environment(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(runtime_environment_snapshot)
+
+    @router.get("/api/system/update-status", response_model=UpdateStatusView)
+    async def get_update_status(
+        force: bool = Query(default=False),
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        return await run_in_threadpool(update_status_service.view, app_version, force=force)
+
+    @router.get("/api/system/update-task", response_model=UpdateTaskView)
+    async def get_update_task(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return update_service.view(app_version)
+
+    @router.post("/api/system/update", response_model=UpdateTaskView, status_code=202)
+    async def start_update(body: SystemUpdateRequest, authorization: str | None = Header(default=None)):
+        """One-click online update. Requires an explicit confirmation flag; never runs automatically."""
+        require_admin(authorization)
+        if not body.confirm:
+            raise HTTPException(status_code=400, detail={"error": "更新需要先确认版本、耗时与重启影响。"})
+        try:
+            return update_service.start(app_version)
+        except UpdateInstallError as exc:
+            raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
     @router.get("/meta/update", include_in_schema=False)
     async def get_update_meta(force: bool = Query(False)):
@@ -585,26 +702,75 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/settings")
     async def get_settings(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"config": config.get()}
+        return {
+            "config": config.get(),
+            "revision": config.revision,
+            "read_only": _settings_read_only_fields(),
+        }
+
+    @router.get("/api/settings/revision")
+    async def get_settings_revision(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"revision": config.revision}
 
     @router.get("/api/third-party-apps")
     async def get_third_party_apps(authorization: str | None = Header(default=None)):
         require_identity(authorization)
-        return {"third_party_apps": config.get_third_party_apps_settings()}
+        return {
+            "third_party_apps": config.get_third_party_apps_settings(),
+            "console_request_timeout_secs": config.console_request_timeout_secs,
+            "api_base_url": config.base_url,
+        }
 
     @router.post("/api/settings")
     async def save_settings(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
             incoming = body.model_dump(mode="python")
+            expected_revision = incoming.pop("revision", None)
             updates = {key: value for key, value in incoming.items() if key in SETTINGS_UPDATE_KEYS}
+            ignored_keys = sorted(str(key) for key in incoming if key not in SETTINGS_UPDATE_KEYS)
+            read_only = _settings_read_only_fields()
             if not updates:
-                return {"config": config.get()}
-            return {"config": config.update(updates)}
+                if expected_revision is not None and expected_revision != config.revision:
+                    raise SettingsRevisionConflictError(config.revision, expected_revision)
+                return {
+                    "config": config.get(),
+                    "revision": config.revision,
+                    "ignored_keys": ignored_keys,
+                    "read_only": read_only,
+                }
+            result = config.update(updates, expected_revision=expected_revision)
+            if updates.keys() & {
+                "image_retention_hours", "log_retention_hours", "image_min_free_mb",
+                "image_retention_days", "log_retention_days",
+            }:
+                retention_cleanup_coordinator.notify_retention_change()
+            return {
+                "config": result,
+                "revision": config.revision,
+                "ignored_keys": ignored_keys,
+                "read_only": read_only,
+                "changed_read_only_keys": sorted(set(updates) & set(read_only)),
+            }
+        except SettingsRevisionConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": str(exc),
+                    "code": "settings_revision_conflict",
+                    "revision": exc.current_revision,
+                },
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         except OSError as exc:
             raise HTTPException(status_code=500, detail={"error": _config_write_error_message(exc)}) from exc
+
+    @router.get("/api/settings/retention-cleanup/status")
+    async def retention_cleanup_status(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return retention_cleanup_coordinator.runtime_status()
 
     @router.post("/api/settings/retention-cleanup/preview")
     async def preview_retention_cleanup(body: RetentionCleanupRequest, authorization: str | None = Header(default=None)):
@@ -628,7 +794,8 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/api/model-catalog")
     async def model_catalog(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        # user 密钥也可读取（Studio 用普通用户密钥时需要模型目录）；目录不含任何凭据。
+        require_identity(authorization)
         return await run_in_threadpool(get_model_catalog)
 
     @router.get("/api/images")
@@ -636,7 +803,8 @@ def create_router(app_version: str) -> APIRouter:
         request: Request,
         start_date: str = "",
         end_date: str = "",
-        limit: int = Query(default=0, ge=0, le=500),
+        # 默认分页 60 条；limit=0 返回全量仅为遗留兼容，大图库下代价高，新调用方应分页。
+        limit: int = Query(default=60, ge=0, le=500),
         offset: int = Query(default=0, ge=0),
         media_type: str = Query(default="all"),
         tag: str = Query(default=""),
@@ -658,21 +826,42 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
     async def get_image(image_path: str):
-        return get_image_response(image_path)
+        # WebDAV 读取和文件系统检查都是阻塞操作，放到线程池里执行。
+        return await run_in_threadpool(get_image_response, image_path)
 
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
-        return get_thumbnail_response(image_path)
+        return await run_in_threadpool(get_thumbnail_response, image_path)
+
+    @router.post("/api/images/genbox-push")
+    async def push_image_to_genbox(
+        body: GenBoxPushRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(push_gallery_image, body.path)
+        except GenBoxPushError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": exc.message},
+            ) from exc
 
     @router.post("/api/images/delete")
     async def delete_images_endpoint(body: ImageDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return delete_images(body.paths, start_date=body.start_date.strip(), end_date=body.end_date.strip(), all_matching=body.all_matching)
+        return await run_in_threadpool(
+            delete_images,
+            body.paths,
+            start_date=body.start_date.strip(),
+            end_date=body.end_date.strip(),
+            all_matching=body.all_matching,
+        )
 
     @router.post("/api/images/download")
     async def download_images_endpoint(body: ImageDownloadRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        buf = download_images_zip(body.paths)
+        buf = await run_in_threadpool(download_images_zip, body.paths)
         return StreamingResponse(
             buf,
             media_type="application/zip",
@@ -682,7 +871,7 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/images/download/{image_path:path}")
     async def download_single_image_endpoint(image_path: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return get_image_download_response(image_path)
+        return await run_in_threadpool(get_image_download_response, image_path)
 
     @router.get("/api/logs")
     async def get_logs(
@@ -695,12 +884,13 @@ def create_router(app_version: str) -> APIRouter:
         account: str = "",
         conversation_id: str = "",
         search: str = "",
-        limit: int = Query(default=200, ge=1, le=20000),
+        limit: int = Query(default=200, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
+        compact: bool = Query(default=False),
         authorization: str | None = Header(default=None),
     ):
         require_admin(authorization)
-        return await run_in_threadpool(
+        page = await run_in_threadpool(
             log_service.list_page,
             type=type.strip(),
             start_date=start_date.strip(),
@@ -714,6 +904,15 @@ def create_router(app_version: str) -> APIRouter:
             limit=limit,
             offset=offset,
         )
+        return compact_log_page(page) if compact else page
+
+    @router.get("/api/logs/{log_id}")
+    async def get_log_detail(log_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        item = await run_in_threadpool(log_service.get_detail, log_id.strip())
+        if item is None:
+            raise HTTPException(status_code=404, detail={"error": "log not found"})
+        return {"item": item}
 
     @router.post("/api/logs/delete")
     async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):
@@ -757,13 +956,52 @@ def create_router(app_version: str) -> APIRouter:
             raise HTTPException(status_code=404, detail={"error": result.get("error") or "request not found"})
         return result
 
+    @router.get("/api/proxy/view")
+    async def get_proxy_view(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return _proxy_view_payload()
+
+    @router.post("/api/proxy/defaults")
+    async def save_proxy_defaults(body: ProxyDefaultsRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        patch: dict[str, Any] = {}
+        if body.proxy is not None:
+            patch["proxy"] = (body.proxy or "").strip()
+        if body.fallback_proxy is not None:
+            patch["fallback_proxy"] = (body.fallback_proxy or "").strip()
+        if body.direct_locale is not None:
+            from utils.locale_env import normalize_locale_fields
+
+            try:
+                timezone_value, language_value = normalize_locale_fields(
+                    body.direct_locale.timezone, body.direct_locale.language
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "直连出口地区环境需要同时填写有效的时区和语言，或都留空"},
+                ) from exc
+            patch["direct_locale"] = (
+                {"timezone": timezone_value, "language": language_value}
+                if timezone_value and language_value
+                else {}
+            )
+        if patch:
+            try:
+                await run_in_threadpool(config.update, patch)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail={"error": _config_write_error_message(exc)}) from exc
+        return _proxy_view_payload()
+
     @router.post("/api/proxy/test")
     async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        candidate = (body.url or "").strip() or config.get_proxy_settings()
+        candidate = config.restore_masked((body.url or "").strip()) or config.get_proxy_settings()
         if not candidate:
             raise HTTPException(status_code=400, detail={"error": "proxy url is required"})
-        return {"result": await run_in_threadpool(test_proxy, candidate)}
+        return {"result": config.mask_public(await run_in_threadpool(test_proxy, candidate))}
 
     @router.post("/api/proxy/sample-test")
     async def test_proxy_sample_endpoint(
@@ -773,7 +1011,7 @@ def create_router(app_version: str) -> APIRouter:
         require_admin(authorization)
         if not body.urls.strip():
             raise HTTPException(status_code=400, detail={"error": "proxy list is required"})
-        return {"result": await run_in_threadpool(test_proxy_list_sample, body.urls)}
+        return {"result": config.mask_public(await run_in_threadpool(test_proxy_list_sample, config.restore_masked(body.urls)))}
 
     @router.get("/api/proxy/profiles")
     async def list_proxy_profiles(authorization: str | None = Header(default=None)):
@@ -807,12 +1045,23 @@ def create_router(app_version: str) -> APIRouter:
     @router.post("/api/proxy/profiles/test")
     async def test_proxy_profile_endpoint(body: ProxyProfileTestRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        candidate = (body.url or "").strip()
+        candidate = config.restore_masked((body.url or "").strip())
         if not candidate and body.id.strip():
             candidate = _resolve_profile_proxy(body.id)
         if not candidate:
             raise HTTPException(status_code=400, detail={"error": "proxy url or profile id is required"})
-        return {"result": await run_in_threadpool(test_proxy, candidate)}
+        return {"result": config.mask_public(await run_in_threadpool(test_proxy, candidate))}
+
+    @router.post("/api/proxy/nodes/import")
+    async def import_proxy_nodes_endpoint(
+        body: ProxyNodeImportRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(import_proxy_nodes, body.text, config.restore_masked(body.existing_urls))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.get("/api/proxy/groups")
     async def list_proxy_groups(authorization: str | None = Header(default=None)):
@@ -837,6 +1086,15 @@ def create_router(app_version: str) -> APIRouter:
         next_groups = [group for group in groups if group.get("id") != normalized]
         if len(next_groups) == len(groups):
             raise HTTPException(status_code=404, detail={"error": "proxy group not found"})
+        references = proxy_settings.proxy_group_references(normalized)
+        if references:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": f"proxy group is still in use: {', '.join(references)}",
+                    "references": references,
+                },
+            )
         try:
             updated = config.update({"proxy_groups": next_groups})
         except OSError as exc:
@@ -846,9 +1104,9 @@ def create_router(app_version: str) -> APIRouter:
     @router.post("/api/proxy/groups/test")
     async def test_proxy_group_endpoint(body: ProxyGroupTestRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        explicit_url = (body.url or "").strip()
+        explicit_url = config.restore_masked((body.url or "").strip())
         if explicit_url:
-            return {"result": await run_in_threadpool(test_proxy, explicit_url)}
+            return {"result": config.mask_public(await run_in_threadpool(test_proxy, explicit_url))}
 
         group_id = _proxy_group_id(body.id)
         if not group_id:
@@ -870,10 +1128,11 @@ def create_router(app_version: str) -> APIRouter:
             {"node_id": str(node.get("id") or ""), "result": await run_in_threadpool(test_proxy, _clean_text(node.get("url")))}
             for node in nodes
         ]
+        results = config.mask_public(results)
         return {
             "results": results,
             "result": results[0]["result"] if len(results) == 1 else None,
-            "groups": _config_dict_list("proxy_groups"),
+            "groups": config.mask_public(_config_dict_list("proxy_groups")),
         }
 
     @router.get("/api/proxy/runtime")
@@ -912,9 +1171,16 @@ def create_router(app_version: str) -> APIRouter:
             "health": storage.health_check(),
         }
 
+    @router.post("/api/dashboard/rebuild-metrics")
+    async def rebuild_dashboard_metrics_endpoint(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(rebuild_dashboard_metrics)
+
     @router.get("/api/dashboard")
     async def get_dashboard(
         authorization: str | None = Header(default=None),
+        # log_limit 仅为兼容旧调用方保留，不再使用：指标来自 dashboard_metrics_service 的小时投影，
+        # 不再每次读取 5000-20000 条调用日志。
         log_limit: int = Query(default=5000, ge=1, le=20000),
         time_range: str = Query(default="24h", pattern="^(24h|7d|30d)$"),
     ):
@@ -922,15 +1188,13 @@ def create_router(app_version: str) -> APIRouter:
         account_stats = await get_provider_account_stats()
         account_healthy = bool(account_stats.get("active")) or bool(account_stats.get("unlimited_quota_count"))
         storage = config.get_storage_backend()
-        call_logs = await run_in_threadpool(log_service.list, type=LOG_TYPE_CALL, limit=log_limit)
-        recent_log_summary = await run_in_threadpool(
-            _dashboard_log_summary,
-            call_logs,
-            time_range=time_range,
-        )
-        await run_in_threadpool(dashboard_metrics_service.backfill_if_empty, call_logs)
         dashboard_logs = await run_in_threadpool(dashboard_metrics_service.summary, time_range)
-        dashboard_logs["recent_failures"] = recent_log_summary.get("recent_failures", [])
+        if not int(dashboard_logs.get("total") or 0):
+            # 指标投影为空（首次启用或被清空）时才扫描调用日志回填，与 /api/dashboard/snapshot 一致。
+            call_logs = await run_in_threadpool(log_service.list, type=LOG_TYPE_CALL, limit=5000)
+            await run_in_threadpool(dashboard_metrics_service.backfill_if_empty, call_logs)
+            dashboard_logs = await run_in_threadpool(dashboard_metrics_service.summary, time_range)
+        dashboard_logs["recent_failures"] = await run_in_threadpool(_recent_failure_rows)
         image_storage_stats = await run_in_threadpool(storage_stats)
         storage_health = await run_in_threadpool(storage.health_check)
         return {
@@ -947,6 +1211,30 @@ def create_router(app_version: str) -> APIRouter:
                 "images": image_storage_stats,
             },
             "logs": dashboard_logs,
+        }
+
+    @router.get("/api/dashboard/snapshot")
+    async def get_dashboard_snapshot(authorization: str | None = Header(default=None)):
+        """概览中心单次快照：账号统计与 24h / 7d / 30d 三个统计周期一次返回，前端据此串行刷新。"""
+        require_admin(authorization)
+        account_stats = await get_provider_account_stats()
+        account_healthy = bool(account_stats.get("active")) or bool(account_stats.get("unlimited_quota_count"))
+        ranges = await run_in_threadpool(dashboard_metrics_service.snapshot_many)
+        if not any(int(item.get("total") or 0) for item in ranges.values()):
+            # 指标投影为空（首次启用或被清空）时才扫描调用日志回填，避免每次刷新都读日志。
+            call_logs = await run_in_threadpool(log_service.list, type=LOG_TYPE_CALL, limit=5000)
+            await run_in_threadpool(dashboard_metrics_service.backfill_if_empty, call_logs)
+            ranges = await run_in_threadpool(dashboard_metrics_service.snapshot_many)
+        return {
+            "status": "ok" if account_healthy else "degraded",
+            "healthy": account_healthy,
+            "version": app_version,
+            "generated_at": datetime.now().timestamp(),
+            "accounts": {
+                **account_stats,
+                "healthy": account_healthy,
+            },
+            "ranges": ranges,
         }
 
     @router.post("/api/backup/test")
@@ -1050,7 +1338,7 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/images/storage")
     async def get_image_storage(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return storage_stats()
+        return await run_in_threadpool(storage_stats)
 
     @router.post("/api/images/storage/compress")
     async def compress_all_images(authorization: str | None = Header(default=None)):
@@ -1059,15 +1347,26 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/images/storage/cleanup-to-target")
     async def cleanup_to_target(
-        target_free_mb: int = 500,
+        target_free_mb: int = Query(default=500, ge=1),
         dry_run: bool = False,
         authorization: str | None = Header(default=None),
     ):
         require_admin(authorization)
-        return await run_in_threadpool(delete_to_target, target_free_mb, dry_run)
+        return await run_in_threadpool(
+            lambda: retention_cleanup_coordinator.cleanup_images_to_target(target_free_mb, dry_run=dry_run)
+        )
 
     @router.get("/health", response_model=None)
-    async def health_dashboard(format: str = Query(default="html")):
+    async def health_dashboard(
+        format: str = Query(default="html"),
+        authorization: str | None = Header(default=None),
+    ):
+        # 无鉴权：仅返回探活信息，供 Docker/负载均衡使用；
+        # 管理员（Authorization: Bearer <密钥>）才返回存储、代理、账号统计等完整诊断。
+        try:
+            require_admin(authorization)
+        except HTTPException:
+            return {"status": "ok", "version": app_version}
         stats = await get_provider_account_stats()
         storage = config.get_storage_backend()
         storage_health = await run_in_threadpool(storage.health_check)
