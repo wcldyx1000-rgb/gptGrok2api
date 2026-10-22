@@ -2,7 +2,8 @@
 
 - 登录导入：粘贴 `邮箱|密码|2FA`，逐个用密码（+ 本地 TOTP）登录拿 token，连同浏览器身份写入号池。
   出口沿用注册中心的代理设置；任务进度和日志在内存里，前端轮询查看。
-- 重新激活：号池里已有账号用 Outlook 邮箱无密码登录换新 token（复用自动重登的登录实现）。
+  密码和 2FA 密钥会随账号保存，RT 失效时自动重登（需开启设置里的“自动重新登录”）直接用它们。
+- 重新激活：号池里已有账号用已存的密码（+2FA）或 Outlook 邮箱无密码登录换新 token（复用自动重登的登录实现）。
 - 入池验证（verify_on_import）：入池前用 refresh_token 换一次 token，入池后同步额度；不可用的不留在号池。
 """
 from __future__ import annotations
@@ -273,6 +274,18 @@ class LoginImportService:
                 self._log(job_id, f"{row['email']} 代理连接失败，换节点重试", "yellow")
         raise last_error or RuntimeError("login failed")
 
+    @staticmethod
+    def _with_saved_credentials(result: dict[str, Any], row: dict[str, str]) -> dict[str, Any]:
+        """把密码和 2FA 密钥随账号保存，RT 失效时可以自动用它们重新登录。"""
+        from utils import totp as totp_util
+
+        saved = dict(result)
+        saved["password"] = row["password"]
+        secret = totp_util.normalize_secret(row.get("totp") or "")
+        if secret:
+            saved["totp_secret"] = secret
+        return saved
+
     def _run(self, job_id: str, rows: list[dict[str, str]]) -> None:
         stop_event = self._stop_events.get(job_id) or threading.Event()
         verify = bool((self.get(job_id) or {}).get("verify"))
@@ -291,7 +304,7 @@ class LoginImportService:
                     self._update(job_id, current=email)
                     entry: dict[str, Any] = {"email": email, "ok": False, "usable": None, "error": ""}
                     try:
-                        result = self._login_with_retry(job_id, row, index)
+                        result = self._with_saved_credentials(self._login_with_retry(job_id, row, index), row)
                         ok += 1
                         entry["ok"] = True
                         if verify:
@@ -353,9 +366,9 @@ class LoginImportService:
                 if account is None:
                     raise RuntimeError("号池里没有这个邮箱的账号")
                 mailbox = relogin.resolve_outlook_mailbox(account)
-                if mailbox is None:
-                    raise RuntimeError("没有找到这个账号的 Outlook 邮箱凭据")
-                tokens = relogin._default_login(account, mailbox)
+                if mailbox is None and not relogin.has_password_credentials(account):
+                    raise RuntimeError("没有找到这个账号的密码或 Outlook 邮箱凭据")
+                tokens = relogin.login_account(account, mailbox)
                 if not _clean((tokens or {}).get("access_token")):
                     raise RuntimeError("重新登录未返回 access_token")
                 relogin._apply_tokens(accounts, _clean(account.get("access_token")), account, tokens)

@@ -2,7 +2,7 @@
   <ModalShell :open="open" :z-index="140" max-width="52rem" @close="emit('close')">
     <ModalHeader
       title="邮箱密码登录导入"
-      subtitle="逐个用 邮箱|密码|2FA 登录已有 ChatGPT 账号拿 token，连同浏览器身份写入号池；出口沿用注册中心的代理设置"
+      subtitle="逐个用 邮箱|密码|2FA 登录已有 ChatGPT 账号拿 token，连同浏览器身份写入号池；密码和 2FA 密钥会随账号保存，RT 失效时可自动重新登录（需在设置里开启）；出口沿用注册中心的代理设置"
       :close-disabled="starting"
       compact
       @close="emit('close')"

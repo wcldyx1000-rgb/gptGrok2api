@@ -142,7 +142,7 @@ def rescue_view(
     has_outlook: bool | None = None,
     mail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """AT 失效后能不能自动救回：RT 续期 → Outlook 收码重登 → 只能手动 / 无法救回。"""
+    """AT 失效后能不能自动救回：RT 续期 → 密码（+2FA）重登 → Outlook 收码重登 → 已放弃 / 无法救回。"""
     from services.account_relogin_service import RELOGIN_MAX_FAILURES
 
     outlook = _has_outlook_credentials(account, mail) if has_outlook is None else bool(has_outlook)
@@ -155,15 +155,18 @@ def rescue_view(
     if lifecycle["refresh_token_status"] == "valid":
         code, label, tone = "refresh", "RT 续期", "success"
         detail = "AT 到期后用 RT 自动续期"
+    elif has_password and failures < RELOGIN_MAX_FAILURES:
+        code, label, tone = "password", "密码+2FA 重登" if has_totp else "密码重登", "success"
+        detail = (
+            "RT 不可用时用已保存的密码" + ("和 2FA 密钥" if has_totp else "")
+            + "自动重新登录" + ("，失败再用 Outlook 收码" if outlook else "") + "（需在设置里开启自动重登）"
+        )
     elif outlook and failures < RELOGIN_MAX_FAILURES:
         code, label, tone = "outlook", "Outlook 重登", "success"
         detail = "RT 不可用时用 Outlook 收码自动重新登录（需在设置里开启自动重登）"
-    elif outlook:
+    elif outlook or has_password:
         code, label, tone = "exhausted", "重登已放弃", "error"
-        detail = f"Outlook 自动重登连续失败 {failures} 次，已停止尝试"
-    elif has_password:
-        code, label, tone = "manual", "仅可手动", "warning"
-        detail = "存了密码" + ("和 2FA" if has_totp else "") + "，但不会用密码自动登录；可在「登录导入」里重新登录"
+        detail = f"自动重登连续失败 {failures} 次，已停止尝试；可在「登录导入」里重新登录"
     else:
         code, label, tone = "none", "无法救回", "error"
         detail = "没有可用 RT，也没有 Outlook 凭据或密码，AT 失效后只能重新导入"

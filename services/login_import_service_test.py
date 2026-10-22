@@ -191,6 +191,23 @@ class LoginImportJobTest(unittest.TestCase):
         for secret in ("secret-pass-1", "secret-pass-2", "TOTPSECRET"):
             self.assertNotIn(secret, dumped)
 
+    def test_password_and_totp_secret_are_saved_with_the_account_for_auto_relogin(self) -> None:
+        accounts = FakeAccounts()
+
+        def login(row, proxy, index):
+            return {"email": row["email"], "access_token": f"at-{index}", "refresh_token": f"rt-{index}"}
+
+        job = _service(login, accounts=accounts).start(
+            "a@example.test|pass-a|jbsw y3dp ehpk 3pxp\nb@example.test|pass-b",
+            verify=False,
+            background=False,
+        )
+        self.assertEqual(job["pool_ok"], 2)
+        self.assertEqual(accounts.items["at-1"]["password"], "pass-a")
+        self.assertEqual(accounts.items["at-1"]["totp_secret"], "JBSWY3DPEHPK3PXP")
+        self.assertEqual(accounts.items["at-2"]["password"], "pass-b")
+        self.assertNotIn("totp_secret", accounts.items["at-2"])
+
     def test_verify_mode_counts_pool_usable_separately(self) -> None:
         accounts = FakeAccounts(statuses={"at-2": "异常"})
 
@@ -336,6 +353,19 @@ class ReactivateTest(unittest.TestCase):
         self.assertEqual(applied, [("at-a", {"access_token": "at-a2"})])
         self.assertIn("Outlook", result["results"][1]["error"])
         self.assertIn("没有这个邮箱", result["results"][2]["error"])
+
+    def test_account_with_saved_password_is_reactivated_without_outlook(self) -> None:
+        accounts = FakeAccounts()
+        accounts.items = {
+            "at-a": {"email": "a@example.test", "access_token": "at-a", "password": "pw-a", "totp_secret": "JBSWY3DPEHPK3PXP"},
+        }
+        service = _service(lambda *args: {}, accounts=accounts)
+        with patch("services.account_relogin_service.resolve_outlook_mailbox", return_value=None), patch(
+            "services.account_relogin_service._default_password_login", return_value={"access_token": "at-a2"},
+        ) as password_mock, patch("services.account_relogin_service._apply_tokens", return_value="at-a2"):
+            result = service.reactivate(["a@example.test"])
+        self.assertEqual((result["ok"], result["fail"]), (1, 0))
+        password_mock.assert_called_once()
 
     def test_login_without_access_token_is_a_failure(self) -> None:
         accounts = FakeAccounts()

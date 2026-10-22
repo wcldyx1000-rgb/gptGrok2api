@@ -1,15 +1,17 @@
-"""RT 失效自动重新登录：用账号的 Outlook 凭据收码，走 passwordless 登录换一组新 token。
+"""RT 失效自动重新登录：优先用账号里存的密码（+ 2FA 密钥算 TOTP）登录，
+没有密码或密码登录失败时，用账号的 Outlook 凭据收码，走 passwordless 登录换一组新 token。
 
 移植自 chatgpt2api 衍生版的 account_relogin_service，登录流程复用注册模块里
-PlatformRegistrar 的 passwordless 登录步骤，收码复用 OutlookTokenProvider。
+PlatformRegistrar 的登录步骤，收码复用 OutlookTokenProvider。
 
-- 只处理“refresh_token 已作废（或缺失且账号已异常）、且找得到 Outlook 凭据”的账号；
+- 只处理“refresh_token 已作废（或缺失且账号已异常）、且有密码或找得到 Outlook 凭据”的账号；
   RT 还能用的账号继续走正常续期。
+- 密码/2FA 本身不对（密码错、密钥错、缺 2FA）且没有 Outlook 兜底时直接放弃，不按退避反复试。
 - Outlook 凭据优先取账号自身字段（outlook_client_id / outlook_refresh_token），
   没有时按邮箱到邮箱配置里的 OutlookToken 邮箱池中查找。
 - 失败按 RELOGIN_BACKOFF_SECS 退避，连续失败 RELOGIN_MAX_FAILURES 次后放弃；
   失败次数和最近错误写在账号上，重启不丢，前端可直接展示。
-- 默认关闭：需要在设置里打开 account_relogin_enabled。
+- 默认开启：可在设置里关掉 account_relogin_enabled。
 """
 
 from __future__ import annotations
@@ -32,6 +34,16 @@ RELOGIN_CODE_WAIT_SECS = 120.0
 RELOGIN_TASK_INDEX = 0
 
 OUTLOOK_ACCOUNT_FIELDS = ("outlook_login_email", "outlook_client_id", "outlook_refresh_token", "outlook_password")
+
+# 密码登录里“再试也没用”的错误：密码错、2FA 密钥错、缺 2FA、账号只有验证码登录、资料未补全。
+# 没有 Outlook 兜底时直接放弃，避免按退避反复提交错误密码把账号锁了。
+_PASSWORD_PERMANENT_MARKERS = (
+    "login_wrong_password",
+    "login_bad_totp_secret",
+    "login_mfa_required",
+    "login_passwordless_only",
+    "login_incomplete_profile",
+)
 
 # refresh_token 被吊销、过期或复用时 OAuth 刷新返回的错误标记；
 # 网络错误、429、5xx、不带错误码的偶发 401 不算作废，留给正常续期重试。
@@ -95,6 +107,17 @@ def has_account_outlook_credentials(account: dict[str, Any] | None) -> bool:
         and _clean(item.get("outlook_client_id"))
         and _clean(item.get("outlook_refresh_token"))
     )
+
+
+def has_password_credentials(account: dict[str, Any] | None) -> bool:
+    """账号上存了密码（可选带 2FA 密钥），可以不靠邮箱收码直接用密码重新登录。"""
+    item = account or {}
+    return bool("@" in _clean(item.get("email")) and _clean(item.get("password")))
+
+
+def account_totp_secret(account: dict[str, Any] | None) -> str:
+    item = account or {}
+    return _clean(item.get("totp_secret") or item.get("totp") or item.get("2fa"))
 
 
 def _mail_settings() -> dict[str, Any]:
@@ -200,7 +223,7 @@ def relogin_exhausted(account: dict[str, Any] | None) -> bool:
 def needs_relogin(account: dict[str, Any] | None, mail: dict[str, Any] | None = None) -> bool:
     if not refresh_token_dead(account):
         return False
-    return resolve_outlook_mailbox(account, mail) is not None
+    return has_password_credentials(account) or resolve_outlook_mailbox(account, mail) is not None
 
 
 def relogin_holds(account: dict[str, Any] | None, mail: dict[str, Any] | None = None) -> bool:
@@ -319,6 +342,73 @@ def _default_login(account: dict[str, Any], mailbox: dict[str, Any]) -> dict[str
         registrar.close()
 
 
+def _default_password_login(account: dict[str, Any]) -> dict[str, str]:
+    """用账号里存的密码（+ 2FA 密钥算出的 TOTP）重新登录，沿用账号自己的浏览器身份。"""
+    from services.register import openai_register as reg
+
+    email = _clean(account.get("email"))
+    proxy = _clean(account.get("proxy"))
+    if not proxy:
+        # 账号没绑代理：和登录导入一样走注册中心的出口，而不是服务器直连。
+        try:
+            from services import login_import_service
+
+            login_import_service._default_prepare()
+            proxy = _clean(reg.login_egress_for_attempt())
+        except Exception as exc:  # noqa: BLE001 - 取不到出口就退回直连，不挡住重登
+            logger.warning({"event": "account_relogin_egress_failed", "error": str(exc)[:200]})
+    registrar = reg.PlatformRegistrar(proxy)
+    try:
+        _apply_account_identity(registrar, account, proxy)
+        reg.step(RELOGIN_TASK_INDEX, f"自动重新登录（密码{'+2FA' if account_totp_secret(account) else ''}）{email}")
+        tokens = registrar.login_with_password(
+            email, _clean(account.get("password")), account_totp_secret(account), RELOGIN_TASK_INDEX
+        )
+        if not _clean((tokens or {}).get("access_token")):
+            raise RuntimeError("密码登录未返回 access_token")
+        return {key: _clean(tokens.get(key)) for key in ("access_token", "refresh_token", "id_token") if _clean(tokens.get(key))}
+    except reg.RegisterStopped as error:
+        raise ReloginDeferred("注册任务已停止，登录通道暂不可用") from error
+    finally:
+        registrar.close()
+
+
+def login_account(
+    account: dict[str, Any],
+    mailbox: dict[str, Any] | None,
+    *,
+    login_fn: Callable[[dict[str, Any], dict[str, Any]], dict[str, str]] | None = None,
+    password_login_fn: Callable[[dict[str, Any]], dict[str, str]] | None = None,
+) -> dict[str, str]:
+    """换一组新 token：有密码先用密码（+2FA），失败且有 Outlook 凭据再退回 Outlook 收码。"""
+    password_error: Exception | None = None
+    if has_password_credentials(account):
+        try:
+            return (password_login_fn or _default_password_login)(account)
+        except ReloginDeferred:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if mailbox is None:
+                raise
+            password_error = exc
+            logger.info({"event": "account_relogin_password_failed_fallback_outlook", "error": str(exc)[:200]})
+    if mailbox is None:
+        raise RuntimeError("没有可用的登录凭据（密码或 Outlook 邮箱）")
+    try:
+        return (login_fn or _default_login)(account, mailbox)
+    except ReloginDeferred:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if password_error is not None:
+            raise RuntimeError(f"密码登录失败：{password_error}；Outlook 重登失败：{exc}") from exc
+        raise
+
+
+def password_failure_is_permanent(message: str) -> bool:
+    lowered = str(message or "").lower()
+    return any(marker in lowered for marker in _PASSWORD_PERMANENT_MARKERS)
+
+
 # ── 回写账号 ──────────────────────────────────────────────────
 
 
@@ -343,8 +433,10 @@ class AccountReloginService:
         login_fn: Callable[[dict[str, Any], dict[str, Any]], dict[str, str]] = _default_login,
         sleep_fn: Callable[[float], None] | None = None,
         accounts: Any = None,
+        password_login_fn: Callable[[dict[str, Any]], dict[str, str]] | None = None,
     ) -> None:
         self._login_fn = login_fn
+        self._password_login_fn = password_login_fn
         self._sleep_fn = sleep_fn
         self._accounts = accounts
         self._lock = threading.Lock()
@@ -463,7 +555,7 @@ class AccountReloginService:
         if not current or not relogin_due(current, mail=mail):
             return False
         mailbox = resolve_outlook_mailbox(current, mail)
-        if mailbox is None:
+        if mailbox is None and not has_password_credentials(current):
             return False
         with self._lock:
             if access_token in self._running:
@@ -472,7 +564,9 @@ class AccountReloginService:
         account_id = _clean(current.get("management_id") or current.get("email"))
         started = time.perf_counter()
         try:
-            tokens = self._login_fn(current, mailbox)
+            tokens = login_account(
+                current, mailbox, login_fn=self._login_fn, password_login_fn=self._password_login_fn
+            )
             if not _clean((tokens or {}).get("access_token")):
                 raise RuntimeError("重新登录未返回 access_token")
             _apply_tokens(accounts, access_token, current, tokens)
@@ -482,8 +576,12 @@ class AccountReloginService:
         except Exception as exc:
             message = str(exc) or exc.__class__.__name__
             failures = int(current.get("relogin_attempts") or 0) + 1
-            # 号已被停用：不再退避重试。
-            deactivated = "account_deactivated" in message or "deleted or deactivated" in message.lower()
+            # 号已被停用，或只有密码这一条路且密码/2FA 本身不对：不再退避重试。
+            deactivated = (
+                "account_deactivated" in message
+                or "deleted or deactivated" in message.lower()
+                or (mailbox is None and password_failure_is_permanent(message))
+            )
             if deactivated:
                 failures = RELOGIN_MAX_FAILURES
             try:

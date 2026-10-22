@@ -58,7 +58,7 @@
       <div class="settings-check-grid settings-check-grid--single">
         <div class="settings-check-item">
           <div class="settings-check-control">
-            <Checkbox v-model="settings.account_relogin_enabled">启用自动重新登录</Checkbox>
+            <Checkbox v-model="settings.account_relogin_enabled">启用自动重新登录（密码+2FA 优先，其次 Outlook 收码）</Checkbox>
             <HelpTip text="默认关闭。refresh_token 被明确拒绝的账号，若保存了 OutlookToken 邮箱凭据（或邮箱仍在 OutlookToken 邮箱池中），后台会用邮箱验证码免密码登录换取新凭据；最多 3 次，间隔 30 分钟、2 小时。开启后“自动移除异常账号”会先保留这些账号。" />
           </div>
         </div>

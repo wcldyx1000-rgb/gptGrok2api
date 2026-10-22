@@ -295,6 +295,141 @@ class ReloginServiceTest(unittest.TestCase):
         self.assertGreaterEqual(sleeps[0], relogin.RELOGIN_GAP_SECS)
 
 
+class PasswordReloginTest(unittest.TestCase):
+    """保存了密码（+2FA）的账号：RT 失效后自动用密码登录，不需要 Outlook。"""
+
+    def setUp(self) -> None:
+        patcher = patch.object(relogin, "_mail_settings", return_value={})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _account(**overrides) -> dict:
+        return _dead_account(
+            outlook_client_id="", outlook_refresh_token="", password="pw-secret", totp_secret="JBSWY3DPEHPK3PXP", **overrides
+        )
+
+    @staticmethod
+    def _outlook_account(**overrides) -> dict:
+        return _dead_account(password="pw-secret", totp_secret="JBSWY3DPEHPK3PXP", **overrides)
+
+    def test_password_account_needs_relogin_without_outlook(self) -> None:
+        account = self._account()
+        self.assertTrue(relogin.has_password_credentials(account))
+        self.assertTrue(relogin.needs_relogin(account, mail={"providers": []}))
+        self.assertFalse(relogin.needs_relogin(_dead_account(outlook_client_id="", outlook_refresh_token=""), mail={}))
+        with ConfigOverride(account_relogin_enabled=True):
+            self.assertTrue(relogin.relogin_holds(account, mail={}))
+
+    def test_password_login_rotates_tokens_without_touching_outlook(self) -> None:
+        accounts = FakeAccounts([self._account(status="异常")])
+        password_calls: list[dict] = []
+        outlook_calls: list = []
+
+        def password_login(account: dict) -> dict:
+            password_calls.append(account)
+            return {"access_token": "at-new", "refresh_token": "rt-new"}
+
+        service = AccountReloginService(
+            login_fn=lambda a, m: outlook_calls.append(a) or {},
+            password_login_fn=password_login,
+            accounts=accounts,
+        )
+        self.assertTrue(service.relogin({"access_token": "at-old"}))
+        self.assertEqual(len(password_calls), 1)
+        self.assertEqual(outlook_calls, [])
+        stored = accounts.get_account("at-new")
+        self.assertEqual(stored["refresh_token"], "rt-new")
+        self.assertEqual(stored["status"], "正常")
+        # 密码和 2FA 密钥留在账号上，下次失效还能用。
+        self.assertEqual(stored["password"], "pw-secret")
+        self.assertEqual(stored["totp_secret"], "JBSWY3DPEHPK3PXP")
+
+    def test_run_due_picks_up_password_only_accounts(self) -> None:
+        accounts = FakeAccounts([self._account(relogin_needed_at=_ago(60), last_token_refresh_error="")])
+        service = AccountReloginService(
+            login_fn=lambda a, m: {},
+            password_login_fn=lambda a: {"access_token": "at-new"},
+            accounts=accounts,
+        )
+        with ConfigOverride(account_relogin_enabled=True):
+            self.assertEqual(service.run_due(), 1)
+
+    def test_password_failure_falls_back_to_outlook(self) -> None:
+        accounts = FakeAccounts([self._outlook_account()])
+
+        def password_login(account: dict) -> dict:
+            raise RuntimeError("login_mfa_failed: 两步验证没通过")
+
+        service = AccountReloginService(
+            login_fn=lambda a, m: {"access_token": "at-outlook", "refresh_token": "rt-outlook"},
+            password_login_fn=password_login,
+            accounts=accounts,
+        )
+        self.assertTrue(service.relogin({"access_token": "at-old"}))
+        self.assertEqual(accounts.get_account("at-outlook")["refresh_token"], "rt-outlook")
+        self.assertEqual(accounts.failures, [])
+
+    def test_both_failing_reports_both_and_is_not_exhausted_at_once(self) -> None:
+        accounts = FakeAccounts([self._outlook_account()])
+
+        def password_login(account: dict) -> dict:
+            raise RuntimeError("login_wrong_password: 账号或密码不对")
+
+        def outlook_login(account: dict, mailbox: dict) -> dict:
+            raise RuntimeError("等待 OpenAI 登录验证码超时")
+
+        service = AccountReloginService(login_fn=outlook_login, password_login_fn=password_login, accounts=accounts)
+        self.assertFalse(service.relogin({"access_token": "at-old"}))
+        error = accounts.get_account("at-old")["last_relogin_error"]
+        self.assertIn("login_wrong_password", error)
+        self.assertIn("验证码超时", error)
+        self.assertEqual(accounts.get_account("at-old")["relogin_attempts"], 1)
+
+    def test_wrong_password_without_outlook_is_exhausted_at_once(self) -> None:
+        for message in (
+            "login_wrong_password: 账号或密码不对",
+            "login_mfa_required: 账号开了两步验证，但没有提供 2FA 密钥",
+            "login_bad_totp_secret: 两步验证密钥不是有效的 base32",
+            "login_passwordless_only: 这个账号走邮箱验证码登录",
+        ):
+            with self.subTest(message=message):
+                accounts = FakeAccounts([self._account()])
+
+                def password_login(account: dict, _message: str = message) -> dict:
+                    raise RuntimeError(_message)
+
+                service = AccountReloginService(password_login_fn=password_login, accounts=accounts)
+                self.assertFalse(service.relogin({"access_token": "at-old"}))
+                self.assertEqual(accounts.get_account("at-old")["relogin_attempts"], relogin.RELOGIN_MAX_FAILURES)
+                self.assertFalse(relogin.relogin_due(accounts.get_account("at-old"), mail={}))
+
+    def test_transient_password_error_keeps_backoff_retry(self) -> None:
+        accounts = FakeAccounts([self._account()])
+
+        def password_login(account: dict) -> dict:
+            raise RuntimeError("curl: (28) timeout")
+
+        service = AccountReloginService(password_login_fn=password_login, accounts=accounts)
+        self.assertFalse(service.relogin({"access_token": "at-old"}))
+        self.assertEqual(accounts.get_account("at-old")["relogin_attempts"], 1)
+
+    def test_deferred_password_login_does_not_count_as_failure(self) -> None:
+        accounts = FakeAccounts([self._account()])
+
+        def password_login(account: dict) -> dict:
+            raise ReloginDeferred("stopped")
+
+        service = AccountReloginService(password_login_fn=password_login, accounts=accounts)
+        self.assertFalse(service.relogin({"access_token": "at-old"}))
+        self.assertEqual(accounts.failures, [])
+
+    def test_totp_secret_aliases(self) -> None:
+        for key in ("totp_secret", "totp", "2fa"):
+            self.assertEqual(relogin.account_totp_secret({key: " ABC "}), "ABC")
+        self.assertEqual(relogin.account_totp_secret({}), "")
+
+
 class RealAccountServiceTest(unittest.TestCase):
     """Runs the relogin cycle against the real AccountService relogin interface."""
 
@@ -381,7 +516,7 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual(config.account_relogin_concurrency, 1)
         saved = config.data.pop("account_relogin_enabled", None)
         try:
-            self.assertFalse(config.account_relogin_enabled)
+            self.assertTrue(config.account_relogin_enabled)
         finally:
             if saved is not None:
                 config.data["account_relogin_enabled"] = saved

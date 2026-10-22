@@ -220,7 +220,7 @@ export interface Account {
   last_token_refresh_at?: number | null
   last_token_refresh_error?: string | null
   last_token_refresh_error_at?: number | null
-  rescue_code?: 'refresh' | 'outlook' | 'exhausted' | 'manual' | 'none'
+  rescue_code?: 'refresh' | 'password' | 'outlook' | 'exhausted' | 'none'
   rescue_label?: string
   rescue_tone?: AccountPresentationTone
   rescue_detail?: string
@@ -774,7 +774,7 @@ function normalizeAccountDisplay(item: BackendAccount): Partial<Account> {
     last_token_refresh_at: optionalTimestamp(item.last_token_refresh_at),
     last_token_refresh_error: cleanString(item.last_token_refresh_error) || null,
     last_token_refresh_error_at: optionalTimestamp(item.last_token_refresh_error_at),
-    rescue_code: oneOf(item.rescue_code, ['refresh', 'outlook', 'exhausted', 'manual', 'none'] as const),
+    rescue_code: oneOf(item.rescue_code, ['refresh', 'password', 'outlook', 'exhausted', 'none'] as const),
     rescue_label: cleanString(item.rescue_label),
     rescue_tone: tone(item.rescue_tone),
     rescue_detail: cleanString(item.rescue_detail),

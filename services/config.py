@@ -1028,7 +1028,7 @@ class ConfigStore:
     @property
     def account_relogin_enabled(self) -> bool:
         """refresh_token 作废后用账号的 Outlook 凭据自动重新登录；默认关闭。"""
-        return _normalize_bool(self.data.get("account_relogin_enabled"), False)
+        return _normalize_bool(self.data.get("account_relogin_enabled"), True)
 
     @property
     def account_relogin_interval_secs(self) -> int:

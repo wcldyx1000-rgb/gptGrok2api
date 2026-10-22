@@ -228,7 +228,7 @@ function normalizePoolTuning(source: RawSettings): Required<PoolTuning> {
     new_account_ramp_daily_images: clampNumber(source.new_account_ramp_daily_images, 5, 1, 200),
     text_account_concurrency: clampNumber(source.text_account_concurrency, 3, 1, 20),
     account_failure_cooldown_secs: clampNumber(source.account_failure_cooldown_secs, 300, 0, 3600),
-    account_relogin_enabled: boolValue(source.account_relogin_enabled, false),
+    account_relogin_enabled: boolValue(source.account_relogin_enabled, true),
     account_relogin_interval_secs: clampNumber(source.account_relogin_interval_secs, 300, 60, 3600),
     account_relogin_concurrency: clampNumber(source.account_relogin_concurrency, 1, 1, 4),
     console_request_timeout_secs: clampNumber(source.console_request_timeout_secs, 600, 30, 3600),

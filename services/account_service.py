@@ -784,6 +784,12 @@ class AccountService:
                 item.get("id_token"),
                 item.get("outlook_refresh_token"),
                 item.get("outlook_password"),
+                # 太短的密码会把正常文字也擦掉，只擦足够长的。
+                *(
+                    secret
+                    for secret in (item.get("password"), item.get("totp_secret"))
+                    if len(str(secret or "").strip()) >= 6
+                ),
             ),
             proxy_values=(item.get("proxy"),),
             limit=2000,

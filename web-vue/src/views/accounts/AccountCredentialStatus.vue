@@ -10,9 +10,18 @@
           <MetaChip :tone="refreshChipTone" size="xs" strong>
             {{ item.refresh_token_label || 'RT —' }}
           </MetaChip>
+          <MetaChip
+            v-if="item.has_password"
+            tone="info"
+            size="xs"
+            strong
+            :title="item.has_totp ? '已保存密码和 2FA 密钥，RT 失效时自动登录' : '已保存密码，RT 失效时自动登录'"
+          >
+            {{ item.has_totp ? '2FA' : '密码' }}
+          </MetaChip>
         </span>
         <span v-if="item.rescue_label" class="account-cell-sub max-w-[10rem]" :class="rescueClass">
-          失效后 {{ item.rescue_label }}<template v-if="item.has_password"> · 密码{{ item.has_totp ? '+2FA' : '' }}</template>
+          失效后 {{ item.rescue_label }}<template v-if="item.has_password && item.rescue_code !== 'password'"> · 密码{{ item.has_totp ? '+2FA' : '' }}</template>
         </span>
       </span>
 
