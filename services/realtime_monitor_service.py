@@ -7,6 +7,15 @@ from collections import Counter, deque
 from threading import Lock
 from typing import Any
 
+from services.call_outcome import (
+    OUTCOME_FAILED,
+    OUTCOME_PARTIAL,
+    OUTCOME_RATE_LIMITED,
+    OUTCOME_SUCCESS,
+    OUTCOME_TEXT_REVIEW,
+    OUTCOME_UNKNOWN,
+    call_outcome,
+)
 from services.request_cancel_service import request_cancel_service
 from utils.timezone import beijing_from_timestamp, beijing_now_str
 
@@ -20,6 +29,19 @@ def _env_int(name: str, default: int, minimum: int, maximum: int | None = None) 
     if maximum is not None:
         value = min(value, maximum)
     return value
+
+
+DEFAULT_THREAD_TOKENS = 120
+THREAD_TOKENS_ENV = "GPTGROK2API_THREAD_TOKENS"
+LEGACY_THREAD_TOKENS_ENV = "CHATGPT2API_THREAD_TOKENS"
+
+
+def thread_tokens() -> int:
+    """后端同步线程池容量：优先读 GPTGROK2API_THREAD_TOKENS，其次兼容 CHATGPT2API_THREAD_TOKENS。"""
+    for name in (THREAD_TOKENS_ENV, LEGACY_THREAD_TOKENS_ENV):
+        if str(os.getenv(name, "") or "").strip():
+            return _env_int(name, DEFAULT_THREAD_TOKENS, 1)
+    return DEFAULT_THREAD_TOKENS
 
 
 def _int_ms(value: object) -> int:
@@ -147,6 +169,18 @@ METRIC_LABELS = {
 }
 
 
+# 完成时从调用日志 detail 带进监控记录的归类字段，供监控页展示状态标签与换号统计。
+OUTCOME_RECORD_INT_KEYS = (
+    "image_requested_count",
+    "image_succeeded_count",
+    "image_failed_count",
+    "attempt_count",
+    "switch_count",
+    "status_code",
+)
+OUTCOME_RECORD_TEXT_KEYS = ("image_result_status", "error_code", "public_error")
+
+
 LOCAL_REJECT_PATTERNS = (
     "image_account_selection:",
     "no available image quota",
@@ -169,7 +203,7 @@ class RealtimeMonitorService:
         self._completed: deque[dict[str, Any]] = deque(maxlen=completed_limit)
         self._events: deque[dict[str, Any]] = deque(maxlen=event_limit)
         self._threadpool: dict[str, int] = {
-            "tokens": _env_int("CHATGPT2API_THREAD_TOKENS", 80, 1),
+            "tokens": thread_tokens(),
             "previous_tokens": 0,
         }
 
@@ -304,6 +338,13 @@ class RealtimeMonitorService:
             urls = detail.get("urls")
             if isinstance(urls, list):
                 record["url_count"] = len(urls)
+            for key in OUTCOME_RECORD_INT_KEYS:
+                if detail.get(key) not in (None, ""):
+                    record[key] = _int_ms(detail.get(key))
+            for key in OUTCOME_RECORD_TEXT_KEYS:
+                if detail.get(key):
+                    record[key] = str(detail.get(key))
+            record["outcome"] = str(detail.get("outcome") or "") or call_outcome({**record, **detail})
             perf = detail.get("perf")
             if isinstance(perf, dict):
                 self._merge_metric_dict(record.setdefault("perf", {}), perf)
@@ -486,9 +527,32 @@ class RealtimeMonitorService:
             ms = _int_ms(value)
             target[key] = max(_int_ms(target.get(key)), ms)
 
+    def _record_outcome(self, record: dict[str, Any]) -> str:
+        outcome = str(record.get("outcome") or "").strip()
+        if outcome:
+            return outcome
+        return call_outcome(record)
+
     def _summary(self, active: list[dict[str, Any]], completed: list[dict[str, Any]]) -> dict[str, Any]:
-        success = sum(1 for item in completed if str(item.get("status") or "").lower() == "success")
-        failed = len(completed) - success
+        outcomes = [self._record_outcome(item) for item in completed]
+        success = sum(1 for outcome in outcomes if outcome in {OUTCOME_SUCCESS, OUTCOME_UNKNOWN})
+        partial_success = sum(1 for outcome in outcomes if outcome == OUTCOME_PARTIAL)
+        rate_limited = sum(1 for outcome in outcomes if outcome == OUTCOME_RATE_LIMITED)
+        text_review = sum(1 for outcome in outcomes if outcome == OUTCOME_TEXT_REVIEW)
+        failed = sum(1 for outcome in outcomes if outcome == OUTCOME_FAILED)
+        # 成功率口径：文本回复不计入成败；部分成功按成功算。
+        measured = success + partial_success + failed + rate_limited
+        switch_requests = 0
+        switches = 0
+        switch_success = 0
+        for item, outcome in zip(completed, outcomes):
+            switch_count = _int_ms(item.get("switch_count"))
+            if switch_count > 0:
+                switch_requests += 1
+                switches += switch_count
+                if outcome in {OUTCOME_SUCCESS, OUTCOME_PARTIAL}:
+                    switch_success += 1
+        stream_error_requests = sum(1 for item in completed if self._metric_value(item, "stream_error_ms") > 0)
         durations = [_int_ms(item.get("duration_ms")) for item in completed if _int_ms(item.get("duration_ms"))]
         metric_p95 = {key: self._percentile(self._metric_values(completed, key), 95) for key in METRIC_LABELS}
         bottleneck_key = max(
@@ -526,8 +590,19 @@ class RealtimeMonitorService:
             "active": len(active),
             "completed": len(completed),
             "success": success,
+            "partial_success": partial_success,
             "failed": failed,
-            "success_rate": round(success * 100 / len(completed), 1) if completed else 0,
+            "rate_limited": rate_limited,
+            "text_review": text_review,
+            "measured": measured,
+            "success_rate": round((success + partial_success) * 100 / measured, 1) if measured else 0,
+            "account_switch_requests": switch_requests,
+            "account_switches": switches,
+            "account_switch_success": switch_success,
+            "account_switch_recovery_rate": round(switch_success * 100 / switch_requests, 1) if switch_requests else 0,
+            "switch_unrecovered": max(0, switch_requests - switch_success),
+            "switch_average": round(switches / switch_requests, 1) if switch_requests else 0,
+            "stream_error_requests": stream_error_requests,
             "avg_duration_ms": round(sum(durations) / len(durations)) if durations else 0,
             "p95_duration_ms": self._percentile(durations, 95),
             "metric_p95": metric_p95,

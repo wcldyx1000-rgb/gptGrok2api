@@ -10,6 +10,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from services.call_outcome import (
+    OUTCOME_RATE_LIMITED,
+    call_outcome,
+    call_switch_count,
+    dashboard_outcome,
+)
 from services.config import DATA_DIR
 from services.json_file import read_json_object, write_json_file
 from utils.log import logger
@@ -96,26 +102,48 @@ def _empty_bucket() -> dict[str, Any]:
         "success": 0,
         "failed": 0,
         "rate_limited": 0,
+        # 文本回复：计入 total，但不计入成功/失败（与实时监控口径一致）。
+        "text_review": 0,
+        "switch_requests": 0,
+        "switch_count": 0,
+        "switch_recovered": 0,
         "by_endpoint": {},
         "by_model": {},
         "by_status": {},
         "by_error_code": {},
         "model_total_times": {},
         "model_time_counts": {},
+        # 成功耗时口径：只统计未失败的调用（成功耗时趋势 / 模型耗时 / 模型请求分布使用）。
+        "success_duration_total_ms": 0.0,
+        "success_duration_count": 0,
+        "model_success": {},
+        "model_success_total_times": {},
+        "model_success_time_counts": {},
     }
 
 
 def _merge_bucket(target: dict[str, Any], source: dict[str, Any]) -> None:
-    for key in ("total", "success", "failed", "rate_limited"):
+    for key in ("total", "success", "failed", "rate_limited", "text_review", "switch_requests", "switch_count", "switch_recovered"):
         target[key] = int(target.get(key, 0) or 0) + int(source.get(key, 0) or 0)
-    for key in ("by_endpoint", "by_model", "by_status", "by_error_code", "model_total_times", "model_time_counts"):
+    target["success_duration_total_ms"] = (
+        float(target.get("success_duration_total_ms", 0.0) or 0.0)
+        + float(source.get("success_duration_total_ms", 0.0) or 0.0)
+    )
+    target["success_duration_count"] = (
+        int(target.get("success_duration_count", 0) or 0) + int(source.get("success_duration_count", 0) or 0)
+    )
+    float_maps = {"model_total_times", "model_success_total_times"}
+    for key in (
+        "by_endpoint", "by_model", "by_status", "by_error_code", "model_total_times", "model_time_counts",
+        "model_success", "model_success_total_times", "model_success_time_counts",
+    ):
         target_map = target.setdefault(key, {})
         source_map = source.get(key) if isinstance(source.get(key), dict) else {}
         for name, value in source_map.items():
             try:
-                numeric = float(value) if key == "model_total_times" else int(value)
+                numeric = float(value) if key in float_maps else int(value)
             except (TypeError, ValueError):
-                numeric = 0.0 if key == "model_total_times" else 0
+                numeric = 0.0 if key in float_maps else 0
             target_map[str(name)] = target_map.get(str(name), 0) + numeric
 
 
@@ -179,15 +207,84 @@ def _metrics_file_lock(path: Path):
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-class DashboardMetricsService:
-    """Rolling dashboard aggregates independent from call-log retention."""
+def _rebuild_day_totals(data: dict[str, Any]) -> None:
+    """数据库只存小时桶：日桶统一由小时桶汇总，避免与待写入的日桶重复计数。"""
+    days = data.get("days") if isinstance(data.get("days"), dict) else {}
+    for day_key, day in list(days.items()):
+        hours = day.get("hours") if isinstance(day, dict) and isinstance(day.get("hours"), dict) else {}
+        rebuilt = _empty_bucket()
+        for hour in hours.values():
+            if isinstance(hour, dict):
+                _merge_bucket(rebuilt, hour)
+        rebuilt["hours"] = hours
+        days[day_key] = rebuilt
 
-    def __init__(self, path=DASHBOARD_METRICS_FILE):
+
+def _default_repository_resolver():
+    from services.storage.factory import database_backend_or_none
+
+    backend = database_backend_or_none()
+    if backend is None:
+        return None
+    from services.storage.dashboard_metrics_repository import DashboardMetricsRepository
+
+    return DashboardMetricsRepository(backend)
+
+
+JSON_IMPORT_STATE_KEY = "dashboard_metrics_json_import"
+
+
+class DashboardMetricsService:
+    """Rolling dashboard aggregates independent from call-log retention.
+
+    存储后端为数据库时，小时桶写入数据库（多实例各自累加自己的增量）；否则写 dashboard_metrics.json。
+    """
+
+    def __init__(self, path=DASHBOARD_METRICS_FILE, repository_resolver=None):
         self.path = Path(path)
         self._lock = threading.RLock()
         self._pending = _empty_metrics_data()
         self._dirty = False
         self._flush_timer: threading.Timer | None = None
+        self._repository_resolver = repository_resolver
+        self._repository_value = None
+        self._repository_resolved = repository_resolver is None
+
+    def _repository(self):
+        if self._repository_resolved:
+            return self._repository_value
+        with self._lock:
+            if not self._repository_resolved:
+                repository = None
+                try:
+                    repository = self._repository_resolver()
+                    if repository is not None:
+                        self._import_json_once(repository)
+                except Exception as exc:
+                    logger.error({"event": "dashboard_metrics_repository_init_failed", "error": str(exc)})
+                    repository = None
+                self._repository_value = repository
+                self._repository_resolved = True
+        return self._repository_value
+
+    def _import_json_once(self, repository) -> None:
+        """首次切换到数据库时导入 dashboard_metrics.json；完成标记保证只导入一次。"""
+        if repository.get_state(JSON_IMPORT_STATE_KEY):
+            return
+        imported_days = 0
+        if self.path.exists() and repository.is_empty():
+            with _metrics_file_lock(self.path):
+                data = self._load_persisted()
+            self._prune(data)
+            imported_days = len(data.get("days") or {})
+            repository.merge(data, _merge_bucket)
+        repository.set_state(JSON_IMPORT_STATE_KEY, {"days": imported_days, "at": beijing_now().isoformat(timespec="seconds")})
+
+    @staticmethod
+    def _retention_window(now: datetime | None = None) -> tuple[str, str]:
+        current = (now or _beijing_now_naive()).date()
+        first = current - timedelta(days=DASHBOARD_METRICS_RETENTION_DAYS - 1)
+        return first.strftime("%Y-%m-%d"), current.strftime("%Y-%m-%d")
 
     def _load_persisted(self) -> dict[str, Any]:
         data = read_json_object(self.path, name="dashboard_metrics.json")
@@ -247,11 +344,16 @@ class DashboardMetricsService:
             if not self._dirty:
                 return
             try:
-                with _metrics_file_lock(self.path):
-                    data = self._load_persisted()
-                    _merge_metrics_data(data, self._pending)
-                    self._prune(data)
-                    self._save(data)
+                repository = self._repository()
+                if repository is not None:
+                    repository.merge(self._pending, _merge_bucket)
+                    repository.prune(*self._retention_window())
+                else:
+                    with _metrics_file_lock(self.path):
+                        data = self._load_persisted()
+                        _merge_metrics_data(data, self._pending)
+                        self._prune(data)
+                        self._save(data)
             except Exception:
                 self._dirty = True
                 self._schedule_flush_locked()
@@ -266,22 +368,48 @@ class DashboardMetricsService:
         endpoint = _clean_text(_detail_value(item, "endpoint"))
         model = _clean_text(_detail_value(item, "model"))
         error_code = _clean_text(_detail_value(item, "error_code"))
-        is_failed = status in {"failed", "error", "fail"} or bool(_detail_value(item, "error"))
+        outcome = call_outcome(item)
+        classification = dashboard_outcome(item)
+        is_failed = classification == "final_failed"
+        is_excluded = classification == "excluded"
 
         bucket["total"] = int(bucket.get("total", 0) or 0) + 1
-        if is_failed:
+        if is_excluded:
+            bucket["text_review"] = int(bucket.get("text_review", 0) or 0) + 1
+        elif is_failed:
             bucket["failed"] = int(bucket.get("failed", 0) or 0) + 1
-            if error_code in {"rate_limited", "rate_limit", "429"}:
+            if outcome == OUTCOME_RATE_LIMITED:
                 bucket["rate_limited"] = int(bucket.get("rate_limited", 0) or 0) + 1
         else:
             bucket["success"] = int(bucket.get("success", 0) or 0) + 1
+
+        switch_count = call_switch_count(item)
+        if switch_count > 0:
+            bucket["switch_requests"] = int(bucket.get("switch_requests", 0) or 0) + 1
+            bucket["switch_count"] = int(bucket.get("switch_count", 0) or 0) + switch_count
+            if classification == "success":
+                bucket["switch_recovered"] = int(bucket.get("switch_recovered", 0) or 0) + 1
 
         if status:
             _increment(bucket.setdefault("by_status", {}), status)
         if endpoint.startswith("/"):
             _increment(bucket.setdefault("by_endpoint", {}), endpoint)
+        duration_raw = _detail_value(item, "duration_ms", None)
+        success_duration_ms: float | None = None
+        if not is_failed and not is_excluded and duration_raw not in (None, ""):
+            try:
+                success_duration_ms = max(0.0, float(duration_raw))
+            except (TypeError, ValueError):
+                success_duration_ms = None
+        if success_duration_ms is not None:
+            bucket["success_duration_total_ms"] = (
+                float(bucket.get("success_duration_total_ms", 0.0) or 0.0) + success_duration_ms
+            )
+            bucket["success_duration_count"] = int(bucket.get("success_duration_count", 0) or 0) + 1
         if _looks_like_model_label(model):
             _increment(bucket.setdefault("by_model", {}), model)
+            if not is_failed and not is_excluded:
+                _increment(bucket.setdefault("model_success", {}), model)
             try:
                 duration_ms = max(0.0, float(_detail_value(item, "duration_ms", 0)))
             except (TypeError, ValueError):
@@ -291,6 +419,11 @@ class DashboardMetricsService:
                 counts = bucket.setdefault("model_time_counts", {})
                 totals[model] = float(totals.get(model, 0.0) or 0.0) + duration_ms
                 counts[model] = int(counts.get(model, 0) or 0) + 1
+            if success_duration_ms is not None:
+                s_totals = bucket.setdefault("model_success_total_times", {})
+                s_counts = bucket.setdefault("model_success_time_counts", {})
+                s_totals[model] = float(s_totals.get(model, 0.0) or 0.0) + success_duration_ms
+                s_counts[model] = int(s_counts.get(model, 0) or 0) + 1
         if error_code:
             _increment(bucket.setdefault("by_error_code", {}), error_code)
 
@@ -313,10 +446,45 @@ class DashboardMetricsService:
             self._apply_call_to_data(self._pending, item, dt)
             self._mark_dirty_locked()
 
+    @classmethod
+    def _data_from_items(cls, items) -> dict[str, Any]:
+        data = _empty_metrics_data()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            dt = _parse_log_time(_call_started_at(item))
+            if dt is None:
+                continue
+            cls._apply_call_to_data(data, item, dt)
+        cls._prune(data)
+        return data
+
+    def rebuild_from_records(self, items) -> dict[str, int]:
+        """按调用记录重建指标投影（items 为全部调用日志，顺序不限）。
+
+        待写入的增量对应的调用已经在日志里，重建后一并丢弃，避免重复计数。
+        """
+        data = self._data_from_items(items)
+        with self._lock:
+            repository = self._repository()
+            if repository is not None:
+                repository.replace_all(data)
+            else:
+                with _metrics_file_lock(self.path):
+                    self._save(data)
+            self._pending = _empty_metrics_data()
+            self._dirty = False
+        return {"days": len(data.get("days") or {})}
+
     def backfill_if_empty(self, items: list[dict[str, Any]]) -> None:
         with self._lock:
             pending_days = self._pending.get("days") if isinstance(self._pending.get("days"), dict) else {}
             if pending_days:
+                return
+            repository = self._repository()
+            if repository is not None:
+                if repository.is_empty():
+                    repository.merge(self._data_from_items(reversed(items)), _merge_bucket)
                 return
             with _metrics_file_lock(self.path):
                 data = self._load_persisted()
@@ -337,7 +505,34 @@ class DashboardMetricsService:
                 if changed or data.get("days"):
                     self._save(data)
 
+    def _load_days(self) -> dict[str, Any]:
+        """读取（数据库或 JSON）并与待写入增量合并后的日/小时桶，返回深拷贝。"""
+        with self._lock:
+            repository = self._repository()
+            if repository is not None:
+                data = repository.load(self._retention_window()[0])
+                _merge_metrics_data(data, self._pending)
+                self._prune(data)
+                _rebuild_day_totals(data)
+            else:
+                with _metrics_file_lock(self.path):
+                    data = self._load_persisted()
+                _merge_metrics_data(data, self._pending)
+                if self._prune(data):
+                    self._mark_dirty_locked()
+            raw_days = data.get("days") if isinstance(data.get("days"), dict) else {}
+            days = copy.deepcopy(raw_days)
+        return days
+
     def summary(self, time_range: str = "24h") -> dict[str, Any]:
+        return self._summary_from_days(self._load_days(), time_range)
+
+    def snapshot_many(self, time_ranges=("24h", "7d", "30d")) -> dict[str, dict[str, Any]]:
+        """一次读取，按多个统计周期生成摘要（概览单次快照用）。"""
+        days = self._load_days()
+        return {str(item): self._summary_from_days(days, str(item)) for item in time_ranges}
+
+    def _summary_from_days(self, days: dict[str, Any], time_range: str = "24h") -> dict[str, Any]:
         bucket_count = {"24h": 24, "7d": 7, "30d": 30}.get(time_range, 24)
         bucket_delta = timedelta(hours=1) if time_range == "24h" else timedelta(days=1)
         bucket_format = "%H:00" if time_range == "24h" else "%m-%d"
@@ -350,14 +545,6 @@ class DashboardMetricsService:
         starts = [current_bucket_start - bucket_delta * (bucket_count - 1 - index) for index in range(bucket_count)]
         labels = [start.strftime(bucket_format) for start in starts]
 
-        with self._lock:
-            with _metrics_file_lock(self.path):
-                data = self._load_persisted()
-            _merge_metrics_data(data, self._pending)
-            if self._prune(data):
-                self._mark_dirty_locked()
-            raw_days = data.get("days") if isinstance(data.get("days"), dict) else {}
-            days = copy.deepcopy(raw_days)
 
         total_bucket = _empty_bucket()
         series_buckets: list[dict[str, Any]] = []
@@ -395,14 +582,64 @@ class DashboardMetricsService:
             for counts in [model_time_counts.get(model, [0] * bucket_count)]
         }
 
+        # 成功请求口径：模型请求分布 / 成功耗时趋势 / 模型耗时只看未失败的调用。
+        model_success_requests: dict[str, list[int]] = {}
+        model_success_total_times: dict[str, list[float]] = {}
+        model_success_time_counts: dict[str, list[int]] = {}
+        for index, bucket in enumerate(series_buckets):
+            for source, target, cast in (
+                ("model_success", model_success_requests, int),
+                ("model_success_total_times", model_success_total_times, float),
+                ("model_success_time_counts", model_success_time_counts, int),
+            ):
+                values = bucket.get(source) if isinstance(bucket.get(source), dict) else {}
+                for model, value in values.items():
+                    zero = cast(0)
+                    target.setdefault(str(model), [zero] * bucket_count)[index] += cast(value or 0)
+        model_avg_success_duration_ms: dict[str, list[float | None]] = {
+            model: [
+                round(totals[index] / counts[index], 2) if counts[index] > 0 else None
+                for index in range(bucket_count)
+            ]
+            for model, totals in model_success_total_times.items()
+            for counts in [model_success_time_counts.get(model, [0] * bucket_count)]
+        }
+        success_duration_ms: list[float | None] = []
+        for bucket in series_buckets:
+            duration_count = int(bucket.get("success_duration_count", 0) or 0)
+            duration_total = float(bucket.get("success_duration_total_ms", 0.0) or 0.0)
+            success_duration_ms.append(round(duration_total / duration_count, 2) if duration_count > 0 else None)
+        total_duration_count = int(total_bucket.get("success_duration_count", 0) or 0)
+        avg_success_duration_ms = (
+            round(float(total_bucket.get("success_duration_total_ms", 0.0) or 0.0) / total_duration_count, 2)
+            if total_duration_count > 0
+            else None
+        )
+
         failed_requests = [
             max(0, int(bucket.get("failed", 0) or 0) - int(bucket.get("rate_limited", 0) or 0))
             for bucket in series_buckets
         ]
+        def _success_rate(success: int, failed: int) -> float | None:
+            measured = success + failed
+            return round(success * 100 / measured, 1) if measured > 0 else None
+
+        total_success = int(total_bucket.get("success", 0) or 0)
+        total_failed = int(total_bucket.get("failed", 0) or 0)
+        switch_requests = int(total_bucket.get("switch_requests", 0) or 0)
+        switch_recovered = int(total_bucket.get("switch_recovered", 0) or 0)
         return {
             "total": int(total_bucket.get("total", 0) or 0),
-            "success": int(total_bucket.get("success", 0) or 0),
-            "failed": int(total_bucket.get("failed", 0) or 0),
+            "success": total_success,
+            "failed": total_failed,
+            "text_review": int(total_bucket.get("text_review", 0) or 0),
+            "success_rate": _success_rate(total_success, total_failed),
+            "switching": {
+                "requests": switch_requests,
+                "count": int(total_bucket.get("switch_count", 0) or 0),
+                "recovered": switch_recovered,
+                "recovery_rate": round(switch_recovered * 100 / switch_requests, 1) if switch_requests else None,
+            },
             "by_endpoint": total_bucket.get("by_endpoint", {}),
             "by_model": total_bucket.get("by_model", {}),
             "by_status": total_bucket.get("by_status", {}),
@@ -416,15 +653,32 @@ class DashboardMetricsService:
                 "success_requests": [int(bucket.get("success", 0) or 0) for bucket in series_buckets],
                 "failed_requests": failed_requests,
                 "rate_limited_requests": [int(bucket.get("rate_limited", 0) or 0) for bucket in series_buckets],
+                "text_review_requests": [int(bucket.get("text_review", 0) or 0) for bucket in series_buckets],
+                "success_rate": [
+                    _success_rate(int(bucket.get("success", 0) or 0), int(bucket.get("failed", 0) or 0))
+                    for bucket in series_buckets
+                ],
+                "switch_count": [int(bucket.get("switch_count", 0) or 0) for bucket in series_buckets],
                 "model_requests": model_requests,
                 "model_ttfb_times": {},
                 "model_total_times": model_avg_times,
+                "model_success_requests": model_success_requests,
+                "model_avg_success_duration_ms": model_avg_success_duration_ms,
+                "success_duration_ms": success_duration_ms,
             },
+            "avg_success_duration_ms": avg_success_duration_ms,
         }
 
 
-dashboard_metrics_service = DashboardMetricsService()
+dashboard_metrics_service = DashboardMetricsService(repository_resolver=_default_repository_resolver)
 atexit.register(dashboard_metrics_service.flush)
+
+
+def rebuild_dashboard_metrics() -> dict[str, int]:
+    """从调用日志（文件或数据库）重建看板指标投影。"""
+    from services.log_service import LOG_TYPE_CALL, log_service
+
+    return dashboard_metrics_service.rebuild_from_records(log_service.iter_records(type=LOG_TYPE_CALL))
 
 
 def safe_record_dashboard_call(item: dict[str, Any]) -> None:

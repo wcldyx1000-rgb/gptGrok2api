@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import itertools
@@ -12,13 +13,17 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import anyio
+from anyio.to_thread import run_sync
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from services.call_outcome import apply_outcome_fields
 from services.config import DATA_DIR
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from services.realtime_monitor_service import realtime_monitor_service
+from services.runtime_configuration import image_thread_tokens
 from utils.diagnostics import exception_diagnostic_fields
 from utils.helper import anthropic_sse_stream, image_sse_stream, sse_json_stream
 from utils.log import logger
@@ -26,20 +31,153 @@ from utils.timezone import beijing_from_timestamp, beijing_now_str
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
-INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id", "_call_id", "_image_urls"}
+INTERNAL_RESPONSE_KEYS = {
+    "_account_email",
+    "_conversation_id",
+    "_call_id",
+    "_image_urls",
+    "_image_attempts",
+    "_image_result",
+    "_log_only",
+}
 LOG_IMAGE_URL_RE = re.compile(r"(?:!\[[^\]]*\]\()(?P<url>(?:https?://|/images/|/image-thumbnails/)[^\s)\"']+)\)")
 PERF_WAIT_WARN_MS = 1000
 REQUEST_TEXT_EXCERPT_LIMIT = 1000
 REQUEST_TEXT_FULL_LIMIT = 50000
 
 
+FILE_IMPORT_STATE_KEY = "logs_jsonl_import"
+FILE_IMPORT_BATCH_SIZE = 1000
+
+
+def _default_store_resolver():
+    """存储后端为数据库（SQLite/PostgreSQL/MySQL）时，日志改存数据库；否则返回 None 继续用 logs.jsonl。"""
+    from services.storage.factory import database_backend_or_none
+
+    backend = database_backend_or_none()
+    if backend is None:
+        return None
+    from services.storage.call_record_repository import CallRecordRepository
+
+    return CallRecordRepository(backend)
+
+
 class LogService:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, store_resolver=None):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._line_count_cache: tuple[int, int, int] | None = None
         self._type_count_cache: dict[str, tuple[int, int, int]] = {}
+        self._store_resolver = store_resolver
+        self._store_value = None
+        self._store_resolved = store_resolver is None
+
+    def _store(self):
+        if self._store_resolved:
+            return self._store_value
+        with self._lock:
+            if not self._store_resolved:
+                try:
+                    self._store_value = self._store_resolver()
+                except Exception as exc:
+                    logger.error({"event": "log_store_init_failed", "error": str(exc)})
+                    self._store_value = None
+                self._store_resolved = True
+        return self._store_value
+
+    def uses_database(self) -> bool:
+        return self._store() is not None
+
+    def flush(self, timeout: float = 10.0) -> None:
+        # 进程退出时若从未写过日志，不为了 flush 去初始化存储后端。
+        store = self._store_value if self._store_resolved else None
+        if store is not None:
+            store.flush(timeout)
+
+    def close(self, timeout: float = 5.0) -> None:
+        store = self._store_value if self._store_resolved else None
+        if store is not None:
+            store.close(timeout)
+
+    def _record_write(self, item: dict[str, Any]):
+        from services.storage.call_record_repository import CallRecordWrite
+
+        return CallRecordWrite(
+            payload=item,
+            status=self._clean(self._detail_value(item, "status")),
+            endpoint=self._clean(self._detail_value(item, "endpoint")),
+            model=self._clean(self._detail_value(item, "model")),
+            account_email=self._clean(self._detail_value(item, "account_email")),
+            conversation_id=self._clean(self._detail_value(item, "conversation_id")),
+            is_failed=self._is_failed(item),
+            is_limited=self._is_limited(item),
+            is_image=self._is_image_log(item),
+            search_text=self._search_haystack(item),
+            outcome=self._clean(self._detail_value(item, "outcome")),
+        )
+
+    def import_file_into_store(self) -> dict[str, int | bool]:
+        """把 logs.jsonl 导入数据库；按记录 id 去重并写入完成标记，重复执行不会重复导入。"""
+        store = self._store()
+        if store is None:
+            return {"imported": 0, "skipped": True}
+        if store.get_state(FILE_IMPORT_STATE_KEY):
+            return {"imported": 0, "skipped": True}
+        imported = 0
+        scanned = 0
+        if self.path.exists():
+            batch = []
+            with self.path.open("r", encoding="utf-8", errors="ignore") as file:
+                for line_number, raw_line in enumerate(file):
+                    item = self._parse_line(raw_line.rstrip("\n").rstrip("\r"), line_number)
+                    if item is None:
+                        continue
+                    scanned += 1
+                    batch.append(self._record_write(item))
+                    if len(batch) >= FILE_IMPORT_BATCH_SIZE:
+                        imported += store.append_many(batch)
+                        batch = []
+            if batch:
+                imported += store.append_many(batch)
+        store.set_state(FILE_IMPORT_STATE_KEY, {"imported": imported, "scanned": scanned, "at": beijing_now_str()})
+        logger.info({"event": "log_store_file_import_done", "imported": imported, "scanned": scanned})
+        return {"imported": imported, "skipped": False}
+
+    def start_store_migration(self) -> threading.Thread | None:
+        """后台导入旧日志文件，不阻塞服务启动。"""
+        if not self.uses_database():
+            return None
+
+        def _run() -> None:
+            try:
+                result = self.import_file_into_store()
+                if not result.get("skipped"):
+                    # 旧文件里可能有超过保留期的记录，导入后立即按保留期清理一次。
+                    from services.config import config
+
+                    self.cleanup_old_hours(config.log_retention_hours)
+            except Exception as exc:
+                logger.error({"event": "log_store_file_import_failed", "error": str(exc)})
+
+        thread = threading.Thread(target=_run, daemon=True, name="log-store-import")
+        thread.start()
+        return thread
+
+    def iter_records(self, type: str = ""):
+        """按写入顺序遍历全部记录（用于重建看板指标）。"""
+        store = self._store()
+        if store is not None:
+            store.flush()
+            yield from store.iter_records(type=type)
+            return
+        if not self.path.exists():
+            return
+        with self.path.open("r", encoding="utf-8", errors="ignore") as file:
+            for line_number, raw_line in enumerate(file):
+                item = self._parse_line(raw_line.rstrip("\n").rstrip("\r"), line_number)
+                if item is not None and (not type or item.get("type") == type):
+                    yield item
 
     @staticmethod
     def _legacy_id(raw_line: str, line_number: int) -> str:
@@ -149,6 +287,14 @@ class LogService:
             return False
         if normalized_status == "limited" and not cls._is_limited(item):
             return False
+        if normalized_status in {"partial", "partial_success"} and (
+            cls._clean(cls._detail_value(item, "outcome")).lower() != "partial_success"
+        ):
+            return False
+        if normalized_status in {"text", "text_review"} and (
+            cls._clean(cls._detail_value(item, "outcome")).lower() != "text_review"
+        ):
+            return False
         if endpoint and cls._clean(cls._detail_value(item, "endpoint")) != endpoint:
             return False
         if model and cls._clean(cls._detail_value(item, "model")) != model:
@@ -158,32 +304,34 @@ class LogService:
         if conversation_id and cls._clean(cls._detail_value(item, "conversation_id")) != conversation_id:
             return False
         query = cls._clean(search).lower()
-        if query:
-            haystack = " ".join(
-                cls._clean(value)
-                for value in (
-                    item.get("id"),
-                    item.get("time"),
-                    item.get("type"),
-                    item.get("summary"),
-                    cls._detail_value(item, "endpoint"),
-                    cls._detail_value(item, "model"),
-                    cls._detail_value(item, "status"),
-                    cls._detail_value(item, "key_id"),
-                    cls._detail_value(item, "key_name"),
-                    cls._detail_value(item, "account_email"),
-                    cls._detail_value(item, "conversation_id"),
-                    cls._detail_value(item, "request_text"),
-                    cls._detail_value(item, "request_text_full"),
-                    cls._detail_value(item, "error"),
-                    cls._detail_value(item, "error_code"),
-                    cls._detail_value(item, "reason"),
-                    cls._detail_value(item, "stage"),
-                )
-            ).lower()
-            if query not in haystack:
-                return False
+        if query and query not in cls._search_haystack(item):
+            return False
         return True
+
+    @classmethod
+    def _search_haystack(cls, item: dict[str, Any]) -> str:
+        return " ".join(
+            cls._clean(value)
+            for value in (
+                item.get("id"),
+                item.get("time"),
+                item.get("type"),
+                item.get("summary"),
+                cls._detail_value(item, "endpoint"),
+                cls._detail_value(item, "model"),
+                cls._detail_value(item, "status"),
+                cls._detail_value(item, "key_id"),
+                cls._detail_value(item, "key_name"),
+                cls._detail_value(item, "account_email"),
+                cls._detail_value(item, "conversation_id"),
+                cls._detail_value(item, "request_text"),
+                cls._detail_value(item, "request_text_full"),
+                cls._detail_value(item, "error"),
+                cls._detail_value(item, "error_code"),
+                cls._detail_value(item, "reason"),
+                cls._detail_value(item, "stage"),
+            )
+        ).lower()
 
     def _line_count(self) -> int:
         if not self.path.exists():
@@ -364,6 +512,8 @@ class LogService:
                 "failed": int(stats["failed"]),
                 "limited": int(stats["limited"]),
                 "image": int(stats["image"]),
+                "partial_success": int(stats["partial_success"]),
+                "text_review": int(stats["text_review"]),
             },
         }
 
@@ -397,6 +547,11 @@ class LogService:
             stats["limited"] += 1
         if self._is_image_log(item):
             stats["image"] += 1
+        outcome = self._clean(self._detail_value(item, "outcome")).lower()
+        if outcome == "partial_success":
+            stats["partial_success"] += 1
+        elif outcome == "text_review":
+            stats["text_review"] += 1
 
     def _list_page_fast(self, *, type: str = "", limit: int, offset: int) -> dict[str, Any]:
         total_lines = self._line_count()
@@ -453,15 +608,23 @@ class LogService:
             "summary": summary,
             "detail": detail or data,
         }
-        with self._lock:
-            with self.path.open("a", encoding="utf-8") as file:
-                file.write(self._serialize_item(item) + "\n")
+        store = self._store()
+        if store is not None:
+            store.enqueue(self._record_write(item))
+        else:
+            with self._lock:
+                with self.path.open("a", encoding="utf-8") as file:
+                    file.write(self._serialize_item(item) + "\n")
         if type == LOG_TYPE_CALL:
             from services.dashboard_metrics_service import safe_record_dashboard_call
 
             safe_record_dashboard_call(item)
 
     def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
+        store = self._store()
+        if store is not None:
+            store.flush()
+            return store.list(type=type, start_date=start_date, end_date=end_date, limit=limit)
         if not self.path.exists():
             return []
         items: list[dict[str, Any]] = []
@@ -490,6 +653,26 @@ class LogService:
     ) -> dict[str, Any]:
         safe_limit = max(1, min(int(limit or 200), 20000))
         safe_offset = max(0, int(offset or 0))
+        store = self._store()
+        if store is not None:
+            from services.storage.call_record_repository import CallRecordQuery
+
+            store.flush()
+            return store.list_page(
+                CallRecordQuery(
+                    type=type,
+                    start_date=start_date,
+                    end_date=end_date,
+                    status=status,
+                    endpoint=endpoint,
+                    model=model,
+                    account=account,
+                    conversation_id=conversation_id,
+                    search=search,
+                ),
+                limit=safe_limit,
+                offset=safe_offset,
+            )
         if not self._has_precise_query(
             start_date=start_date,
             end_date=end_date,
@@ -553,8 +736,32 @@ class LogService:
             stats=stats,
         )
 
+    def get_detail(self, log_id: str) -> dict[str, Any] | None:
+        """Full record (never compacted) by id, from the database or logs.jsonl."""
+        target = str(log_id or "").strip()
+        if not target:
+            return None
+        store = self._store()
+        if store is not None:
+            store.flush()
+            return store.get(target)
+        if not self.path.exists():
+            return None
+        for raw_line, line_number in self._iter_raw_lines_reverse() or ():
+            # 新记录的 id 写在行内，先做子串过滤避免逐行 JSON 解析；没有 id 的旧记录才需要解析后比对。
+            if target not in raw_line and '"id"' in raw_line:
+                continue
+            item = self._parse_line(raw_line, line_number)
+            if item is not None and str(item.get("id") or "") == target:
+                return item
+        return None
+
     def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
+        store = self._store()
+        if store is not None:
+            store.flush()
+            return {"removed": store.delete(target_ids)}
         if not self.path.exists() or not target_ids:
             return {"removed": 0}
         with self._lock:
@@ -577,13 +784,28 @@ class LogService:
         return {"removed": removed}
 
     def _cleanup_old(self, retention_days: int, *, dry_run: bool) -> dict[str, int | bool]:
+        try:
+            hours = max(1, int(retention_days)) * 24
+        except (TypeError, ValueError):
+            hours = 30 * 24
+        return self._cleanup_old_hours(hours, dry_run=dry_run)
+
+    def _cleanup_old_hours(self, retention_hours: int, *, dry_run: bool) -> dict[str, int | bool]:
+        store = self._store()
+        if store is not None:
+            try:
+                hours = max(1, int(retention_hours))
+            except (TypeError, ValueError):
+                hours = 24
+            store.flush()
+            return store.cleanup_before(beijing_from_timestamp(time.time() - hours * 3600), dry_run=dry_run)
         if not self.path.exists():
             return {"removed": 0, "kept": 0, "removed_size_bytes": 0, "dry_run": dry_run}
         try:
-            days = max(1, int(retention_days))
+            hours = max(1, int(retention_hours))
         except (TypeError, ValueError):
-            days = 30
-        cutoff = time.time() - days * 86400
+            hours = 24
+        cutoff = time.time() - hours * 3600
         with self._lock:
             removed = 0
             kept = 0
@@ -628,30 +850,79 @@ class LogService:
     def cleanup_old(self, retention_days: int) -> dict[str, int | bool]:
         return self._cleanup_old(retention_days, dry_run=False)
 
+    def preview_cleanup_old_hours(self, retention_hours: int) -> dict[str, int | bool]:
+        return self._cleanup_old_hours(retention_hours, dry_run=True)
 
-log_service = LogService(DATA_DIR / "logs.jsonl")
+    def cleanup_old_hours(self, retention_hours: int) -> dict[str, int | bool]:
+        return self._cleanup_old_hours(retention_hours, dry_run=False)
+
+
+log_service = LogService(DATA_DIR / "logs.jsonl", store_resolver=_default_store_resolver)
+atexit.register(log_service.flush, 5.0)
+
+
+LOG_DETAIL_ONLY_KEYS = (
+    "request_text_full",
+    "request_text_truncated",
+    "monitor",
+    "image_attempts",
+)
+LOG_COMPACT_TEXT_LIMIT = 400
+LOG_COMPACT_EGRESS_KEYS = (
+    "proxy_source",
+    "proxy_hash",
+    "egress_key",
+    "egress_label",
+    "proxy_group_id",
+    "proxy_node_id",
+    "proxy_node_name",
+    "image_egress_limit",
+    "has_proxy",
+    "egress_mode",
+)
+
+
+def compact_log_item(item: dict[str, Any]) -> dict[str, Any]:
+    """List-view projection: drops heavy detail-only fields and shortens long text.
+
+    The full record is available from LogService.get_detail(id) (GET /api/logs/{id}).
+    """
+    detail = item.get("detail")
+    if not isinstance(detail, dict):
+        return item
+    compact: dict[str, Any] = {}
+    for key, value in detail.items():
+        if key in LOG_DETAIL_ONLY_KEYS:
+            continue
+        if isinstance(value, str) and len(value) > LOG_COMPACT_TEXT_LIMIT:
+            value = value[: LOG_COMPACT_TEXT_LIMIT - 1].rstrip() + "…"
+        compact[key] = value
+    monitor = detail.get("monitor")
+    if isinstance(monitor, dict):
+        for key in LOG_COMPACT_EGRESS_KEYS:
+            if key not in compact and monitor.get(key) not in (None, ""):
+                compact[key] = monitor[key]
+    attempts = detail.get("image_attempts")
+    if isinstance(attempts, list) and attempts:
+        compact["image_attempt_count"] = len(attempts)
+    compact["detail_compact"] = True
+    return {**item, "detail": compact}
+
+
+def compact_log_page(page: dict[str, Any]) -> dict[str, Any]:
+    items = page.get("items")
+    if not isinstance(items, list):
+        return page
+    return {**page, "items": [compact_log_item(item) if isinstance(item, dict) else item for item in items]}
 
 
 def cleanup_old_logs() -> dict[str, int]:
     from services.config import config
 
-    return log_service.cleanup_old(config.log_retention_days)
+    return log_service.cleanup_old_hours(config.log_retention_hours)
 
 
-def _auto_cleanup_worker(stop_event: threading.Event) -> None:
-    while not stop_event.wait(1800):
-        try:
-            result = cleanup_old_logs()
-            if int(result.get("removed") or 0) > 0:
-                logger.info({"event": "log_auto_cleanup_done", **result})
-        except Exception as exc:
-            logger.error({"event": "log_auto_cleanup_failed", "error": str(exc)})
-
-
-def start_log_cleanup_scheduler(stop_event: threading.Event) -> threading.Thread:
-    thread = threading.Thread(target=_auto_cleanup_worker, args=(stop_event,), daemon=True, name="log-cleanup")
-    thread.start()
-    return thread
+# 定时清理已统一由 services.retention_cleanup_service 的协调器负责（按小时、日志+图片一并处理）。
 
 
 def _collect_urls(value: object) -> list[str]:
@@ -726,6 +997,11 @@ def _image_trace_metadata(body: dict[str, Any]) -> dict[str, object]:
     return metadata
 
 
+def image_request_meta(body: dict[str, Any]) -> dict[str, object]:
+    """Request-side image params (size/quality/response_format/n...) for the log detail."""
+    return _image_trace_metadata(body if isinstance(body, dict) else {})
+
+
 def _image_result_metrics(value: object) -> dict[str, object]:
     metrics = {
         "result_data_count": 0,
@@ -763,6 +1039,189 @@ def _image_result_metrics(value: object) -> dict[str, object]:
     }
 
 
+IMAGE_ATTEMPT_TEXT_KEYS = (
+    "status",
+    "egress_key",
+    "egress_label",
+    "proxy_source",
+    "proxy_group_id",
+    "proxy_node_name",
+    "failure_code",
+    "failure_scope",
+    "failure_capability",
+    "error_type",
+    "retry_kind",
+)
+IMAGE_ATTEMPT_INT_KEYS = ("slot", "attempt", "duration_ms", "status_code")
+IMAGE_ATTEMPT_BOOL_KEYS = (
+    "switched_account",
+    "egress_fallback",
+    "failure_retryable",
+    "failure_account_failure",
+    "failure_switch_account",
+)
+MAX_RESULT_IMAGES = 32
+MAX_URL_DIMENSION_LOOKUPS = 8
+
+
+def mask_account_email(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "@" in text:
+        local, _, domain = text.partition("@")
+        return f"{local[:2] if len(local) > 2 else local[:1]}***@{domain}"
+    return f"{text[:3]}***" if len(text) > 3 else text
+
+
+def normalize_image_attempt(value: object) -> dict[str, object] | None:
+    """Keep only the whitelisted attempt fields; the account is masked, the raw email dropped."""
+    if not isinstance(value, dict) or "attempt" not in value or "status" not in value:
+        return None
+    attempt: dict[str, object] = {}
+    for key in IMAGE_ATTEMPT_TEXT_KEYS:
+        text = str(value.get(key) or "").strip()
+        if text:
+            attempt[key] = text[:200]
+    for key in IMAGE_ATTEMPT_INT_KEYS:
+        try:
+            parsed = int(value.get(key))
+        except (TypeError, ValueError):
+            continue
+        if parsed >= 0:
+            attempt[key] = parsed
+    for key in IMAGE_ATTEMPT_BOOL_KEYS:
+        if isinstance(value.get(key), bool):
+            attempt[key] = value[key]
+    account = mask_account_email(value.get("account") or value.get("account_email"))
+    if account:
+        attempt["account"] = account
+    if "attempt" not in attempt or "status" not in attempt:
+        return None
+    attempt.setdefault("slot", 1)
+    return attempt
+
+
+def collect_image_attempts(value: object) -> list[dict[str, object]]:
+    """Collect normalized attempts from results, stream chunks and exceptions (deduped, ordered)."""
+    attempts: list[dict[str, object]] = []
+    seen: set[str] = set()
+    pending: list[object] = [value]
+    visited: set[int] = set()
+    while pending:
+        item = pending.pop()
+        if isinstance(item, BaseException):
+            pending.append(getattr(item, "image_attempts", None))
+            continue
+        if isinstance(item, dict):
+            if id(item) in visited:
+                continue
+            visited.add(id(item))
+            normalized = normalize_image_attempt(item)
+            if normalized is not None:
+                signature = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+                if signature not in seen:
+                    seen.add(signature)
+                    attempts.append(normalized)
+                continue
+            for key, child in item.items():
+                if key in {"_image_attempts", "image_attempts"} or isinstance(child, (dict, list, tuple)):
+                    pending.append(child)
+        elif isinstance(item, (list, tuple)):
+            pending.extend(reversed(item))
+    attempts.sort(key=lambda entry: (int(entry.get("slot") or 1), int(entry.get("attempt") or 0)))
+    return attempts
+
+
+def _positive_int(value: object) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _local_image_dimensions(url: str) -> tuple[int, int] | None:
+    """Read the size of a locally stored /images/ file (chat-style image replies carry no size)."""
+    marker = "/images/"
+    index = url.find(marker)
+    if index < 0:
+        return None
+    relative = url[index + len(marker):].split("?", 1)[0].split("#", 1)[0]
+    if not relative:
+        return None
+    try:
+        from services.image_service import _image_dimensions, _safe_image_path
+
+        return _image_dimensions(_safe_image_path(relative))
+    except Exception:
+        return None
+
+
+def collect_result_images(value: object, urls: list[str] | None = None) -> list[dict[str, int]]:
+    """Actual output sizes: width/height on result data items, SSE `_image_result`, else local file lookup."""
+    images: list[dict[str, int]] = []
+    seen_ids: set[int] = set()
+
+    def visit(item: object) -> None:
+        if len(images) >= MAX_RESULT_IMAGES:
+            return
+        if isinstance(item, dict):
+            if id(item) in seen_ids:
+                return
+            seen_ids.add(id(item))
+            inner = item.get("_image_result")
+            if isinstance(inner, dict):
+                width = _positive_int(inner.get("width"))
+                height = _positive_int(inner.get("height"))
+                if width and height:
+                    images.append({"width": width, "height": height})
+                    return
+            width = _positive_int(item.get("width"))
+            height = _positive_int(item.get("height"))
+            if width and height and any(item.get(key) for key in ("url", "b64_json", "revised_prompt")):
+                images.append({"width": width, "height": height})
+                return
+            for nested in item.values():
+                if isinstance(nested, (dict, list)):
+                    visit(nested)
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    if not images and urls:
+        for url in urls[:MAX_URL_DIMENSION_LOOKUPS]:
+            dimensions = _local_image_dimensions(str(url))
+            if dimensions:
+                images.append({"width": int(dimensions[0]), "height": int(dimensions[1])})
+    return images
+
+
+def image_result_summary(value: object, urls: list[str] | None = None) -> dict[str, object]:
+    """Detail fields for the actual output: `result_images` (sizes) and `result_image_count`."""
+    images = collect_result_images(value, urls)
+    if not images:
+        return {}
+    return {"result_images": images, "result_image_count": len(images)}
+
+
+def format_result_resolutions(images: object) -> str:
+    """List column text, e.g. "1024x1024" (or "1024x1024 x2" when all sizes match)."""
+    if not isinstance(images, list):
+        return ""
+    labels = [
+        f"{image['width']}×{image['height']}"
+        for image in images
+        if isinstance(image, dict) and image.get("width") and image.get("height")
+    ]
+    if not labels:
+        return ""
+    unique = list(dict.fromkeys(labels))
+    if len(unique) == 1:
+        return unique[0] if len(labels) == 1 else f"{unique[0]} ×{len(labels)}"
+    return " / ".join(unique)
+
+
 def _strip_internal_response_fields(value: object) -> object:
     if isinstance(value, dict):
         return {
@@ -796,7 +1255,11 @@ def _request_full_text(text: object, limit: int = REQUEST_TEXT_FULL_LIMIT) -> tu
 
 
 def _exception_log_fields(exc: Exception) -> dict[str, object]:
-    return exception_diagnostic_fields(exc, include_status_code=True)
+    fields = exception_diagnostic_fields(exc, include_status_code=True)
+    attempts = collect_image_attempts(exc)
+    if attempts:
+        fields["image_attempts"] = attempts
+    return fields
 
 def _image_error_response(exc: Exception) -> JSONResponse:
     from services.protocol.conversation import public_image_error_message
@@ -818,7 +1281,14 @@ def _image_error_response(exc: Exception) -> JSONResponse:
             },
             429,
         )
-    return openai_error_response(message, 502)
+    # 结构化 type/code/状态码，不再一律 502 + 原始异常文本。
+    from services.image_failure import classify_image_exception
+
+    failure = classify_image_exception(exc)
+    return JSONResponse(
+        status_code=int(failure.status_code),
+        content={"error": {"message": message, "type": failure.error_type, "param": None, "code": failure.code}},
+    )
 
 
 def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSONResponse:
@@ -833,6 +1303,43 @@ def _next_item(items):
         return True, next(items)
     except StopIteration:
         return False, None
+
+
+_image_thread_limiter: anyio.CapacityLimiter | None = None
+
+
+def image_thread_limiter() -> anyio.CapacityLimiter:
+    """生图请求专用的线程上限（在事件循环内首次使用时创建）。
+
+    排队等账号的生图请求会一直占着线程；和对话共用默认线程池时，生图一多就会把对话和其他
+    接口挤到入口排队。分开后生图最多占这么多线程，超出的在异步层排队、不占线程。
+    """
+    global _image_thread_limiter
+    if _image_thread_limiter is None:
+        _image_thread_limiter = anyio.CapacityLimiter(image_thread_tokens())
+    return _image_thread_limiter
+
+
+async def _run_blocking(fn, image_request: bool):
+    if image_request:
+        return await run_sync(fn, limiter=image_thread_limiter())
+    return await run_in_threadpool(fn)
+
+
+async def _iterate_with_image_limiter(iterator):
+    """同步迭代器的每次读取都走生图线程上限，不占默认线程池。"""
+    sentinel = object()
+    iterator = iter(iterator)
+    try:
+        while True:
+            item = await run_sync(lambda: next(iterator, sentinel), limiter=image_thread_limiter())
+            if item is sentinel:
+                return
+            yield item
+    finally:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close()
 
 
 @dataclass
@@ -892,7 +1399,7 @@ class LoggedCall:
                     self.perf_timings["handler_exec_ms"] = int((time.perf_counter() - handler_started) * 1000)
 
         try:
-            result = await run_in_threadpool(_call_handler)
+            result = await _run_blocking(_call_handler, self._trace_image_perf())
         except ImageGenerationError as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""), extra=_exception_log_fields(exc))
@@ -903,7 +1410,7 @@ class LoggedCall:
         except Exception as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      extra=_exception_log_fields(exc))
-            if self.endpoint.startswith("/v1/images"):
+            if self.endpoint.startswith("/v1/images") or self._trace_image_perf():
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
 
@@ -944,7 +1451,7 @@ class LoggedCall:
                     self.perf_timings["stream_first_exec_ms"] = int((time.perf_counter() - first_item_started) * 1000)
 
         try:
-            has_first, first = await run_in_threadpool(_next_item_with_timing)
+            has_first, first = await _run_blocking(_next_item_with_timing, self._trace_image_perf())
         except ImageGenerationError as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""), extra=_exception_log_fields(exc))
@@ -955,13 +1462,16 @@ class LoggedCall:
         except Exception as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      extra=_exception_log_fields(exc))
-            if self.endpoint.startswith("/v1/images"):
+            if self.endpoint.startswith("/v1/images") or self._trace_image_perf():
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
             self.log("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
-        return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
+        body = sender(self.stream(itertools.chain([first], result)))
+        if self._trace_image_perf():
+            body = _iterate_with_image_limiter(body)
+        return StreamingResponse(body, media_type="text/event-stream")
 
     def _trace_image_perf(self) -> bool:
         model = str(self.model or "").strip().lower()
@@ -984,15 +1494,37 @@ class LoggedCall:
         urls: list[str] = []
         account_emails: list[str] = []
         conversation_ids: list[str] = []
+        result_images: list[dict[str, int]] = []
+        stream_attempts: list[dict[str, object]] = []
         failed = False
+        image_call = self._trace_image_perf()
+        image_completed = False
+        image_failure = ""
         try:
             for item in items:
+                event_type = str(item.get("type") or "") if isinstance(item, dict) else ""
+                if event_type.endswith(".completed"):
+                    image_completed = True
+                elif event_type.endswith(".failed") and not image_failure:
+                    error = item.get("error")
+                    image_failure = str((error or {}).get("message") if isinstance(error, dict) else error or "") or event_type
                 urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))
+                if image_call:
+                    result_images.extend(collect_result_images(item))
+                    stream_attempts = collect_image_attempts([stream_attempts, item])
+                if isinstance(item, dict) and item.get("_log_only"):
+                    continue
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
             failed = True
+            extra = _exception_log_fields(exc)
+            if result_images:
+                extra.update({"result_images": result_images[:MAX_RESULT_IMAGES], "result_image_count": len(result_images)})
+            combined = collect_image_attempts([stream_attempts, exc])
+            if combined:
+                extra["image_attempts"] = combined
             self.log(
                 "流式调用失败",
                 status="failed",
@@ -1000,7 +1532,7 @@ class LoggedCall:
                 urls=urls,
                 account_email=(account_emails[0] if account_emails else getattr(exc, "account_email", "")),
                 conversation_id=(conversation_ids[0] if conversation_ids else getattr(exc, "conversation_id", "")),
-                extra=_exception_log_fields(exc),
+                extra=extra,
             )
             if self.endpoint.startswith("/v1/images") and not hasattr(exc, "to_openai_error"):
                 from services.protocol.conversation import ImageGenerationError, public_image_error_message
@@ -1009,8 +1541,19 @@ class LoggedCall:
             raise
         finally:
             if not failed:
-                self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
-                         conversation_id=conversation_ids[0] if conversation_ids else "")
+                extra: dict[str, object] = {}
+                if result_images:
+                    extra["result_images"] = result_images[:MAX_RESULT_IMAGES]
+                    extra["result_image_count"] = len(result_images)
+                if stream_attempts:
+                    extra["image_attempts"] = stream_attempts
+                if image_call and image_failure and not image_completed:
+                    self.log("流式调用失败", status="failed", error=image_failure, urls=urls,
+                             account_email=account_emails[0] if account_emails else "",
+                             conversation_id=conversation_ids[0] if conversation_ids else "", extra=extra or None)
+                else:
+                    self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
+                             conversation_id=conversation_ids[0] if conversation_ids else "", extra=extra or None)
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", conversation_id: str = "",
@@ -1066,6 +1609,12 @@ class LoggedCall:
             image_metrics = _image_result_metrics(result)
             if image_metrics:
                 detail.update(image_metrics)
+            if "result_images" not in detail:
+                detail.update(image_result_summary(result, detail.get("urls") if isinstance(detail.get("urls"), list) else None))
+            attempts = collect_image_attempts([result, detail.get("image_attempts")])
+            if attempts:
+                detail["image_attempts"] = attempts
+        apply_outcome_fields(detail)
         if self._trace_image_perf():
             realtime_monitor_service.finish(detail)
         log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)
