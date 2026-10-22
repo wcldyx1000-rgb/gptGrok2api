@@ -10,11 +10,18 @@
           <Button size="sm" variant="outline" :disabled="settingsStore.isLoading || isSaving" @click="reloadSettings">
             {{ settingsStore.isLoading ? '刷新中...' : '刷新' }}
           </Button>
-          <Button size="sm" variant="primary" :disabled="isSaving || !localSettings" @click="handleSave">
+          <Button size="sm" variant="primary" :disabled="isSaving || !localSettings || hasInvalidNumberSettings" :title="hasInvalidNumberSettings ? '有数值设置超出范围，请先修正标红的输入' : ''" @click="handleSave">
             {{ isSaving ? '保存中...' : '保存设置' }}
           </Button>
         </div>
       </div>
+
+      <SurfaceBox v-if="revisionStale" density="compact">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <p class="text-xs leading-5 text-warning">设置已在别处被修改。当前页面的未保存编辑仍保留，重新加载将丢弃它们并显示最新设置。</p>
+          <Button size="sm" variant="outline" :disabled="settingsStore.isLoading || isSaving" @click="reloadDiscardingEdits">重新加载</Button>
+        </div>
+      </SurfaceBox>
 
       <ConsoleSegmentedTabs v-model="activeSettingsTab" :options="settingsTabs" aria-label="设置分组" />
 
@@ -30,17 +37,27 @@
             <SettingsBasicConfigPanel
               :settings="localSettings"
               :refresh-account-interval-field="refreshAccountIntervalField"
-              :image-retention-days-field="imageRetentionDaysField"
-              :log-retention-days-field="logRetentionDaysField"
+              :image-retention-hours-field="imageRetentionHoursField"
+              :log-retention-hours-field="logRetentionHoursField"
+              :image-min-free-mb-field="imageMinFreeMbField"
+              :cleanup-busy="cleanupBusy"
+              :console-request-timeout-field="consoleRequestTimeoutField"
               :image-poll-timeout-field="imagePollTimeoutField"
               :image-stream-timeout-field="imageStreamTimeoutField"
               :image-account-concurrency-field="imageAccountConcurrencyField"
               :image-timeout-retry-field="imageTimeoutRetryField"
               :proxy-busy="proxyBusy"
               :proxy-test-result="proxyTestResult"
+              :base-url-read-only="baseUrlReadOnly"
               @clear-proxy-test-result="proxyTestResult = null"
               @test-default-proxy="testDefaultProxy"
+              @preview-cleanup="settingsConfigRuntime.previewCleanupNow"
+              @run-cleanup="settingsConfigRuntime.runCleanupNow"
             />
+
+            <SettingsAccountPoolPanel :settings="localSettings" />
+
+            <SettingsDashboardPreferencesPanel />
 
             <SettingsProxyRuntimePanel
               v-model:clearance-test-target="clearanceTestTarget"
@@ -248,7 +265,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent } from 'vue'
 import { Button, FormField, FormSection, HelpTip } from 'nanocat-ui'
-import { normalizeProxyRuntime } from '@/api/settings'
+import { normalizeProxyRuntime, settingsApi } from '@/api/settings'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import ConsoleSegmentedTabs from '@/components/ai/ConsoleSegmentedTabs.vue'
 import ModalBody from '@/components/ai/ModalBody.vue'
@@ -261,9 +278,11 @@ import {
   backupStatusText as buildBackupStatusText,
   settingsTabs,
 } from '@/views/settings/settingsView'
+import SettingsAccountPoolPanel from '@/views/settings/SettingsAccountPoolPanel.vue'
 import SettingsBasicConfigPanel from '@/views/settings/SettingsBasicConfigPanel.vue'
 import SettingsBasicPolicyPanel from '@/views/settings/SettingsBasicPolicyPanel.vue'
 import SettingsBackupPanel from '@/views/settings/SettingsBackupPanel.vue'
+import SettingsDashboardPreferencesPanel from '@/views/settings/SettingsDashboardPreferencesPanel.vue'
 import SettingsExternalSourceModals from '@/views/settings/SettingsExternalSourceModals.vue'
 import SettingsExternalSourcesPanel from '@/views/settings/SettingsExternalSourcesPanel.vue'
 import SettingsImageErrorsPanel from '@/views/settings/SettingsImageErrorsPanel.vue'
@@ -280,7 +299,7 @@ import { useSettingsImageStorageRuntime } from '@/views/settings/settingsImageSt
 import { useSettingsProxyRuntime } from '@/views/settings/settingsProxyRuntime'
 import { useSettingsTabRuntime } from '@/views/settings/settingsTabRuntime'
 import { useSettingsUserKeysRuntime } from '@/views/settings/settingsUserKeysRuntime'
-import { useNumberSettingField } from '@/views/settings/useNumberSettingField'
+import { hasInvalidNumberSettings, useNumberSettingField } from '@/views/settings/useNumberSettingField'
 
 defineOptions({ name: 'Settings' })
 
@@ -309,7 +328,18 @@ const settingsLoadError = settingsConfigRuntime.settingsLoadError
 const hasUnsavedSettings = settingsConfigRuntime.hasUnsavedSettings
 const requireSavedSettings = settingsConfigRuntime.requireSavedSettings
 const reloadSettings = settingsConfigRuntime.reloadSettings
+const revisionStale = settingsConfigRuntime.revisionStale
+const reloadDiscardingEdits = settingsConfigRuntime.reloadDiscardingEdits
+const baseUrlReadOnly = computed(() => {
+  // 依赖 settings 以便重新加载后刷新；读取的是最近一次 GET /api/settings 的 read_only 信息。
+  void settingsStore.settings
+  return settingsApi.getReadOnlyFields().base_url?.message || ''
+})
+// 页面从隐藏回到可见（或从其它页返回）时检查 revision，变化则提示重新加载。
+pageRuntime.onShow(() => { void settingsConfigRuntime.checkRevisionStale() })
+pageRuntime.onActivate(({ initial }) => { if (!initial) void settingsConfigRuntime.checkRevisionStale() })
 const handleSave = settingsConfigRuntime.handleSave
+const cleanupBusy = settingsConfigRuntime.cleanupBusy
 const backupRuntime = useSettingsBackupRuntime({
   runtime: pageRuntime,
   requestKey: BACKUPS_REQUEST_KEY,
@@ -423,21 +453,29 @@ const testDefaultProxy = proxyRuntime.testDefaultProxy
 const loadProxyRuntimeStatus = proxyRuntime.loadProxyRuntimeStatus
 const testProxyClearance = proxyRuntime.testProxyClearance
 
-const imageRetentionDaysField = useNumberSettingField(
-  () => localSettings.value?.image_retention_days ?? 15,
+const imageRetentionHoursField = useNumberSettingField(
+  () => localSettings.value?.image_retention_hours ?? 720,
   (value) => {
     if (!localSettings.value) return
-    localSettings.value.image_retention_days = value
+    localSettings.value.image_retention_hours = value
   },
-  { integer: true, min: 1, fallback: 15 },
+  { integer: true, min: 1, fallback: 24 },
 )
-const logRetentionDaysField = useNumberSettingField(
-  () => localSettings.value?.log_retention_days ?? 30,
+const logRetentionHoursField = useNumberSettingField(
+  () => localSettings.value?.log_retention_hours ?? 720,
   (value) => {
     if (!localSettings.value) return
-    localSettings.value.log_retention_days = value
+    localSettings.value.log_retention_hours = value
   },
-  { integer: true, min: 1, fallback: 30 },
+  { integer: true, min: 1, fallback: 24 },
+)
+const imageMinFreeMbField = useNumberSettingField(
+  () => localSettings.value?.image_min_free_mb ?? 500,
+  (value) => {
+    if (!localSettings.value) return
+    localSettings.value.image_min_free_mb = value
+  },
+  { integer: true, min: 0, fallback: 500 },
 )
 const refreshAccountIntervalField = useNumberSettingField(
   () => localSettings.value?.refresh_account_interval_minute ?? 5,
@@ -445,7 +483,7 @@ const refreshAccountIntervalField = useNumberSettingField(
     if (!localSettings.value) return
     localSettings.value.refresh_account_interval_minute = value
   },
-  { integer: true, min: 1, fallback: 5 },
+  { integer: true, min: 1, max: 10080, fallback: 5 },
 )
 const imagePollTimeoutField = useNumberSettingField(
   () => localSettings.value?.image_poll_timeout_secs ?? 120,
@@ -454,6 +492,14 @@ const imagePollTimeoutField = useNumberSettingField(
     localSettings.value.image_poll_timeout_secs = value
   },
   { integer: true, min: 1, fallback: 120 },
+)
+const consoleRequestTimeoutField = useNumberSettingField(
+  () => localSettings.value?.console_request_timeout_secs ?? 600,
+  (value) => {
+    if (!localSettings.value) return
+    localSettings.value.console_request_timeout_secs = value
+  },
+  { integer: true, min: 30, max: 3600, fallback: 600 },
 )
 const imageStreamTimeoutField = useNumberSettingField(
   () => localSettings.value?.image_stream_timeout_secs ?? 300,
@@ -464,12 +510,12 @@ const imageStreamTimeoutField = useNumberSettingField(
   { integer: true, min: 1, fallback: 300 },
 )
 const imageAccountConcurrencyField = useNumberSettingField(
-  () => localSettings.value?.image_account_concurrency ?? 3,
+  () => localSettings.value?.image_account_concurrency ?? 1,
   (value) => {
     if (!localSettings.value) return
     localSettings.value.image_account_concurrency = value
   },
-  { integer: true, min: 1, fallback: 3 },
+  { integer: true, min: 1, max: 3, fallback: 1 },
 )
 const imageTimeoutRetryField = useNumberSettingField(
   () => localSettings.value?.image_timeout_retry_secs ?? 30,
@@ -480,12 +526,12 @@ const imageTimeoutRetryField = useNumberSettingField(
   { integer: true, min: 1, fallback: 30 },
 )
 const imageSettleSecondsField = useNumberSettingField(
-  () => localSettings.value?.image_settle_secs ?? 5,
+  () => localSettings.value?.image_settle_secs ?? 1.5,
   (value) => {
     if (!localSettings.value) return
     localSettings.value.image_settle_secs = value
   },
-  { min: 0.5, fallback: 5 },
+  { min: 0.5, fallback: 1.5, enabled: () => Boolean(localSettings.value?.image_settle_enabled) },
 )
 const clearanceTimeoutField = useNumberSettingField(
   () => localSettings.value?.proxy_runtime?.clearance.timeout_sec ?? 60,
@@ -508,7 +554,7 @@ const clearanceRefreshIntervalField = useNumberSettingField(
 const backupIntervalMinutesField = useNumberSettingField(
   () => localSettings.value?.backup?.interval_minutes ?? 1440,
   (value) => { if (localSettings.value) localSettings.value.backup.interval_minutes = value },
-  { integer: true, min: 1, fallback: 1440 },
+  { integer: true, min: 1, max: 525600, fallback: 1440 },
 )
 const backupRotationKeepField = useNumberSettingField(
   () => localSettings.value?.backup?.rotation_keep ?? 10,

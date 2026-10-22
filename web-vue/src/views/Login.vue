@@ -41,12 +41,14 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { Button, Input } from 'nanocat-ui'
 import { useToast } from '@/composables/useToast'
 import { useAuthStore } from '@/stores/auth'
+import { resolveLoginRedirect } from '@/router/redirect'
 
 const router = useRouter()
+const route = useRoute()
 const authStore = useAuthStore()
 const toast = useToast()
 
@@ -62,6 +64,12 @@ async function handleLogin() {
     const loggedIn = await authStore.login(password.value)
     if (!loggedIn) {
       toast.error('密钥无效或已失效。')
+      return
+    }
+    // 优先回到被拦截前的站内页面（redirect 经校验，防开放重定向）；路由守卫会再按角色兜底。
+    const redirect = resolveLoginRedirect(route.query.redirect)
+    if (redirect) {
+      await router.replace(redirect)
       return
     }
     await router.push(authStore.isUser ? { name: 'studio' } : { name: 'dashboard' })

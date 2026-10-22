@@ -28,6 +28,8 @@ export interface ProxyProfile {
   no_proxy?: string
   enabled: boolean
   notes?: string
+  timezone?: string
+  language?: string
 }
 
 export type ProxyProfilePayload = Partial<ProxyProfile> & {
@@ -40,6 +42,8 @@ export interface ProxyNode {
   url: string
   enabled: boolean
   image_concurrency_limit?: number
+  timezone?: string
+  language?: string
   last_latency_ms?: number
   fail_count?: number
   last_error?: string
@@ -57,6 +61,25 @@ export interface ProxyGroup {
   enabled: boolean
   notes?: string
   nodes: ProxyNode[]
+}
+
+export interface ProxyNodeImportNode {
+  url: string
+  image_concurrency_limit: number
+}
+
+export interface ProxyNodeImportInvalidItem {
+  line: number
+  raw: string
+  reason: string
+}
+
+export interface ProxyNodeImportResult {
+  nodes: ProxyNodeImportNode[]
+  added_count: number
+  duplicate_count: number
+  invalid_count: number
+  invalid_items: ProxyNodeImportInvalidItem[]
 }
 
 export type ProxyGroupPayload = Partial<ProxyGroup> & {
@@ -104,7 +127,27 @@ export function proxyReferenceLabel(value: unknown): string {
   return reference.value
 }
 
+export interface ProxyDirectLocale {
+  timezone: string
+  language: string
+  timezone_offset_min?: number
+}
+
+export interface ProxyViewResponse {
+  schema_version: number
+  revision: number
+  proxy: string
+  fallback_proxy: string
+  direct_locale: ProxyDirectLocale | null
+}
+
 export const proxyApi = {
+  getView: () => apiClient.get<never, ProxyViewResponse>('/api/proxy/view'),
+
+  // direct_locale 两项都留空表示清除；不传表示不修改。
+  saveDefaults: (payload: { direct_locale?: { timezone: string; language: string } }) =>
+    apiClient.post<typeof payload, ProxyViewResponse>('/api/proxy/defaults', payload),
+
   test: (url: string) =>
     apiClient.post<{ url: string }, { result: ProxyTestResult }>('/api/proxy/test', { url }),
 
@@ -150,6 +193,12 @@ export const proxyApi = {
       { id?: string; node_id?: string; url?: string },
       { result?: ProxyTestResult | null; results?: Array<{ node_id: string; result: ProxyTestResult }>; groups?: ProxyGroup[] }
     >('/api/proxy/groups/test', payload),
+
+  importNodes: (text: string, existingUrls: string[] = []) =>
+    apiClient.post<{ text: string; existing_urls: string[] }, ProxyNodeImportResult>(
+      '/api/proxy/nodes/import',
+      { text, existing_urls: existingUrls },
+    ),
 
   getRuntime: () =>
     apiClient.get<never, { runtime: ProxyRuntimeSettings; status: ProxyRuntimeStatus }>('/api/proxy/runtime'),

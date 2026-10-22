@@ -20,6 +20,10 @@ type AccountPageLifecycleRuntimeOptions = {
   keyword: Ref<string>
   statusFilter: Ref<string>
   groupFilter: Ref<string>
+  healthFilter?: Ref<string>
+  flagFilter?: Ref<string>
+  /** 跨分页全选后翻页不应清空选择。 */
+  keepSelectionOnPageChange?: () => boolean
   pageSizeDefault: number
   pageSizeOptions: readonly number[]
   reloadTimerKey: string
@@ -80,7 +84,7 @@ export function useAccountPageLifecycleRuntime(options: AccountPageLifecycleRunt
   }
 
   watch(
-    [options.keyword, options.statusFilter, options.groupFilter],
+    [options.keyword, options.statusFilter, options.groupFilter, () => options.healthFilter?.value, () => options.flagFilter?.value],
     () => {
       options.clearSelection()
       if (options.currentPage.value !== 1) {
@@ -102,6 +106,7 @@ export function useAccountPageLifecycleRuntime(options: AccountPageLifecycleRunt
   })
 
   watch(options.currentPage, () => {
+    if (options.keepSelectionOnPageChange?.()) return
     options.clearSelection()
   })
 

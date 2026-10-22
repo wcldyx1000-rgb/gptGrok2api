@@ -16,6 +16,7 @@ export interface UserKeysResponse {
 export interface UserKeyCreateResponse extends UserKeysResponse {
   item: UserKey
   key: string
+  raw_key?: string
 }
 
 export interface UserKeyUpdatePayload {
@@ -32,7 +33,7 @@ export const userKeysApi = {
   list: () => apiClient.get<never, UserKeysResponse>('/api/auth/users'),
 
   create: (name: string) =>
-    apiClient.post<{ name: string }, UserKeyCreateResponse>('/api/auth/users', { name }),
+    apiClient.post<{ name: string }, UserKeyCreateResponse>('/api/auth/users', { name }, { params: { include_items: 1 } }),
 
   update: (keyId: string, updates: UserKeyUpdatePayload) =>
     apiClient.post<UserKeyUpdatePayload, UserKeyUpdateResponse>(`/api/auth/users/${keyId}`, updates),

@@ -37,6 +37,8 @@ type BackendLogsResponse = {
     failed?: number
     limited?: number
     image?: number
+    partial_success?: number
+    text_review?: number
   }
 }
 
@@ -52,6 +54,8 @@ export type SystemLogsListParams = {
   search?: string
   limit?: number
   offset?: number
+  /** 默认 true：列表返回精简字段；传 false 取完整 detail */
+  compact?: boolean
 }
 
 export type SystemLogsResponse = {
@@ -75,6 +79,8 @@ export type SystemLogsResponse = {
     failed: number
     limited: number
     image: number
+    partial_success?: number
+    text_review?: number
   }
 }
 
@@ -119,9 +125,45 @@ export type LogDiagnosisChip = {
   tone: 'neutral' | 'success' | 'warning' | 'danger' | 'info'
 }
 
+export type LogImageAttempt = {
+  slot: number
+  attempt: number
+  status: string
+  account: string
+  durationMs: number
+  egressLabel: string
+  egressKey: string
+  proxySource: string
+  failureCode: string
+  errorType: string
+  statusCode: number
+  switchedAccount: boolean
+  egressFallback: boolean
+  retryKind: string
+  /** 生成成功但结果交付失败（如图片下载失败）。 */
+  deliveryFailed: boolean
+}
+
 export type SystemLogRow = {
   id: string
   raw: SystemLog
+  /** 实际出图分辨率，如 1024×1024；多张且尺寸一致时为 "1024×1024 ×2"，未知为空 */
+  resolution: string
+  resultImageCount: number
+  requestSize: string
+  requestQuality: string
+  requestResponseFormat: string
+  requestCount: string
+  imageAttempts: LogImageAttempt[]
+  imageAttemptCount: number
+  /** 后端归类的调用结果；旧日志没有该字段时为空，由前端按状态推导。 */
+  outcome: string
+  imageRequestedCount: number
+  imageSucceededCount: number
+  imageFailedCount: number
+  switchCount: number
+  /** 列表返回的是精简字段，详情需按 id 拉取完整记录 */
+  detailCompact: boolean
   time: string
   type: string
   summary: string
@@ -320,6 +362,56 @@ export function formatLogDuration(value: string): string {
   return `${(parsed / 1000).toFixed(1)}s`
 }
 
+function nonNegativeInt(value: unknown): number {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : 0
+}
+
+/** 由 result_images 生成列表分辨率文案；与后端 format_result_resolutions 保持一致 */
+export function formatResultResolution(images: unknown): string {
+  if (!Array.isArray(images)) return ''
+  const labels = images
+    .map((image) => {
+      const record = image && typeof image === 'object' ? image as Record<string, unknown> : {}
+      const width = nonNegativeInt(record.width)
+      const height = nonNegativeInt(record.height)
+      return width && height ? `${width}×${height}` : ''
+    })
+    .filter(Boolean)
+  if (!labels.length) return ''
+  const unique = Array.from(new Set(labels))
+  if (unique.length === 1) return labels.length === 1 ? unique[0] : `${unique[0]} ×${labels.length}`
+  return unique.join(' / ')
+}
+
+function normalizeImageAttempts(value: unknown): LogImageAttempt[] {
+  if (!Array.isArray(value)) return []
+  const rows: LogImageAttempt[] = []
+  value.forEach((item) => {
+    if (!item || typeof item !== 'object') return
+    const record = item as Record<string, unknown>
+    rows.push({
+      slot: nonNegativeInt(record.slot) || 1,
+      attempt: nonNegativeInt(record.attempt),
+      status: cleanString(record.status),
+      account: cleanString(record.account),
+      durationMs: nonNegativeInt(record.duration_ms),
+      egressLabel: cleanString(record.egress_label),
+      egressKey: cleanString(record.egress_key),
+      proxySource: cleanString(record.proxy_source),
+      failureCode: cleanString(record.failure_code),
+      errorType: cleanString(record.error_type),
+      statusCode: nonNegativeInt(record.status_code),
+      switchedAccount: record.switched_account === true,
+      egressFallback: record.egress_fallback === true,
+      retryKind: cleanString(record.retry_kind),
+      deliveryFailed: cleanString(record.failure_scope).toLowerCase() === 'delivery'
+        || cleanString(record.failure_code).toLowerCase() === 'image_download_failed',
+    })
+  })
+  return rows
+}
+
 function boolDetailLabel(value: unknown): string {
   if (value === true || value === 'true') return 'true'
   if (value === false || value === 'false') return 'false'
@@ -397,10 +489,30 @@ export function normalizeSystemLogRow(item: SystemLog, index: number, options: N
   const blocked = boolDetailLabel(detailRawValue(detail, 'blocked'))
   const upstreamMessageLen = detailValue(detail, 'upstream_message_len')
   const time = startedAt || cleanString(item.time) || endedAt
+  const requestMeta = detail.request_meta && typeof detail.request_meta === 'object'
+    ? detail.request_meta as Record<string, unknown>
+    : {}
+  const imageAttempts = normalizeImageAttempts(detail.image_attempts)
+  const resultImages = Array.isArray(detail.result_images) ? detail.result_images : []
 
   return {
     id: cleanString(item.id) || `log-${index}`,
     raw: item,
+    resolution: formatResultResolution(resultImages),
+    resultImageCount: nonNegativeInt(detail.result_image_count) || resultImages.length,
+    requestSize: formatDetailValue(requestMeta.size),
+    requestQuality: formatDetailValue(requestMeta.quality),
+    requestResponseFormat: formatDetailValue(requestMeta.response_format),
+    requestCount: formatDetailValue(requestMeta.n),
+    imageAttempts,
+    imageAttemptCount: imageAttempts.length || nonNegativeInt(detail.image_attempt_count) || nonNegativeInt(detail.attempt_count),
+    outcome: cleanString(detail.outcome).toLowerCase(),
+    imageRequestedCount: nonNegativeInt(detail.image_requested_count),
+    imageSucceededCount: nonNegativeInt(detail.image_succeeded_count),
+    imageFailedCount: nonNegativeInt(detail.image_failed_count),
+    switchCount: nonNegativeInt(detail.switch_count)
+      || imageAttempts.filter((attempt) => attempt.switchedAccount).length,
+    detailCompact: detail.detail_compact === true,
     time,
     type: cleanString(item.type),
     summary,
@@ -474,8 +586,26 @@ export function isSystemLogSuccess(item: SystemLogRow): boolean {
   return item.status.toLowerCase() === 'success'
 }
 
+const RATE_LIMITED_ERROR_CODES = new Set([
+  'rate_limited',
+  'rate_limit',
+  'rate_limit_exceeded',
+  'upstream_rate_limited',
+  'insufficient_quota',
+  'quota_exhausted',
+  'image_quota_exhausted',
+])
+
+/**
+ * 是否限流：优先使用后端写入的 outcome / error_code；
+ * 只有两者都缺失的旧日志才按文本推断（兜底，可能误判）。
+ */
 export function isSystemLogLimited(item: SystemLogRow): boolean {
-  const text = [item.status, item.errorCode, item.reason, item.error].join(' ').toLowerCase()
+  if (item.outcome) return item.outcome === 'rate_limited'
+  const code = (item.errorCode || '').toLowerCase()
+  if (code) return RATE_LIMITED_ERROR_CODES.has(code) || code === '429'
+  if (item.status.toLowerCase() === 'limited') return true
+  const text = [item.status, item.reason, item.error].join(' ').toLowerCase()
   return text.includes('limit') || text.includes('quota') || text.includes('受限') || text.includes('限流')
 }
 
@@ -660,8 +790,10 @@ function normalizeSystemParams(params?: SystemLogsListParams) {
     account: cleanString(params?.account),
     conversation_id: cleanString(params?.conversation_id),
     search: cleanString(params?.search),
-    limit: Number.isFinite(limit) ? Math.min(Math.max(Math.trunc(limit), 1), 20000) : 500,
+    limit: Number.isFinite(limit) ? Math.min(Math.max(Math.trunc(limit), 1), 500) : 500,
     offset: Number.isFinite(offset) ? Math.max(Math.trunc(offset), 0) : 0,
+    // 列表只取精简字段，完整详情在打开抽屉时按 id 拉取（GET /api/logs/{id}）
+    compact: params?.compact === false ? undefined : 1,
   }
 }
 
@@ -720,6 +852,8 @@ function normalizeSystemResponse(response: BackendLogsResponse): SystemLogsRespo
       failed: Number(stats.failed ?? fallbackStats.failed),
       limited: Number(stats.limited ?? fallbackStats.limited),
       image: Number(stats.image ?? fallbackStats.image),
+      partial_success: Number(stats.partial_success ?? 0),
+      text_review: Number(stats.text_review ?? 0),
     },
   }
 }
@@ -749,7 +883,7 @@ function normalizeRuntimeResponse(response: RuntimeLogsResponseRaw): RuntimeLogs
 
 export const logsApi = {
   list: async (params?: LogsListParams) => {
-    const limit = Math.min(Math.max(Number(params?.limit || 500), 10), 20000)
+    const limit = Math.min(Math.max(Number(params?.limit || 500), 10), 500)
     const response = await apiClient.get<never, BackendLogsResponse>('/api/logs', {
       params: { limit },
     })
@@ -768,6 +902,12 @@ export const logsApi = {
       params: normalizeRuntimeParams(params),
     })
     return normalizeRuntimeResponse(response)
+  },
+
+  /** 单条完整日志（含请求全文、监控事件、生成尝试等列表里被精简掉的字段） */
+  detail: async (id: string): Promise<SystemLog | null> => {
+    const response = await apiClient.get<never, { item?: SystemLog }>(`/api/logs/${encodeURIComponent(id)}`)
+    return response?.item ?? null
   },
 
   delete: async (ids: string[]) =>

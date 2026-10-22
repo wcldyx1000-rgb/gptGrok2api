@@ -69,6 +69,21 @@
             </Button>
           </ActionRow>
           <div class="mt-4 border-t border-border pt-4">
+            <p class="ui-field-label">直连出口地区环境</p>
+            <div class="mt-2 grid grid-cols-1 gap-3 md:grid-cols-2">
+              <ProxyLocaleFields
+                :timezone="directTimezone"
+                :language="directLanguage"
+                timezone-label="出口时区"
+                @update:timezone="directTimezone = $event"
+                @update:language="directLanguage = $event"
+              />
+            </div>
+            <p class="mt-2 text-xs" :class="directLocaleError ? 'text-rose-600' : 'text-muted-foreground'">
+              {{ directLocaleError || '没走代理组节点的请求（直连、自定义代理 URL）按这里生成时区与语言；都留空沿用默认。需要同时填写时区和语言。' }}
+            </p>
+          </div>
+          <div class="mt-4 border-t border-border pt-4">
             <div class="grid grid-cols-1 gap-3 md:grid-cols-[12rem_minmax(0,1fr)]">
               <label class="block text-xs">
                 <span class="ui-field-label">备用出口模式</span>
@@ -145,6 +160,7 @@
             placeholder="搜索代理组 / 节点 / 地址"
             @update:model-value="groupKeyword = $event.trim()"
           />
+          <ListLayoutControl v-model="listLayoutMode" />
           <Button size="sm" variant="primary" @click="openCreateGroupModal">新建代理组</Button>
         </template>
       </PanelHeader>
@@ -156,7 +172,7 @@
       <StateBlock v-else-if="filteredGroups.length === 0">
         <EmptyState plain title="暂无代理组" description="新建代理组后，可绑定账号组、账号或默认出口使用。" />
       </StateBlock>
-      <TableShell v-else>
+      <TableShell v-else sticky-header>
         <table class="min-w-[1080px] w-full table-fixed text-left text-sm">
           <colgroup>
             <col class="w-[20%]" />
@@ -195,13 +211,15 @@
       </TableShell>
     </PagePanel>
 
+    <EgressGatewayPanel />
+
     <ModalShell :open="showGroupModal" max-width="56rem" :z-index="120">
       <ModalHeader
         :title="editingGroupId ? '编辑代理组' : '新建代理组'"
         :close-disabled="savingGroupId === FORM_TEST_KEY"
         :bordered="false"
         compact
-        @close="closeGroupModal"
+        @close="requestCloseGroupModal"
       />
 
       <ModalBody class="space-y-4">
@@ -246,7 +264,10 @@
               <div class="space-y-3">
                 <div class="flex flex-wrap items-center justify-between gap-2">
                   <p class="text-xs font-medium text-foreground">代理节点</p>
-                  <Button size="xs" variant="outline" @click="addGroupNode">添加节点</Button>
+                  <div class="flex items-center gap-2">
+                    <Button size="xs" variant="outline" @click="showNodeImportModal = true">批量添加</Button>
+                    <Button size="xs" variant="outline" @click="addGroupNode">添加节点</Button>
+                  </div>
                 </div>
                 <div class="space-y-3">
                   <FormSection
@@ -290,6 +311,15 @@
                         <Checkbox v-model="node.enabled">启用</Checkbox>
                       </div>
                     </div>
+                    <div class="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
+                      <ProxyLocaleFields
+                        :timezone="node.timezone || ''"
+                        :language="node.language || ''"
+                        timezone-label="出口时区"
+                        @update:timezone="node.timezone = $event"
+                        @update:language="node.language = $event"
+                      />
+                    </div>
                     <div class="mt-2 flex flex-wrap items-center justify-between gap-2">
                       <label class="min-w-[12rem] flex-1 text-xs">
                         <span class="ui-field-label">备注</span>
@@ -304,10 +334,11 @@
                         <Button
                           size="xs"
                           variant="outline"
-                          :disabled="!editingGroupId || !node.url || testingKey === `group:${editingGroupId}:${node.id}`"
-                          @click="testProxyGroupNode({ id: editingGroupId, name: groupForm.name }, node)"
+                          :disabled="!node.url || Boolean(testingKey)"
+                          :title="node.url ? '' : '请先填写代理地址'"
+                          @click="testGroupFormNode(node)"
                         >
-                          {{ testingKey === `group:${editingGroupId}:${node.id}` ? '检测中...' : '检测' }}
+                          {{ testingKey === draftNodeTestKey(node) || testingKey === `group:${editingGroupId}:${node.id}` ? '检测中...' : '检测' }}
                         </Button>
                         <Button size="xs" variant="outline" root-class="text-rose-600" @click="removeGroupNode(index)">
                           删除
@@ -320,7 +351,7 @@
       </ModalBody>
 
       <ModalFooter :bordered="false">
-        <Button size="xs" variant="outline" root-class="min-w-14 justify-center" :disabled="savingGroupId === FORM_TEST_KEY" @click="closeGroupModal">
+        <Button size="xs" variant="outline" root-class="min-w-14 justify-center" :disabled="savingGroupId === FORM_TEST_KEY" @click="requestCloseGroupModal">
           取消
         </Button>
         <Button size="xs" variant="primary" root-class="min-w-14 justify-center" :disabled="savingGroupId === FORM_TEST_KEY" @click="saveProxyGroup">
@@ -329,12 +360,21 @@
       </ModalFooter>
     </ModalShell>
 
+    <ProxyNodeImportModal
+      :open="showNodeImportModal"
+      :group-name="groupForm.name"
+      :existing-urls="groupForm.nodes.map((node) => node.url).filter(Boolean)"
+      @close="showNodeImportModal = false"
+      @apply="applyImportedNodes"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
+import { ref } from 'vue'
 import { Button, Checkbox, EmptyState, Input } from 'nanocat-ui'
 import ActionRow from '@/components/ai/ActionRow.vue'
+import ListLayoutControl from '@/components/ai/ListLayoutControl.vue'
 import FormSection from '@/components/ai/FormSection.vue'
 import ModalBody from '@/components/ai/ModalBody.vue'
 import ModalFooter from '@/components/ai/ModalFooter.vue'
@@ -346,6 +386,7 @@ import PanelHeader from '@/components/ai/PanelHeader.vue'
 import StateBlock from '@/components/ai/StateBlock.vue'
 import TableShell from '@/components/ai/TableShell.vue'
 import GroupedSelectMenu from '@/components/ui/GroupedSelectMenu.vue'
+import { useListLayoutPreference } from '@/composables/useListLayoutPreference'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import {
   defaultProxyModeOptions,
@@ -359,6 +400,9 @@ import {
   useProxyGroupRuntime,
 } from '@/views/proxy/proxyGroupRuntime'
 import ProxyGroupRow from '@/views/proxy/ProxyGroupRow.vue'
+import EgressGatewayPanel from '@/views/proxy/EgressGatewayPanel.vue'
+import ProxyNodeImportModal from '@/views/proxy/ProxyNodeImportModal.vue'
+import ProxyLocaleFields from '@/views/proxy/ProxyLocaleFields.vue'
 
 defineOptions({ name: 'Proxy' })
 
@@ -376,9 +420,14 @@ const updateGroups = proxyGroupsRuntime.updateGroups
 const copyProxyGroupReference = proxyGroupsRuntime.copyProxyGroupReference
 const openCreateGroupModal = proxyGroupsRuntime.openCreateGroupModal
 const openEditGroupModal = proxyGroupsRuntime.openEditGroupModal
-const closeGroupModal = proxyGroupsRuntime.closeGroupModal
+const requestCloseGroupModal = proxyGroupsRuntime.requestCloseGroupModal
+const testGroupFormNode = proxyGroupsRuntime.testGroupFormNode
+const draftNodeTestKey = proxyGroupsRuntime.draftNodeTestKey
 const addGroupNode = proxyGroupsRuntime.addGroupNode
 const removeGroupNode = proxyGroupsRuntime.removeGroupNode
+const applyImportedNodes = proxyGroupsRuntime.applyImportedNodes
+const showNodeImportModal = ref(false)
+const { listLayoutMode } = useListLayoutPreference()
 const saveProxyGroup = proxyGroupsRuntime.saveProxyGroup
 const handleProxyGroupAction = proxyGroupsRuntime.handleProxyGroupAction
 const testProxyGroupNode = proxyGroupsRuntime.testProxyGroupNode
@@ -402,6 +451,9 @@ const fallbackProxyMode = proxyDefaultRuntime.fallbackProxyMode
 const selectedFallbackProxyGroupId = proxyDefaultRuntime.selectedFallbackProxyGroupId
 const fallbackCustomProxyInput = proxyDefaultRuntime.fallbackCustomProxyInput
 const defaultTestResult = proxyDefaultRuntime.defaultTestResult
+const directTimezone = proxyDefaultRuntime.directTimezone
+const directLanguage = proxyDefaultRuntime.directLanguage
+const directLocaleError = proxyDefaultRuntime.directLocaleError
 const defaultProxyGroupOptions = proxyDefaultRuntime.defaultProxyGroupOptions
 const canTestDefaultProxy = proxyDefaultRuntime.canTestDefaultProxy
 const isDefaultProxyDirty = proxyDefaultRuntime.isDefaultProxyDirty

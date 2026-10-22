@@ -408,6 +408,24 @@ export function imageTaskProgressLabel(task?: ImageTask | null) {
   return IMAGE_TASK_PROGRESS_LABELS[key] || '生成中'
 }
 
+/** 排队/生成已用时：来自后端轮询快照的 elapsed_secs，如 "已用 12s" / "已用 2m5s"。 */
+export function imageTaskElapsedText(task?: ImageTask | null) {
+  const seconds = Number(task?.elapsed_secs)
+  if (!task || !Number.isFinite(seconds) || seconds < 1) return ''
+  if (task.status !== 'queued' && task.status !== 'running') return ''
+  const total = Math.floor(seconds)
+  if (total < 60) return `已用 ${total}s`
+  return `已用 ${Math.floor(total / 60)}m${total % 60}s`
+}
+
+/** 请求多张但只出了一部分时的提示；全部成功/没有结果时返回空。 */
+export function partialImageNote(task: ImageTask | undefined, producedCount: number) {
+  if (!task || task.status !== 'success') return ''
+  const requested = Math.max(1, Math.trunc(Number(task.n) || 1))
+  if (producedCount <= 0 || producedCount >= requested) return ''
+  return `部分成功：生成 ${producedCount}/${requested} 张图片`
+}
+
 export function taskPrimaryMessage(task?: ImageTask | null) {
   if (!task) return ''
   if (task.upstream_request_id) {

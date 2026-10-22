@@ -1,6 +1,6 @@
 import { computed, reactive, ref } from 'vue'
 
-import { proxyApi, type ProxyGroup, type ProxyNode, type ProxyTestResult } from '@/api/proxy'
+import { proxyApi, type ProxyGroup, type ProxyNode, type ProxyNodeImportResult, type ProxyTestResult } from '@/api/proxy'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { useToast } from '@/composables/useToast'
 import { errorMessage } from '@/lib/errorMessage'
@@ -61,6 +61,8 @@ function createDefaultNode(index = 0): ProxyNode {
     url: '',
     enabled: true,
     image_concurrency_limit: DEFAULT_PROXY_NODE_IMAGE_CONCURRENCY,
+    timezone: '',
+    language: '',
     notes: '',
   }
 }
@@ -83,6 +85,8 @@ function normalizeGroupNode(item: ProxyNode, index: number): ProxyNode {
     url: String(item.url || '').trim(),
     enabled: item.enabled !== false,
     image_concurrency_limit: normalizeImageConcurrencyLimit(item.image_concurrency_limit ?? DEFAULT_PROXY_NODE_IMAGE_CONCURRENCY),
+    timezone: String(item.timezone || '').trim(),
+    language: String(item.language || '').trim(),
     last_latency_ms: Number(item.last_latency_ms || 0),
     fail_count: Number(item.fail_count || 0),
     last_error: String(item.last_error || '').trim(),
@@ -176,8 +180,24 @@ export function useProxyGroupRuntime() {
     Object.assign(groupForm, createDefaultGroupForm())
   }
 
+  // 草稿签名：打开弹窗时记一份快照，关闭前对比以拦截未保存的修改。
+  function groupFormSignature() {
+    return JSON.stringify({
+      id: groupForm.id,
+      name: groupForm.name,
+      enabled: groupForm.enabled,
+      notes: groupForm.notes,
+      nodes: groupForm.nodes.map((node) => [
+        node.name, node.url, node.enabled, node.image_concurrency_limit, node.timezone || '', node.language || '', node.notes || '',
+      ]),
+    })
+  }
+  let groupFormBaseline = ''
+
   function openCreateGroupModal() {
     resetGroupForm()
+    // 新建时节点 id 是随机生成的，不参与签名，所以基线可直接取当前草稿。
+    groupFormBaseline = groupFormSignature()
     showGroupModal.value = true
   }
 
@@ -190,6 +210,7 @@ export function useProxyGroupRuntime() {
       notes: group.notes || '',
       nodes: group.nodes.length ? group.nodes.map((node, index) => normalizeGroupNode(node, index)) : [createDefaultNode(0)],
     })
+    groupFormBaseline = groupFormSignature()
     showGroupModal.value = true
   }
 
@@ -199,8 +220,39 @@ export function useProxyGroupRuntime() {
     resetGroupForm()
   }
 
+  function isGroupFormDirty() {
+    return groupFormSignature() !== groupFormBaseline
+  }
+
+  /** 关闭前拦截：有未保存修改时先确认，避免误触遮罩/取消丢掉草稿。 */
+  async function requestCloseGroupModal() {
+    if (savingGroupId.value === FORM_TEST_KEY) return
+    if (isGroupFormDirty()) {
+      const confirmed = await confirmDialog.ask({
+        title: '放弃代理组草稿',
+        message: '当前代理组有未保存的修改，关闭后这些内容将丢失。是否继续？',
+        confirmText: '放弃修改',
+        cancelText: '继续编辑',
+      })
+      if (!confirmed) return
+    }
+    closeGroupModal()
+  }
+
   function addGroupNode() {
     groupForm.nodes.push(createDefaultNode(groupForm.nodes.length))
+  }
+
+  // 批量导入的节点追加到草稿；表单里还没填地址的占位节点会被替换掉。
+  function applyImportedNodes(result: ProxyNodeImportResult) {
+    if (!result.nodes.length) return
+    const kept = groupForm.nodes.filter((node) => node.url.trim())
+    const appended = result.nodes.map((item, offset) => ({
+      ...createDefaultNode(kept.length + offset),
+      url: item.url,
+      image_concurrency_limit: normalizeImageConcurrencyLimit(item.image_concurrency_limit),
+    }))
+    groupForm.nodes = [...kept, ...appended]
   }
 
   function removeGroupNode(index: number) {
@@ -337,6 +389,50 @@ export function useProxyGroupRuntime() {
     }
   }
 
+  function draftNodeTestKey(node: Pick<ProxyNode, 'id'>) {
+    return `${FORM_TEST_KEY}:${node.id}`
+  }
+
+  /** 弹窗内检测：已保存且地址未改的节点按组检测，草稿 / 改过地址的节点直接带 URL 检测。 */
+  async function testGroupFormNode(node: ProxyNode) {
+    const url = String(node.url || '').trim()
+    if (!url) {
+      toast.warning('请先填写代理地址')
+      return
+    }
+    const savedNode = editingGroupId.value
+      ? groups.value.find((group) => group.id === editingGroupId.value)?.nodes.find((item) => item.id === node.id)
+      : undefined
+    if (savedNode && String(savedNode.url || '').trim() === url) {
+      await testProxyGroupNode({ id: editingGroupId.value, name: groupForm.name }, node)
+      return
+    }
+
+    const confirmed = await confirmDialog.ask({
+      title: '确认测试代理节点',
+      message: `即将用草稿中的代理地址发起外部网络测试请求（尚未保存）。请确认当前允许测试该代理连接。`,
+      confirmText: '开始测试',
+      cancelText: '取消',
+    })
+    if (!confirmed) return
+
+    const key = draftNodeTestKey(node)
+    testingKey.value = key
+    try {
+      const response = await proxyApi.testGroup({ url })
+      const result = response.result
+      if (result) testResults[key] = result
+      if (result?.ok) toast.success(`节点检测通过，耗时 ${result.latency_ms}ms`)
+      else toast.warning(result?.error || '节点检测失败')
+    } catch (error) {
+      const message = errorMessage(error, '节点检测失败')
+      testResults[key] = { ok: false, status: 0, latency_ms: 0, error: message }
+      toast.error(message)
+    } finally {
+      testingKey.value = ''
+    }
+  }
+
   async function testProxyGroupAll(group: ProxyGroup) {
     const confirmed = await confirmDialog.ask({
       title: '确认测试代理组',
@@ -394,7 +490,12 @@ export function useProxyGroupRuntime() {
     openCreateGroupModal,
     openEditGroupModal,
     closeGroupModal,
+    requestCloseGroupModal,
+    isGroupFormDirty,
+    draftNodeTestKey,
+    testGroupFormNode,
     addGroupNode,
+    applyImportedNodes,
     removeGroupNode,
     saveProxyGroup,
     proxyGroupActionItems,

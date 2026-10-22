@@ -1,3 +1,4 @@
+import { DEFAULT_REGISTER_EGRESS, type RegisterEgressConfig } from '@/api/egress'
 import { parseProxyReference, serializeProxyReference } from '@/api/proxy'
 import type { ProxyGroup } from '@/api/proxy'
 import type {
@@ -155,6 +156,7 @@ export const defaultGrokRegisterConfig: GrokRegisterConfig = {
   create_path: '/createTask',
   result_path: '/getTaskResult',
   max_mail_retries: 3,
+  turnstile_prefetch: true,
   xai_cli_oauth_enabled: true,
   xai_cli_oauth_flow: 'device',
   xai_cli_pkce_reference_dir: '',
@@ -213,6 +215,8 @@ export const defaultRegisterConfig: LegacyRegisterConfig = {
   agent_identity_archive: {
     enabled: true,
   },
+  confirm_refresh_token: false,
+  egress: { ...DEFAULT_REGISTER_EGRESS },
   mail: {
     request_timeout: 30,
     wait_timeout: 30,
@@ -290,6 +294,7 @@ export function normalizeGrokRegisterConfig(value: unknown): GrokRegisterConfig 
     create_path: String(input.create_path || defaultGrokRegisterConfig.create_path).trim(),
     result_path: String(input.result_path || defaultGrokRegisterConfig.result_path).trim(),
     max_mail_retries: Math.max(1, Math.min(20, Number(input.max_mail_retries) || defaultGrokRegisterConfig.max_mail_retries)),
+    turnstile_prefetch: input.turnstile_prefetch !== false,
     xai_cli_oauth_enabled: input.xai_cli_oauth_enabled !== false,
     xai_cli_oauth_flow: input.xai_cli_oauth_flow === 'pkce_reference' ? 'pkce_reference' : 'device',
     xai_cli_pkce_reference_dir: String(input.xai_cli_pkce_reference_dir || '').trim(),
@@ -507,9 +512,22 @@ export function normalizeRegisterConfig(raw: LegacyRegisterConfig): LegacyRegist
     sub2api_sync: sub2apiSync,
     cpa_sync: cpaSync,
     agent_identity_archive: agentIdentityArchive,
+    confirm_refresh_token: raw.confirm_refresh_token === true,
+    egress: normalizeRegisterEgress(raw.egress),
     stats: { ...defaultRegisterConfig.stats, ...(raw.stats || {}) },
     logs: Array.isArray(raw.logs) ? raw.logs : [],
     grok_oauth_logs: Array.isArray(raw.grok_oauth_logs) ? raw.grok_oauth_logs : [],
+  }
+}
+
+export function normalizeRegisterEgress(raw: unknown): RegisterEgressConfig {
+  const source = raw && typeof raw === 'object' ? raw as Partial<Record<keyof RegisterEgressConfig, unknown>> : {}
+  const intIn = (value: unknown, max: number) => Math.min(max, Math.max(0, Math.floor(Number(value) || 0)))
+  return {
+    check_enabled: source.check_enabled !== false,
+    block_unsupported: source.block_unsupported !== false,
+    daily_limit: intIn(source.daily_limit, 10000),
+    min_gap_secs: intIn(source.min_gap_secs, 86400),
   }
 }
 
@@ -659,6 +677,10 @@ export function sanitizedProviderPayload(provider: RegisterProvider): RegisterPr
   delete output.mailboxes_parse_stats
   delete output.mailboxes_failed
   delete output.provider_ref
+  // 敏感字段“保存时清除”：只提交被勾选的 clear_<key>，保存后服务端回读不再带它。
+  for (const [key, value] of Object.entries(provider)) {
+    if (key.startsWith('clear_') && value === true) output[key] = true
+  }
   return output
 }
 
@@ -702,6 +724,8 @@ export function legacyRegisterPayload(config: LegacyRegisterConfig): Partial<Leg
     agent_identity_archive: {
       enabled: config.agent_identity_archive?.enabled !== false,
     },
+    confirm_refresh_token: Boolean(config.confirm_refresh_token),
+    egress: normalizeRegisterEgress(config.egress),
     mail: {
       ...config.mail,
       providers: (config.mail.providers || [])
@@ -722,7 +746,7 @@ export function grokRequirementMessages(config: LegacyRegisterConfig | null | un
   if (!config || normalizeRegisterTarget(config.target) !== 'grok') return []
   const grok = normalizeGrokRegisterConfig(config.grok)
   const missing: string[] = []
-  if (grok.provider !== 'local' && !isFilled(grok.api_key)) missing.push('Turnstile API Key')
+  if (grok.provider !== 'local' && !isFilled(grok.api_key) && !grok.api_key_set) missing.push('Turnstile API Key')
   if (grok.provider === 'custom' && !isFilled(grok.api_base)) missing.push('Turnstile API Base')
   const sub2api = grok.oauth_delivery.sub2api
   if (sub2api.enabled) {
@@ -776,22 +800,27 @@ export function providerRequirementMessages(provider: RegisterProvider) {
   const requireList = (value: unknown, label: string) => {
     if (!listHasValue(value)) missing.push(label)
   }
+  // 凭据只写不读：后端返回空值并附带 `<key>_set`，已配置即视为已填。
+  const requireSecret = (key: string, label: string) => {
+    const record = provider as Record<string, unknown>
+    if (!isFilled(record[key]) && !record[`${key}_set`]) missing.push(label)
+  }
 
   switch (type) {
     case 'cloudmail_gen':
       requireValue(provider.api_base, 'CloudMail URL')
       requireValue(provider.admin_email, '管理员邮箱')
-      requireValue(provider.admin_password, 'Admin Password')
+      requireSecret('admin_password', 'Admin Password')
       requireList(provider.domain, '邮箱域名')
       break
     case 'cloudflare_temp_email':
       requireValue(provider.api_base, 'API Base')
-      requireValue(provider.admin_password, 'Admin Password')
+      requireSecret('admin_password', 'Admin Password')
       requireList(provider.domain, '域名')
       break
     case 'moemail':
       requireValue(provider.api_base, 'API Base')
-      requireValue(provider.api_key, 'API Key')
+      requireSecret('api_key', 'API Key')
       requireList(provider.domain, '域名')
       break
     case 'inbucket':
@@ -799,30 +828,30 @@ export function providerRequirementMessages(provider: RegisterProvider) {
       requireList(provider.domain, '基础域名')
       break
     case 'duckmail':
-      requireValue(provider.api_key, 'API Key')
+      requireSecret('api_key', 'API Key')
       break
     case 'gptmail':
-      if (!providerUsesPublicGptMailKey(provider)) requireValue(provider.api_key, 'API Key')
+      if (!providerUsesPublicGptMailKey(provider)) requireSecret('api_key', 'API Key')
       if (provider.local_compose) requireValue(provider.default_domain, '默认域名')
       break
     case 'icloud_api':
       requireValue(provider.api_base, 'iCloud API Base')
-      requireValue(provider.api_key, 'API Key')
+      requireSecret('api_key', 'API Key')
       break
     case 'icloud_local':
       break
     case 'donemail':
       requireValue(provider.api_base, 'DoneMail URL')
-      requireValue(provider.admin_key, 'Admin Key')
+      requireSecret('admin_key', 'Admin Key')
       requireList(provider.domain, '域名')
       break
     case 'yyds_mail':
-      requireValue(provider.api_key, 'API Key')
+      requireSecret('api_key', 'API Key')
       break
     case 'ddg_mail':
       requireValue(provider.api_base, 'CF API Base')
-      requireValue(provider.ddg_token, 'DDG Token')
-      requireValue(provider.cf_inbox_jwt, 'CF Inbox JWT')
+      requireSecret('ddg_token', 'DDG Token')
+      requireSecret('cf_inbox_jwt', 'CF Inbox JWT')
       break
     case 'outlook_token': {
       const savedCount = Number(provider.mailboxes_count || 0)
@@ -942,6 +971,12 @@ export function outlookAliasSummary(provider: RegisterProvider) {
     pendingExpanded: provider.alias_enabled ? pending * multiplier : pending,
   }
 }
+
+/** Outlook 读信（token 刷新 / Graph / IMAP）后端强制直连，与注册代理设置无关。 */
+export const outlookDirectReadHint = 'Outlook 读信（Microsoft token 刷新、Graph、IMAP）始终直连，不经过注册代理，避免代理隧道被微软断开；「邮箱 API 走注册代理」的设置（api_use_register_proxy）只对 GPTMail、DuckMail 等 HTTP 邮箱 API 生效。'
+
+/** 别名家族去重的含义，展示在 Outlook 别名区块。 */
+export const outlookAliasFamilyHint = '别名家族去重：同一原邮箱的所有 +别名属于同一家族，OpenAI 会把它们当成同一个人。家族里任一地址注册成功后，原邮箱和其余别名都不再领用（显示为「家族已用」）；同一家族的别名也不会被并发领用，只会排队等待。'
 
 export function outlookAliasHint(provider: RegisterProvider) {
   const summary = outlookAliasSummary(provider)
@@ -1098,6 +1133,12 @@ export function registerMetricItems(
     ...common,
     { key: 'quota', label: '当前额度', value: stats.current_quota || 0 },
     { key: 'available', label: '正常账号', value: stats.current_available || 0 },
+    {
+      key: 'pool',
+      label: '入池可用率',
+      value: Number(stats.pool_ok || 0) + Number(stats.pool_fail || 0) > 0 ? `${stats.pool_usable_rate || 0}%` : '-',
+      meta: `可用 ${stats.pool_ok || 0} / 不可用 ${stats.pool_fail || 0}`,
+    },
   ]
 }
 

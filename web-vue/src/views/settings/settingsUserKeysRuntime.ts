@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { onBeforeUnmount, ref, watch } from 'vue'
 
 import { userKeysApi, type UserKey } from '@/api/userKeys'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
@@ -6,6 +6,9 @@ import type { usePageRuntime } from '@/composables/usePageRuntime'
 import { usePageQuery } from '@/composables/usePageQuery'
 import { useToast } from '@/composables/useToast'
 import { errorMessage } from '@/lib/errorMessage'
+
+/** 新建用户密钥后明文在页面上最多保留的时间。 */
+export const NEW_USER_KEY_VISIBLE_MS = 120_000
 
 export type UserKeyForm = {
   name: string
@@ -29,9 +32,35 @@ export function useSettingsUserKeysRuntime(options: SettingsUserKeysRuntimeOptio
   const userKeyModal = ref<'create' | 'edit' | ''>('')
   const editingUserKey = ref<UserKey | null>(null)
   const newUserKey = ref('')
+  let newUserKeyTimer: ReturnType<typeof setTimeout> | undefined
   const userKeyForm = ref<UserKeyForm>(createUserKeyForm())
   const toast = useToast()
   const confirmDialog = useConfirmDialog()
+
+  function clearNewUserKey(notify = false) {
+    if (newUserKeyTimer !== undefined) {
+      clearTimeout(newUserKeyTimer)
+      newUserKeyTimer = undefined
+    }
+    if (!newUserKey.value) return
+    newUserKey.value = ''
+    if (notify) toast.info('新密钥明文已自动清除；如未保存，请重新创建或重置密钥')
+  }
+
+  // 明文密钥 120 秒后自动清除；离开页面（deactivate）时立即清除。
+  watch(newUserKey, (value) => {
+    if (newUserKeyTimer !== undefined) {
+      clearTimeout(newUserKeyTimer)
+      newUserKeyTimer = undefined
+    }
+    if (!value) return
+    newUserKeyTimer = setTimeout(() => {
+      newUserKeyTimer = undefined
+      clearNewUserKey(true)
+    }, NEW_USER_KEY_VISIBLE_MS)
+  })
+  options.runtime.onDeactivate(() => clearNewUserKey())
+  onBeforeUnmount(() => clearNewUserKey())
 
   const userKeysQuery = usePageQuery({
     runtime: options.runtime,
@@ -186,6 +215,7 @@ export function useSettingsUserKeysRuntime(options: SettingsUserKeysRuntimeOptio
     userKeyModal,
     editingUserKey,
     newUserKey,
+    clearNewUserKey,
     userKeyForm,
     copyUserKey,
     resetUserKeyForm,

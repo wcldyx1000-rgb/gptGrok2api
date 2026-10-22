@@ -61,6 +61,10 @@ export function useProxyDefaultRuntime(options: ProxyDefaultRuntimeOptions) {
   const fallbackCustomProxyInput = ref('')
   const currentSettings = ref<Settings | null>(null)
   const defaultTestResult = ref<ProxyTestResult | null>(null)
+  // 直连出口（以及自定义代理 URL）的地区环境：时区与语言必须同时填写，或都留空沿用默认。
+  const directTimezone = ref('')
+  const directLanguage = ref('')
+  const savedDirectLocale = ref({ timezone: '', language: '' })
 
   const proxyDataQuery = usePageQuery({
     runtime: options.runtime,
@@ -79,9 +83,28 @@ export function useProxyDefaultRuntime(options: ProxyDefaultRuntimeOptions) {
     return false
   })
 
+  const directLocaleError = computed(() => (
+    Boolean(directTimezone.value) !== Boolean(directLanguage.value)
+      ? '直连出口地区环境需要同时填写时区和语言，或都留空'
+      : ''
+  ))
+
+  const isDirectLocaleDirty = computed(() => (
+    directTimezone.value !== savedDirectLocale.value.timezone
+    || directLanguage.value !== savedDirectLocale.value.language
+  ))
+
+  function applyDirectLocale(locale: { timezone?: string; language?: string } | null | undefined) {
+    const next = { timezone: String(locale?.timezone || ''), language: String(locale?.language || '') }
+    savedDirectLocale.value = next
+    directTimezone.value = next.timezone
+    directLanguage.value = next.language
+  }
+
   const isDefaultProxyDirty = computed(() => {
     const settings = currentSettings.value
     if (!settings) return false
+    if (isDirectLocaleDirty.value) return true
     return (
       normalizeDefaultProxyForCompare(defaultProxyValue()) !== normalizeDefaultProxyForCompare(defaultProxyFromSettings(settings))
       || normalizeDefaultProxyForCompare(fallbackProxyValue()) !== normalizeDefaultProxyForCompare(fallbackProxyFromSettings(settings))
@@ -176,9 +199,11 @@ export function useProxyDefaultRuntime(options: ProxyDefaultRuntimeOptions) {
       () => Promise.all([
         settingsApi.get(),
         proxyApi.listGroups(),
+        proxyApi.getView().catch(() => null),
       ]),
       {
-        apply: ([settings, groupResponse]) => {
+        apply: ([settings, groupResponse, view]) => {
+          applyDirectLocale(view?.direct_locale)
           currentSettings.value = prepareSettingsForEdit(settings)
           settingsStore.$patch({ settings })
           options.updateGroups(groupResponse.groups || [])
@@ -213,6 +238,10 @@ export function useProxyDefaultRuntime(options: ProxyDefaultRuntimeOptions) {
       toast.warning('请填写备用代理 URL')
       return
     }
+    if (directLocaleError.value) {
+      toast.warning(directLocaleError.value)
+      return
+    }
     const confirmed = await confirmDialog.ask({
       title: '确认保存出口配置',
       message: '即将保存默认出口和备用出口配置。备用出口只在图片请求早期连接失败时重试一次，是否继续？',
@@ -231,6 +260,12 @@ export function useProxyDefaultRuntime(options: ProxyDefaultRuntimeOptions) {
         fallback_proxy: next.fallback_proxy,
       })
       currentSettings.value = prepareSettingsForEdit(response.config || next)
+      if (isDirectLocaleDirty.value) {
+        const view = await proxyApi.saveDefaults({
+          direct_locale: { timezone: directTimezone.value, language: directLanguage.value },
+        })
+        applyDirectLocale(view.direct_locale)
+      }
       syncDefaultProxyControlsFromValue(defaultProxyFromSettings(currentSettings.value))
       syncFallbackProxyControlsFromValue(fallbackProxyFromSettings(currentSettings.value))
       toast.success('出口配置已保存')
@@ -320,6 +355,9 @@ export function useProxyDefaultRuntime(options: ProxyDefaultRuntimeOptions) {
     selectedFallbackProxyGroupId,
     fallbackCustomProxyInput,
     defaultTestResult,
+    directTimezone,
+    directLanguage,
+    directLocaleError,
     defaultProxyGroupOptions,
     canTestDefaultProxy,
     isDefaultProxyDirty,

@@ -1,6 +1,6 @@
 import type { Ref } from 'vue'
 
-import { accountsApi, type Account, type AccountGroup } from '@/api/accounts'
+import { accountDisplayLabel, accountsApi, type Account, type AccountGroup } from '@/api/accounts'
 import type { ProxyGroup } from '@/api/proxy'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { useToast } from '@/composables/useToast'
@@ -80,7 +80,11 @@ export function useAccountBulkActionsRuntime(options: AccountBulkActionsRuntimeO
   const toast = useToast()
   const confirmDialog = useConfirmDialog()
 
-  async function refreshAccountsWithProgress(accountIds: readonly string[], title: string) {
+  async function refreshAccountsWithProgress(
+    accountIds: readonly string[],
+    title: string,
+    kind: 'sync' | 'access_token' = 'sync',
+  ) {
     const targetIds = uniqueIds(accountIds)
     if (!targetIds.length) {
       toast.warning('没有可刷新的账号')
@@ -89,7 +93,9 @@ export function useAccountBulkActionsRuntime(options: AccountBulkActionsRuntimeO
 
     const confirmed = await confirmDialog.ask({
       title,
-      message: `即将按每批 ${options.refreshBatchSize} 个刷新 ${targetIds.length} 个账号的信息和额度，是否继续？`,
+      message: kind === 'access_token'
+        ? `即将按每批 ${options.refreshBatchSize} 个用 refresh token 刷新 ${targetIds.length} 个账号的 access token（不查询账号信息和额度），没有 refresh token 的账号会被跳过。是否继续？`
+        : `即将按每批 ${options.refreshBatchSize} 个刷新 ${targetIds.length} 个账号的信息和额度，是否继续？`,
       confirmText: '开始刷新',
       cancelText: '取消',
     })
@@ -104,14 +110,17 @@ export function useAccountBulkActionsRuntime(options: AccountBulkActionsRuntimeO
       for (let index = 0; index < targetIds.length; index += options.refreshBatchSize) {
         if (options.bulkProgress.bulkStopRequested.value) break
         const batch = targetIds.slice(index, index + options.refreshBatchSize)
-        const result = await accountsApi.refreshAccountsWithProgress(batch, (progress) => {
+        const onProgress = (progress: Parameters<Parameters<typeof accountsApi.refreshAccountsWithProgress>[1] & {}>[0]) => {
           options.bulkProgress.update({
             ...progress,
             total: targetIds.length,
             processed: Math.min(targetIds.length, processedOffset + Number(progress.processed || 0)),
             done: false,
           })
-        })
+        }
+        const result = kind === 'access_token'
+          ? await accountsApi.refreshAccessTokensWithProgress(batch, onProgress)
+          : await accountsApi.refreshAccountsWithProgress(batch, onProgress)
 
         const batchProgress = result.progress
         const batchErrors = normalizeErrorList(batchProgress?.result?.errors)
@@ -151,6 +160,14 @@ export function useAccountBulkActionsRuntime(options: AccountBulkActionsRuntimeO
     } finally {
       options.bulkProgress.end()
     }
+  }
+
+  async function refreshSelectedAccessTokens() {
+    await refreshAccountsWithProgress(options.accountSelection.selectedIds.value, '刷新选中账号 Access Token', 'access_token')
+  }
+
+  async function refreshAccessTokensFor(accountId: string) {
+    await refreshAccountsWithProgress([accountId], `刷新账号 ${accountDisplayLabel(accountId)} 的 Access Token`, 'access_token')
   }
 
   async function refreshSelectedAccounts() {
@@ -365,6 +382,8 @@ export function useAccountBulkActionsRuntime(options: AccountBulkActionsRuntimeO
   return {
     refreshAllAccounts,
     refreshSelectedAccounts,
+    refreshSelectedAccessTokens,
+    refreshAccessTokensFor,
     requestStopRefreshProgress,
     runBulkAction,
     bindSelectedAccountsToGroup,

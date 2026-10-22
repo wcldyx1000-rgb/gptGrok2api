@@ -21,9 +21,22 @@ export interface ModelCatalogResponse {
   image_edit_models?: string[]
   video_models?: string[]
   all_models?: string[]
+  schema_version?: number
+  generated_at?: string
+  revision?: string
+  defaults?: {
+    chat_model?: string
+    image_model?: string
+  }
+  capabilities?: {
+    image_upscale?: boolean
+    // 支持 2K/4K 高分辨率尺寸的图片模型；Studio 的尺寸预设据此过滤。
+    high_resolution_image_models?: string[]
+  }
   source?: {
     chat?: string
     image?: string
+    grok?: string
   }
   openai_models_endpoint?: string
 }

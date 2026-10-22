@@ -89,6 +89,18 @@
                 />
               </div>
             </FormSection>
+
+            <RegisterOutlookPoolPanel
+              v-for="({ provider, index }) in outlookProviderEntries"
+              :key="`outlook-pool-${providerKey(provider, index)}`"
+              :provider="provider"
+              :disabled="registerConfig.enabled"
+              :confirm="confirmDialog.ask"
+              :notify-success="(message: string) => toast.success(message)"
+              :notify-error="(message: string) => toast.error(message)"
+              @import="text => importOutlookMailboxes(index, text)"
+              @changed="loadRegisterRuntimeConfig()"
+            />
           </div>
 
           <RegisterRuntimePanel
@@ -166,6 +178,7 @@ import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import { useToast } from '@/composables/useToast'
 import { saveBlob } from '@/lib/downloads'
+import RegisterOutlookPoolPanel from '@/views/register/RegisterOutlookPoolPanel.vue'
 import RegisterProviderCard from '@/views/register/RegisterProviderCard.vue'
 import CheckoutTaskTable from '@/views/register/CheckoutTaskTable.vue'
 import RegisterRuntimePanel from '@/views/register/RegisterRuntimePanel.vue'
@@ -290,6 +303,9 @@ const showDisabledProviders = ref(false)
 const visibleRegisterProviderEntries = computed(() => registerProviders.value
   .map((provider, index) => ({ provider, index }))
   .filter(({ provider }) => showDisabledProviders.value || provider.enable !== false))
+const outlookProviderEntries = computed(() => registerProviders.value
+  .map((provider, index) => ({ provider, index }))
+  .filter(({ provider }) => provider.type === 'outlook_token'))
 const enabledProviderIssueCount = computed(() => buildRegisterProviderIssueCount(registerProviders.value))
 const grokConfigIssueCount = computed(() => grokRequirementMessages(registerConfig.value).length)
 const sub2apiSyncIssueCount = computed(() => sub2apiSyncRequirementMessages(registerConfig.value).length)
@@ -370,6 +386,15 @@ function updateProviderType(index: number, type: string) {
 function updateProviderField(index: number, key: string, value: unknown) {
   updateProviderFieldDraft(index, key, value)
   if (key === 'enable' && value === false) showDisabledProviders.value = true
+}
+
+// 邮箱池面板的批量导入沿用现有导入通道：并入该来源的 mailboxes 草稿，随配置自动保存后入池。
+function importOutlookMailboxes(index: number, text: string) {
+  const provider = registerProviders.value[index]
+  if (!provider) return
+  const current = String(provider.mailboxes || '').trim()
+  updateProviderField(index, 'mailboxes', current ? `${current}\n${text}` : text)
+  toast.success('已加入导入草稿，自动保存后进入邮箱池')
 }
 
 function grokExportFilename(format: 'cpa' | 'sub2api') {

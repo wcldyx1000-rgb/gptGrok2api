@@ -2,6 +2,20 @@ import apiClient from './client'
 
 export type GalleryMediaType = 'all' | 'image' | 'video' | 'music'
 
+export type GalleryGenBoxPushStatus = 'imported' | 'already-imported' | 'duplicate-local'
+
+export interface GalleryGenBoxPushState {
+  status: GalleryGenBoxPushStatus
+  label: string
+  sha256: string
+  updated_at: string
+}
+
+export interface GalleryGenBoxPushResult extends GalleryGenBoxPushState {
+  path: string
+  source_retained: boolean
+}
+
 export interface GalleryFile {
   filename: string
   path: string
@@ -14,19 +28,25 @@ export interface GalleryFile {
   type: Exclude<GalleryMediaType, 'all'>
   expired: boolean
   expires_in_seconds: number | null
+  /** 绝对到期时间（北京时间文本），来自后端 expires_at。 */
+  expires_at?: string
+  /** 到期时刻（毫秒时间戳）：拉取时按剩余秒数换算，页面用它随时钟倒计时。 */
+  expires_at_ms?: number | null
   tags: string[]
   storage: string
   local: boolean
   webdav: boolean
   width: number | null
   height: number | null
+  genbox_push?: GalleryGenBoxPushState | null
 }
 
 export interface GalleryResponse {
   files: GalleryFile[]
   total: number
   total_size: number
-  retention_days: number
+  retention_hours: number
+  genbox_push_enabled: boolean
   counts: {
     all: number
     image: number
@@ -69,7 +89,8 @@ type BackendImagesResponse = {
   items?: BackendImageItem[]
   total?: number
   total_size?: number
-  retention_days?: number
+  retention_hours?: number
+  genbox_push_enabled?: boolean
   counts?: Partial<GalleryResponse['counts']>
   limit?: number
   offset?: number
@@ -85,7 +106,7 @@ type BackendTagsResponse = {
 
 type BackendSettingsResponse = {
   config?: {
-    image_retention_days?: number
+    image_retention_hours?: number
     basic?: {
       image_expire_hours?: number
     }
@@ -172,11 +193,11 @@ export function resolveGalleryFileUrl(url: string, baseUrl = defaultFileBaseUrl(
   return `${cleanBase}${cleanPath}`
 }
 
-function expiryFor(createdAtMs: number, retentionDays: number) {
+function expiryFor(createdAtMs: number, retentionHours: number) {
   if (!createdAtMs) {
     return { expired: false, expires_in_seconds: null }
   }
-  const expiresAt = createdAtMs + retentionDays * 86400 * 1000
+  const expiresAt = createdAtMs + retentionHours * 3600 * 1000
   const remaining = Math.floor((expiresAt - Date.now()) / 1000)
   return {
     expired: remaining <= 0,
@@ -184,7 +205,7 @@ function expiryFor(createdAtMs: number, retentionDays: number) {
   }
 }
 
-function expiryForItem(item: BackendImageItem, createdAtMs: number, retentionDays: number) {
+function expiryForItem(item: BackendImageItem, createdAtMs: number, retentionHours: number) {
   if (typeof item.expired === 'boolean' || item.expires_in_seconds !== undefined) {
     const remaining = item.expires_in_seconds === null || item.expires_in_seconds === undefined
       ? null
@@ -194,15 +215,30 @@ function expiryForItem(item: BackendImageItem, createdAtMs: number, retentionDay
       expires_in_seconds: remaining,
     }
   }
-  return expiryFor(createdAtMs, retentionDays)
+  return expiryFor(createdAtMs, retentionHours)
 }
 
-function mapFile(item: BackendImageItem, retentionDays: number): GalleryFile {
+function normalizeGenBoxPush(value: unknown): GalleryGenBoxPushState | null {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const status = cleanString(raw.status)
+  if (status !== 'imported' && status !== 'already-imported' && status !== 'duplicate-local') return null
+  const label = cleanString(raw.label)
+  if (!label) return null
+  return {
+    status,
+    label,
+    sha256: cleanString(raw.sha256),
+    updated_at: cleanString(raw.updated_at),
+  }
+}
+
+function mapFile(item: BackendImageItem, retentionHours: number): GalleryFile {
   const path = cleanString(item.path || item.rel || item.name)
   const name = cleanString(item.filename || item.name || path.split('/').pop() || path)
   const createdAt = cleanString(item.created_at)
   const createdAtMs = parseTimeMs(createdAt)
-  const expiry = expiryForItem(item, createdAtMs, retentionDays)
+  const expiry = expiryForItem(item, createdAtMs, retentionHours)
   const safePath = path || name
   return {
     filename: name || safePath,
@@ -216,12 +252,15 @@ function mapFile(item: BackendImageItem, retentionDays: number): GalleryFile {
     type: mediaTypeFor(item),
     expired: expiry.expired,
     expires_in_seconds: expiry.expires_in_seconds,
+    expires_at: cleanString(item.expires_at),
+    expires_at_ms: expiry.expires_in_seconds === null ? null : Date.now() + expiry.expires_in_seconds * 1000,
     tags: normalizeTags(item.tags),
     storage: cleanString(item.storage || (item.webdav ? (item.local ? 'both' : 'webdav') : 'local')),
     local: Boolean(item.local ?? true),
     webdav: Boolean(item.webdav ?? false),
     width: Number.isFinite(Number(item.width)) ? Number(item.width) : null,
     height: Number.isFinite(Number(item.height)) ? Number(item.height) : null,
+    genbox_push: normalizeGenBoxPush(item.genbox_push),
   }
 }
 
@@ -259,13 +298,13 @@ function matchesSearch(file: GalleryFile, search: string) {
   ].some((value) => cleanString(value).toLowerCase().includes(keyword))
 }
 
-async function getRetentionDays() {
+async function getRetentionHours() {
   try {
     const settings = await apiClient.get<never, BackendSettingsResponse>('/api/settings')
-    const value = Number(settings.config?.image_retention_days ?? settings.config?.basic?.image_expire_hours ?? 15)
-    return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 15
+    const value = Number(settings.config?.image_retention_hours)
+    return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 24
   } catch {
-    return 15
+    return 24
   }
 }
 
@@ -285,14 +324,15 @@ async function listMappedFiles(params?: GalleryListParams) {
   if (params?.offset !== undefined && Number.isFinite(params.offset)) requestParams.offset = Number(params.offset)
 
   const images = await apiClient.get<never, BackendImagesResponse>('/api/images', { params: requestParams })
-  const responseRetentionDays = Number(images.retention_days)
-  const retentionDays = Number.isFinite(responseRetentionDays) && responseRetentionDays >= 1
-    ? Math.floor(responseRetentionDays)
-    : await getRetentionDays()
+  const responseRetentionHours = Number(images.retention_hours)
+  const retentionHours = Number.isFinite(responseRetentionHours) && responseRetentionHours >= 1
+    ? Math.floor(responseRetentionHours)
+    : await getRetentionHours()
 
   return {
-    files: (images.items || []).map((item) => mapFile(item, retentionDays)),
-    retentionDays,
+    files: (images.items || []).map((item) => mapFile(item, retentionHours)),
+    retentionHours,
+    genboxPushEnabled: Boolean(images.genbox_push_enabled),
     meta: images,
   }
 }
@@ -304,7 +344,7 @@ export const galleryApi = {
     const search = cleanString(params?.search)
     const pageSize = Math.min(Math.max(Number(params?.page_size || 24), 1), 200)
     const requestedPage = Math.max(Number(params?.page || 1), 1)
-    const { files, retentionDays, meta } = await listMappedFiles({
+    const { files, retentionHours, genboxPushEnabled, meta } = await listMappedFiles({
       start_date: params?.start_date,
       end_date: params?.end_date,
       media_type: mediaType,
@@ -321,7 +361,8 @@ export const galleryApi = {
         files,
         total,
         total_size: Number(meta.total_size || 0),
-        retention_days: retentionDays,
+        retention_hours: retentionHours,
+        genbox_push_enabled: genboxPushEnabled,
         counts: {
           all: Number(meta.counts?.all || 0),
           image: Number(meta.counts?.image || 0),
@@ -346,7 +387,8 @@ export const galleryApi = {
       files: page.items,
       total: filtered.length,
       total_size: filtered.reduce((sum, file) => sum + file.size, 0),
-      retention_days: retentionDays,
+      retention_hours: retentionHours,
+      genbox_push_enabled: genboxPushEnabled,
       counts,
       media_type: mediaType,
       page: page.page,
@@ -383,6 +425,11 @@ export const galleryApi = {
 
   deleteTag: (tag: string) =>
     apiClient.delete<never, { ok: boolean; removed_from: number }>(`/api/images/tags/${encodeURIComponent(tag)}`),
+
+  pushToGenBox: (path: string) =>
+    apiClient.post<{ path: string }, GalleryGenBoxPushResult>('/api/images/genbox-push', {
+      path,
+    }),
 
   getStorage: () =>
     apiClient.get<never, ImageStorageStats>('/api/images/storage'),

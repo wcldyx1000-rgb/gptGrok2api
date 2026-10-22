@@ -100,7 +100,14 @@
             block
             root-class="font-mono"
             :disabled="disabled"
+            :placeholder="provider.admin_key_set ? '已配置，留空不修改' : ''"
             @update:model-value="value => emit('update-field', index, 'admin_key', String(value || '').trim())"
+          />
+          <RegisterSecretClear
+            :visible="Boolean(provider.admin_key_set) && !String(provider.admin_key || '').trim()"
+            :model-value="Boolean(provider.clear_admin_key)"
+            :disabled="disabled"
+            @update:model-value="value => emit('update-field', index, 'clear_admin_key', value)"
           />
         </label>
 
@@ -111,7 +118,14 @@
             block
             root-class="font-mono"
             :disabled="disabled"
+            :placeholder="provider.admin_password_set ? '已配置，留空不修改' : ''"
             @update:model-value="value => emit('update-field', index, 'admin_password', String(value || '').trim())"
+          />
+          <RegisterSecretClear
+            :visible="Boolean(provider.admin_password_set) && !String(provider.admin_password || '').trim()"
+            :model-value="Boolean(provider.clear_admin_password)"
+            :disabled="disabled"
+            @update:model-value="value => emit('update-field', index, 'clear_admin_password', value)"
           />
         </label>
 
@@ -122,7 +136,14 @@
             block
             root-class="font-mono"
             :disabled="disabled"
+            :placeholder="provider.api_key_set ? '已配置，留空不修改' : ''"
             @update:model-value="value => emit('update-field', index, 'api_key', String(value || '').trim())"
+          />
+          <RegisterSecretClear
+            :visible="Boolean(provider.api_key_set) && !String(provider.api_key || '').trim()"
+            :model-value="Boolean(provider.clear_api_key)"
+            :disabled="disabled"
+            @update:model-value="value => emit('update-field', index, 'clear_api_key', value)"
           />
         </label>
 
@@ -242,8 +263,14 @@
             block
             root-class="font-mono"
             :disabled="disabled"
-            placeholder="DuckDuckGo Email Protection Bearer Token"
+            :placeholder="provider.ddg_token_set ? '已配置，留空不修改' : 'DuckDuckGo Email Protection Bearer Token'"
             @update:model-value="value => emit('update-field', index, 'ddg_token', String(value || '').trim())"
+          />
+          <RegisterSecretClear
+            :visible="Boolean(provider.ddg_token_set) && !String(provider.ddg_token || '').trim()"
+            :model-value="Boolean(provider.clear_ddg_token)"
+            :disabled="disabled"
+            @update:model-value="value => emit('update-field', index, 'clear_ddg_token', value)"
           />
         </label>
 
@@ -254,8 +281,14 @@
             block
             root-class="font-mono"
             :disabled="disabled"
-            placeholder="固定收件箱 JWT"
+            :placeholder="provider.cf_inbox_jwt_set ? '已配置，留空不修改' : '固定收件箱 JWT'"
             @update:model-value="value => emit('update-field', index, 'cf_inbox_jwt', String(value || '').trim())"
+          />
+          <RegisterSecretClear
+            :visible="Boolean(provider.cf_inbox_jwt_set) && !String(provider.cf_inbox_jwt || '').trim()"
+            :model-value="Boolean(provider.clear_cf_inbox_jwt)"
+            :disabled="disabled"
+            @update:model-value="value => emit('update-field', index, 'clear_cf_inbox_jwt', value)"
           />
         </label>
 
@@ -266,8 +299,14 @@
             block
             root-class="font-mono"
             :disabled="disabled"
-            placeholder="可选"
+            :placeholder="provider.cf_api_key_set ? '已配置，留空不修改' : '可选'"
             @update:model-value="value => emit('update-field', index, 'cf_api_key', String(value || '').trim())"
+          />
+          <RegisterSecretClear
+            :visible="Boolean(provider.cf_api_key_set) && !String(provider.cf_api_key || '').trim()"
+            :model-value="Boolean(provider.clear_cf_api_key)"
+            :disabled="disabled"
+            @update:model-value="value => emit('update-field', index, 'clear_cf_api_key', value)"
           />
         </label>
 
@@ -452,6 +491,8 @@
         </label>
       </div>
 
+      <p class="register-preview-line">{{ outlookDirectReadHint }}</p>
+
       <div class="register-provider-section register-provider-section--soft">
         <div class="register-provider-section-title">加号别名</div>
         <div class="register-form-grid register-form-grid--three">
@@ -501,6 +542,7 @@
           </label>
         </div>
         <p class="register-preview-line">{{ outlookAliasHint(provider) }}</p>
+        <p class="register-preview-line">{{ outlookAliasFamilyHint }}</p>
       </div>
 
       <label class="register-field">
@@ -605,6 +647,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { Button, Checkbox, Input } from 'nanocat-ui'
+import RegisterSecretClear from '@/views/register/RegisterSecretClear.vue'
 import type { ActionMenuItem } from 'nanocat-ui'
 
 import type { GptMailStatus, OutlookFailedMailbox, RegisterProvider } from '@/api/register'
@@ -622,7 +665,9 @@ import {
   domainPlaceholder,
   gptMailKeyModeGroups,
   gptMailKeyModeLabel,
+  outlookAliasFamilyHint,
   outlookAliasHint,
+  outlookDirectReadHint,
   outlookModeGroups,
   outlookPoolHint,
   outlookPoolSummary,

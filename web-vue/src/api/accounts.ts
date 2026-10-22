@@ -1,14 +1,144 @@
-﻿import apiClient from './client'
+import apiClient from './client'
 import type { ProxyGroup } from './proxy'
 
 export type AccountLane = 'fast' | 'thinking' | 'pro'
 export type AccountBackendStatus = '正常' | '限流' | '异常' | '禁用'
 export type AccountStatusCategory = 'normal' | 'limited' | 'abnormal' | 'disabled'
 export type CheckoutLinkStatus = 'ready' | 'failed' | 'pending' | 'processing' | ''
+export type AccountHealthLevel = 'healthy' | 'warning' | 'danger' | 'idle'
+export type AccountHealthTone = 'success' | 'warning' | 'error' | 'neutral'
+export type AccountHealthFilter = 'all' | 'risk' | AccountHealthLevel
+
+export interface AccountPoolWarning {
+  code: string
+  tone: 'warning' | 'error'
+  message: string
+}
+
+export interface AccountPoolHealth {
+  level: 'healthy' | 'warning' | 'danger'
+  label: string
+  tone: AccountHealthTone
+  warnings: AccountPoolWarning[]
+  suggested_additional_accounts: number
+  metrics: {
+    total_accounts: number
+    ready_accounts: number
+    danger_accounts: number
+    warning_accounts: number
+    demand_1h: number
+    capacity_1h: number
+    utilization: number | null
+    waits_1h: number
+    avg_wait_seconds: number
+    timeouts_1h: number
+    avg_hold_seconds: number
+    observed_seconds: number
+  }
+}
+
+export interface AccountPoolHealthResponse {
+  pool: AccountPoolHealth | Record<string, never>
+  counts: Partial<Record<AccountHealthLevel, number>>
+}
+
+export interface AccountTestResult {
+  ok: boolean
+  duration_ms: number
+  message?: string
+  error?: string
+}
+
+/** 账号真实测试：probe 只探测远程信息；chat / image 发起真实对话或画图。 */
+export type AccountTestMode = 'probe' | 'chat' | 'image'
+
+export interface AccountCapabilityTestResult {
+  status: 'success' | 'failed'
+  status_label: string
+  tone: 'success' | 'danger'
+  account_id: string
+  account_label: string
+  mode: 'chat' | 'image'
+  mode_label: string
+  model: string
+  duration_ms: number
+  content: string
+  quota_before_label: string
+  quota_after_label: string
+  quota_deducted: boolean
+  error_code: string
+  error_message: string
+}
+
+/** 跨分页选择范围：filter 为当前筛选结果，excluded_account_ids 为取消勾选的账号。 */
+export interface AccountSelectionScope {
+  mode: 'explicit' | 'filter' | 'all'
+  account_ids?: string[]
+  excluded_account_ids?: string[]
+  keyword?: string
+  status?: string
+  group_id?: string
+  health?: string
+  /** “更多筛选”取值，与 GET /api/accounts 的 flag 参数一致。 */
+  flag?: string
+}
+
+export interface AccountSelectionPreview {
+  matching_count: number
+  selected_count: number
+  excluded_account_ids: string[]
+  account_ids: string[]
+  errors: Array<{ id: string; code: string; message: string }>
+}
+
+export type AccountExportFormat = 'json' | 'zip' | 'cpa' | 'sub2api' | 'agent_identity' | 'txt' | 'backup'
+
+export interface CodexOAuthStartResponse {
+  session_id: string
+  authorize_url: string
+  expires_in: string
+  redirect_uri_prefix: string
+}
+
+export interface CodexOAuthBindResult {
+  id: string
+  email: string
+  codex_plan_type: string
+  codex_token_expires_at: number
+}
+
+export type AccountPresentationTone = 'neutral' | 'success' | 'warning' | 'error' | 'info'
+
+export interface AccountEgress {
+  mode: 'slot' | 'direct' | 'group' | 'profile' | 'custom' | 'default'
+  slot: number | null
+  label: string
+  source: 'account' | 'group' | 'default'
+  source_label: string
+  usable: boolean
+  switch_to: string | null
+  switch_to_label: string
+  switch_at: number | null
+}
+
+export interface AccountEgressSwitchResult {
+  target: string
+  due_at: string
+  scheduled: string[]
+  applied: string[]
+  skipped: Array<{ token: string; reason: string }>
+}
 
 export interface Account {
+  /** 后端稳定管理 ID（acct_...），token 轮换后不变；所有账号操作都用它定位。 */
   id: string
   access_token?: string
+  /** 后端是否保存了 refresh_token（token 本身不在列表里返回）。 */
+  has_refresh_token?: boolean
+  /** 是否已绑定 Codex 登录（仅 codex-gpt-image-2 使用，不影响账号原有 token）。 */
+  codex_bound?: boolean
+  codex_plan_type?: string
+  codex_token_expires_at?: number
   backend_status?: string
   status_category?: AccountStatusCategory
   status_label?: string
@@ -66,6 +196,61 @@ export interface Account {
   checkout_upstream_status?: number
   quota?: number
   image_quota_unknown?: boolean
+  /** GPT pool auto pause: ISO time until which the account is deprioritised. */
+  auto_paused_until?: string
+  auto_pause_reason?: string
+  /** Set when the refresh_token is rejected and automatic relogin is pending. */
+  relogin_needed_at?: string
+  relogin_attempts?: number
+  last_relogin_error?: string
+  // ── 展示字段（services/account_view.py）：只有布尔和时间，没有任何明文凭据 ──
+  access_token_status?: 'valid' | 'expiring' | 'invalid'
+  access_token_label?: string
+  access_token_tone?: AccountPresentationTone
+  access_token_issued_at?: number | null
+  access_token_expires_at?: number | null
+  refresh_token_status?: 'valid' | 'missing' | 'invalid'
+  refresh_token_label?: string
+  refresh_token_tone?: AccountPresentationTone
+  can_refresh_access_token?: boolean
+  credential_availability?: 'usable' | 'recoverable' | 'unavailable'
+  credential_availability_label?: string
+  credential_availability_tone?: AccountPresentationTone
+  refresh_token_invalid_at?: number | null
+  last_token_refresh_at?: number | null
+  last_token_refresh_error?: string | null
+  last_token_refresh_error_at?: number | null
+  rescue_code?: 'refresh' | 'outlook' | 'exhausted' | 'manual' | 'none'
+  rescue_label?: string
+  rescue_tone?: AccountPresentationTone
+  rescue_detail?: string
+  has_outlook_credentials?: boolean
+  has_password?: boolean
+  has_totp?: boolean
+  relogin_failures?: number
+  relogin_last_error?: string | null
+  quota_remaining?: number
+  quota_unknown?: boolean
+  quota_unlimited?: boolean
+  quota_state?: 'unlimited' | 'unknown' | 'exhausted' | 'available'
+  quota_label?: string
+  quota_reset_at?: number | null
+  quota_source?: 'estimated' | 'remote' | 'unknown'
+  quota_synced_at?: number | null
+  quota_reset_idle?: boolean
+  group_name?: string
+  proxy_label?: string
+  status_raw_error?: string
+  egress?: AccountEgress | null
+  /** Inferred GPT image account health (see services/account_health.py). */
+  /** Live scheduling view from services/account_service.py scheduling_view (Unix seconds). */
+  scheduling?: AccountScheduling
+  health_level?: AccountHealthLevel
+  health_label?: string
+  health_tone?: AccountHealthTone
+  health_reasons?: string[]
+  recent_uses_1h?: number
+  recent_uses_24h?: number
   name: string
   status?: 'ready' | 'incomplete' | 'disabled' | 'invalid' | 'auto_disabled' | 'cooling' | 'backoff'
   status_reason?: string
@@ -189,6 +374,8 @@ export interface AccountsResponse {
   accounts: Account[]
   total?: number
   all_total?: number
+  /** 调度状态汇总（除“状态”外的其它筛选生效）：code -> 数量。 */
+  availability_summary?: Record<string, number>
   page?: number
   page_size?: number
 }
@@ -218,11 +405,53 @@ export interface AccountGroupPayload extends Partial<AccountGroup> {
   create_only?: boolean
 }
 
+export interface AccountScheduling {
+  new_account_stage: '' | 'cooldown' | 'ramp'
+  new_account_joined_at: number | null
+  cooldown_until: number | null
+  ramp_until: number | null
+  ramp_used_today: number
+  ramp_daily_limit: number
+  ramp_exhausted: boolean
+  ramp_resume_at: number | null
+  failure_cooldown_until: number | null
+  failure_streak: number
+  auto_paused_until: number | null
+  auto_pause_reason: string
+  image_inflight: number
+  image_concurrency: number
+  text_inflight: number
+  text_concurrency: number
+  auth_pending: boolean
+  auth_pending_event: string
+  auth_pending_since: number | null
+  credential_status: 'usable' | 'recoverable' | 'unavailable'
+  access_token_status: 'valid' | 'expiring' | 'invalid'
+  refresh_token_status: 'valid' | 'missing' | 'invalid'
+  image_schedulable: boolean
+}
+
+/** One per-account line of an operation (services/account_service.py update_refresh_progress). */
+export interface AccountOperationEvent {
+  sequence: number
+  timestamp: string
+  account_id: string
+  account_label: string
+  action: string
+  status: 'info' | 'success' | 'failed' | 'skipped'
+  message: string
+}
+
 export interface AccountRefreshProgress {
   total: number
   processed: number
   done: boolean
   error?: string | null
+  /** Present on /api/accounts/operations/{id}. */
+  status?: 'running' | 'success' | 'failed'
+  percent?: number
+  events?: AccountOperationEvent[]
+  last_sequence?: number
   status_counts?: Record<string, number>
   total_quota?: number
   result?: {
@@ -234,10 +463,44 @@ export interface AccountRefreshProgress {
 
 type BackendAccount = Record<string, any>
 
+function normalizeScheduling(raw: unknown): AccountScheduling | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const s = raw as Record<string, any>
+  const num = (value: unknown): number | null => (Number(value) > 0 ? Number(value) : null)
+  const count = (value: unknown, fallback = 0): number => Math.max(0, Number(value ?? fallback) || 0)
+  const stage = s.new_account_stage === 'cooldown' || s.new_account_stage === 'ramp' ? s.new_account_stage : ''
+  return {
+    new_account_stage: stage,
+    new_account_joined_at: num(s.new_account_joined_at),
+    cooldown_until: num(s.cooldown_until),
+    ramp_until: num(s.ramp_until),
+    ramp_used_today: count(s.ramp_used_today),
+    ramp_daily_limit: count(s.ramp_daily_limit),
+    ramp_exhausted: Boolean(s.ramp_exhausted),
+    ramp_resume_at: num(s.ramp_resume_at),
+    failure_cooldown_until: num(s.failure_cooldown_until),
+    failure_streak: count(s.failure_streak),
+    auto_paused_until: num(s.auto_paused_until),
+    auto_pause_reason: cleanString(s.auto_pause_reason),
+    image_inflight: count(s.image_inflight),
+    image_concurrency: count(s.image_concurrency, 1),
+    text_inflight: count(s.text_inflight),
+    text_concurrency: count(s.text_concurrency, 1),
+    auth_pending: Boolean(s.auth_pending),
+    auth_pending_event: cleanString(s.auth_pending_event),
+    auth_pending_since: num(s.auth_pending_since),
+    credential_status: ['recoverable', 'unavailable'].includes(s.credential_status) ? s.credential_status : 'usable',
+    access_token_status: ['expiring', 'invalid'].includes(s.access_token_status) ? s.access_token_status : 'valid',
+    refresh_token_status: ['missing', 'invalid'].includes(s.refresh_token_status) ? s.refresh_token_status : 'valid',
+    image_schedulable: s.image_schedulable !== false,
+  }
+}
+
 type BackendAccountsResponse = {
   items?: BackendAccount[]
   total?: number
   all_total?: number
+  availability_summary?: Record<string, number>
   page?: number
   page_size?: number
 }
@@ -251,14 +514,28 @@ type BackendAccountMutationResponse = {
   updated?: number
   removed?: number
   errors?: Array<{ token?: string; error?: string } | string>
+  verified?: number
+  rejected?: AccountImportRejected[]
   group_id?: string
   groups?: AccountGroup[]
+}
+
+export type AccountImportRejected = {
+  email?: string
+  reason?: string
+  status?: string
 }
 
 type AccountImportPayload = Record<string, unknown>
 type AccountImportOptions = {
   refresh?: boolean
   returnItems?: boolean
+  /** 入池前验证 refresh_token 与额度，不可用的账号不留在号池。 */
+  verifyOnImport?: boolean
+  /** undefined 不改分组；'' 归入未分组；其它为已存在的账号组 ID。 */
+  targetGroupId?: string
+  /** 导入完整备份：保留备份里的管理 ID 与全部字段。 */
+  restore?: boolean
 }
 type AccountImportCleanupResponse = {
   checked?: number
@@ -276,6 +553,34 @@ const STATUS_LIMITED: AccountBackendStatus = '限流'
 const STATUS_INVALID: AccountBackendStatus = '异常'
 
 const accountTokenById = new Map<string, string>()
+const accountLabelById = new Map<string, string>()
+
+const MANAGEMENT_ID_PATTERN = /^acct_[0-9a-f]{24}$/
+
+/** 后端稳定管理 ID；旧版展示 ID（邮箱等）不满足该格式。 */
+export function isAccountManagementId(value: unknown): boolean {
+  return MANAGEMENT_ID_PATTERN.test(String(value || '').trim().toLowerCase())
+}
+
+/** 把一组账号标识拆成 account_ids（管理 ID）与 access_tokens（旧版标识，兼容旧接口）。 */
+function targetFields(values: readonly string[]): { account_ids: string[]; access_tokens: string[] } {
+  const accountIds: string[] = []
+  const accessTokens: string[] = []
+  for (const raw of new Set(values.map((value) => String(value || '').trim()).filter(Boolean))) {
+    if (isAccountManagementId(raw)) {
+      accountIds.push(raw.toLowerCase())
+      continue
+    }
+    const token = resolveToken(raw)
+    if (token) accessTokens.push(token)
+  }
+  return { account_ids: accountIds, access_tokens: accessTokens }
+}
+
+/** 用于提示文案：优先显示邮箱，没有则显示 ID。 */
+export function accountDisplayLabel(accountId: string): string {
+  return accountLabelById.get(accountId) || accountId
+}
 
 function cleanString(value: unknown): string {
   return String(value || '').trim()
@@ -411,10 +716,95 @@ function optionalBoolean(value: unknown): boolean | undefined {
   return undefined
 }
 
+function normalizeHealthLevel(value: unknown): AccountHealthLevel | undefined {
+  const level = cleanString(value)
+  return level === 'healthy' || level === 'warning' || level === 'danger' || level === 'idle' ? level : undefined
+}
+
+function normalizeHealthTone(value: unknown): AccountHealthTone | undefined {
+  const tone = cleanString(value)
+  return tone === 'success' || tone === 'warning' || tone === 'error' || tone === 'neutral' ? tone : undefined
+}
+
+function oneOf<T extends string>(value: unknown, allowed: readonly T[]): T | undefined {
+  const raw = cleanString(value)
+  return (allowed as readonly string[]).includes(raw) ? raw as T : undefined
+}
+
+function optionalTimestamp(value: unknown): number | null {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : null
+}
+
+const PRESENTATION_TONES = ['neutral', 'success', 'warning', 'error', 'info'] as const
+
+function normalizeEgress(value: unknown): AccountEgress | null {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  return {
+    mode: oneOf(raw.mode, ['slot', 'direct', 'group', 'profile', 'custom', 'default'] as const) ?? 'default',
+    slot: raw.slot === null || raw.slot === undefined ? null : Number(raw.slot) || null,
+    label: cleanString(raw.label) || '默认出口',
+    source: oneOf(raw.source, ['account', 'group', 'default'] as const) ?? 'default',
+    source_label: cleanString(raw.source_label),
+    usable: raw.usable !== false,
+    switch_to: cleanString(raw.switch_to) || null,
+    switch_to_label: cleanString(raw.switch_to_label),
+    switch_at: optionalTimestamp(raw.switch_at),
+  }
+}
+
+/** services/account_view.py 生成的凭据 / 救回 / 额度 / 出口展示字段。 */
+function normalizeAccountDisplay(item: BackendAccount): Partial<Account> {
+  const tone = (value: unknown) => oneOf(value, PRESENTATION_TONES)
+  return {
+    access_token_status: oneOf(item.access_token_status, ['valid', 'expiring', 'invalid'] as const),
+    access_token_label: cleanString(item.access_token_label),
+    access_token_tone: tone(item.access_token_tone),
+    access_token_issued_at: optionalTimestamp(item.access_token_issued_at),
+    access_token_expires_at: optionalTimestamp(item.access_token_expires_at),
+    refresh_token_status: oneOf(item.refresh_token_status, ['valid', 'missing', 'invalid'] as const),
+    refresh_token_label: cleanString(item.refresh_token_label),
+    refresh_token_tone: tone(item.refresh_token_tone),
+    can_refresh_access_token: Boolean(item.can_refresh_access_token),
+    credential_availability: oneOf(item.credential_availability, ['usable', 'recoverable', 'unavailable'] as const),
+    credential_availability_label: cleanString(item.credential_availability_label),
+    credential_availability_tone: tone(item.credential_availability_tone),
+    refresh_token_invalid_at: optionalTimestamp(item.refresh_token_invalid_at),
+    last_token_refresh_at: optionalTimestamp(item.last_token_refresh_at),
+    last_token_refresh_error: cleanString(item.last_token_refresh_error) || null,
+    last_token_refresh_error_at: optionalTimestamp(item.last_token_refresh_error_at),
+    rescue_code: oneOf(item.rescue_code, ['refresh', 'outlook', 'exhausted', 'manual', 'none'] as const),
+    rescue_label: cleanString(item.rescue_label),
+    rescue_tone: tone(item.rescue_tone),
+    rescue_detail: cleanString(item.rescue_detail),
+    has_outlook_credentials: Boolean(item.has_outlook_credentials),
+    has_password: Boolean(item.has_password),
+    has_totp: Boolean(item.has_totp),
+    relogin_failures: Math.max(0, Number(item.relogin_failures || 0) || 0),
+    relogin_last_error: cleanString(item.relogin_last_error) || null,
+    quota_remaining: Math.max(0, Number(item.quota_remaining || 0) || 0),
+    quota_unknown: Boolean(item.quota_unknown),
+    quota_unlimited: Boolean(item.quota_unlimited),
+    quota_state: oneOf(item.quota_state, ['unlimited', 'unknown', 'exhausted', 'available'] as const),
+    quota_label: cleanString(item.quota_label),
+    quota_reset_at: optionalTimestamp(item.quota_reset_at),
+    quota_source: oneOf(item.quota_source, ['estimated', 'remote', 'unknown'] as const),
+    quota_synced_at: optionalTimestamp(item.quota_synced_at),
+    quota_reset_idle: Boolean(item.quota_reset_idle),
+    group_name: cleanString(item.group_name),
+    proxy_label: cleanString(item.proxy_label),
+    status_raw_error: cleanString(item.status_raw_error),
+    egress: normalizeEgress(item.egress),
+  }
+}
+
 function mapBackendAccount(item: BackendAccount, index: number, usedIds: Set<string>): Account {
   const accessToken = cleanString(item.access_token || item.accessToken)
-  const id = displayIdForAccount(item, index, usedIds)
+  const backendId = cleanString(item.id).toLowerCase()
+  const id = isAccountManagementId(backendId) ? backendId : displayIdForAccount(item, index, usedIds)
   if (accessToken) accountTokenById.set(id, accessToken)
+  accountLabelById.set(id, cleanString(item.email) || id)
 
   const quota = Math.max(0, Number(item.quota ?? 0) || 0)
   const imageQuotaUnknown = Boolean(item.image_quota_unknown)
@@ -436,6 +826,10 @@ function mapBackendAccount(item: BackendAccount, index: number, usedIds: Set<str
   return {
     id,
     access_token: accessToken,
+    has_refresh_token: Boolean(item.has_refresh_token),
+    codex_bound: Boolean(item.codex_bound),
+    codex_plan_type: cleanString(item.codex_plan_type),
+    codex_token_expires_at: optionalNonNegativeInteger(item.codex_token_expires_at),
     backend_status: rawStatus || STATUS_NORMAL,
     status_category: normalizeAccountStatusCategory(item.status_category),
     status_label: cleanString(item.status_label),
@@ -490,6 +884,19 @@ function mapBackendAccount(item: BackendAccount, index: number, usedIds: Set<str
     checkout_upstream_status: Number(item.checkout_upstream_status || 0) || undefined,
     quota,
     image_quota_unknown: imageQuotaUnknown,
+    auto_paused_until: cleanString(item.auto_paused_until),
+    auto_pause_reason: cleanString(item.auto_pause_reason),
+    relogin_needed_at: cleanString(item.relogin_needed_at),
+    relogin_attempts: Math.max(0, Number(item.relogin_attempts || 0) || 0),
+    last_relogin_error: cleanString(item.last_relogin_error),
+    scheduling: normalizeScheduling(item.scheduling),
+    ...normalizeAccountDisplay(item),
+    health_level: normalizeHealthLevel(item.health_level),
+    health_label: cleanString(item.health_label),
+    health_tone: normalizeHealthTone(item.health_tone),
+    health_reasons: Array.isArray(item.health_reasons) ? item.health_reasons.map(cleanString).filter(Boolean) : [],
+    recent_uses_1h: optionalNonNegativeInteger(item.recent_uses_1h),
+    recent_uses_24h: optionalNonNegativeInteger(item.recent_uses_24h),
     name: email || `${type} / ${sourceType}`,
     cookie: maskToken(accessToken),
     snlm0e: '',
@@ -540,8 +947,20 @@ export type AccountListParams = {
   page?: number
   page_size?: number
   keyword?: string
-  status?: 'all' | 'normal' | 'limited' | 'abnormal' | 'disabled' | 'valid_checkout'
+  status?: 'all' | 'normal' | 'limited' | 'abnormal' | 'disabled' | 'valid_checkout' | `sched:${string}`
   group_id?: string
+  health?: AccountHealthFilter
+  flag?: string
+}
+
+function normalizeAvailabilitySummary(value: unknown): Record<string, number> {
+  const result: Record<string, number> = {}
+  if (!value || typeof value !== 'object') return result
+  for (const [code, count] of Object.entries(value as Record<string, unknown>)) {
+    const n = Number(count)
+    if (code && Number.isFinite(n) && n > 0) result[code] = n
+  }
+  return result
 }
 
 function mapAccountsResponse(response: BackendAccountsResponse): AccountsResponse {
@@ -552,6 +971,7 @@ function mapAccountsResponse(response: BackendAccountsResponse): AccountsRespons
     accounts,
     total: Number.isFinite(Number(response.total)) ? Number(response.total) : accounts.length,
     all_total: Number.isFinite(Number(response.all_total)) ? Number(response.all_total) : undefined,
+    availability_summary: normalizeAvailabilitySummary(response.availability_summary),
     page: Number.isFinite(Number(response.page)) ? Number(response.page) : undefined,
     page_size: Number.isFinite(Number(response.page_size)) ? Number(response.page_size) : undefined,
   }
@@ -581,13 +1001,15 @@ function backendStatusForPayload(payload: Partial<Account>): AccountBackendStatu
   return backendStatusForEnabled(payload.enabled)
 }
 
-function accountFromPayload(payload: Partial<Account>) {
+function accountFromPayload(payload: Partial<Account> & { refresh_token?: string }, requireToken = true) {
   const accessToken = payloadToken(payload)
-  if (!accessToken) {
+  if (!accessToken && requireToken) {
     throw new Error('请填写 access token')
   }
+  const refreshToken = cleanString(payload.refresh_token)
   return {
     access_token: accessToken,
+    ...(refreshToken ? { refresh_token: refreshToken } : {}),
     type: payload.type,
     source_type: payload.source_type,
     proxy: payload.proxy,
@@ -597,10 +1019,12 @@ function accountFromPayload(payload: Partial<Account>) {
   }
 }
 
-async function refreshAndPoll(accessTokens: string[]) {
-  const start = await apiClient.post<{ access_tokens: string[] }, { progress_id: string }>(
-    '/api/accounts/refresh',
-    { access_tokens: accessTokens },
+type RefreshStartResponse = { progress_id: string; target_ids?: string[]; errors?: unknown[] }
+
+async function refreshAndPoll(accountIdsOrTokens: string[]) {
+  const start = await apiClient.post<Record<string, unknown>, RefreshStartResponse>(
+    '/api/accounts/sync',
+    targetFields(accountIdsOrTokens),
   )
   const progressId = cleanString(start.progress_id)
   if (!progressId) return { status: 'ok' }
@@ -608,9 +1032,9 @@ async function refreshAndPoll(accessTokens: string[]) {
   const deadline = Date.now() + 60_000
   while (Date.now() < deadline) {
     const progress = await apiClient.get<never, AccountRefreshProgress>(
-      `/api/accounts/refresh/progress/${encodeURIComponent(progressId)}`,
+      `/api/accounts/operations/${encodeURIComponent(progressId)}`,
     )
-    const legacyProgress = progress as AccountRefreshProgress & { status?: string; finished?: boolean }
+    const legacyProgress = progress as unknown as { status?: string; finished?: boolean }
     if (progress.done || legacyProgress.status === 'done' || legacyProgress.finished) {
       if (progress.error) throw new Error(String(progress.error))
       const errors = Array.isArray(progress?.result?.errors) ? progress.result.errors : []
@@ -628,19 +1052,26 @@ async function refreshAndPoll(accessTokens: string[]) {
   throw new Error('刷新进度超时，请稍后重新打开列表查看结果')
 }
 
-async function refreshAndPollWithProgress(
+/**
+ * 启动一个带进度的账号刷新类任务并轮询。
+ * endpoint: sync 同步账号信息与额度；refresh-access-token 只用 RT 换新 AT。
+ */
+async function runProgressTask(
+  endpoint: 'sync' | 'refresh-access-token',
   accountIdsOrTokens: string[],
   onProgress?: (progress: AccountRefreshProgress) => void,
   options?: { all?: boolean },
 ) {
-  const accessTokens = Array.from(new Set(accountIdsOrTokens.map(resolveToken).filter(Boolean)))
-  if (!accessTokens.length && !options?.all) {
-    throw new Error('没有可刷新的 access token')
+  const targets = targetFields(accountIdsOrTokens)
+  const count = targets.account_ids.length + targets.access_tokens.length
+  if (!count && !options?.all) {
+    throw new Error('没有可刷新的账号')
   }
 
-  const start = await apiClient.post<{ access_tokens: string[] }, { progress_id: string }>(
-    '/api/accounts/refresh',
-    { access_tokens: accessTokens },
+  const body: Record<string, unknown> = options?.all && !count ? { selection: { mode: 'all' } } : targets
+  const start = await apiClient.post<Record<string, unknown>, RefreshStartResponse>(
+    `/api/accounts/${endpoint}`,
+    body,
   )
   const progressId = cleanString(start.progress_id)
   if (!progressId) {
@@ -648,11 +1079,12 @@ async function refreshAndPollWithProgress(
   }
 
   const deadline = Date.now() + (
-    options?.all ? 12 * 60 * 60 * 1000 : Math.max(90_000, accessTokens.length * 15_000)
+    options?.all ? 12 * 60 * 60 * 1000 : Math.max(90_000, count * 15_000)
   )
   while (Date.now() < deadline) {
+    // 统一进度接口（带 status/percent/events）；旧的 /api/accounts/refresh/progress 仍保留给外部调用方。
     const progress = await apiClient.get<never, AccountRefreshProgress>(
-      `/api/accounts/refresh/progress/${encodeURIComponent(progressId)}`,
+      `/api/accounts/operations/${encodeURIComponent(progressId)}`,
     )
     onProgress?.(progress)
     if (progress.done || progress.error) {
@@ -665,12 +1097,30 @@ async function refreshAndPollWithProgress(
   throw new Error('刷新进度超时，请稍后重新打开列表查看结果')
 }
 
+async function refreshAndPollWithProgress(
+  accountIdsOrTokens: string[],
+  onProgress?: (progress: AccountRefreshProgress) => void,
+  options?: { all?: boolean },
+) {
+  return runProgressTask('sync', accountIdsOrTokens, onProgress, options)
+}
+
+function mutationErrors(errors: BackendAccountMutationResponse['errors']): string[] {
+  return Array.isArray(errors)
+    ? errors
+      .map((item) => (typeof item === 'string' ? item : String(item.error || (item as { message?: string }).message || item.token || '')))
+      .filter(Boolean)
+    : []
+}
+
 async function updateStatus(accountId: string, status: string) {
-  const accessToken = resolveToken(accountId)
+  const target = targetFields([accountId])
   const response = await apiClient.post<
-    { access_token: string; status: string },
+    Record<string, unknown>,
     BackendAccountMutationResponse
-  >('/api/accounts/update', { access_token: accessToken, status })
+  >('/api/accounts/update', target.account_ids.length
+    ? { id: target.account_ids[0], status }
+    : { access_token: target.access_tokens[0] || '', status })
   return {
     status: 'ok',
     account: response.item ? mapBackendAccount(response.item, 0, new Set()) : undefined,
@@ -678,40 +1128,39 @@ async function updateStatus(accountId: string, status: string) {
 }
 
 async function updateStatusBatch(accountIdsOrTokens: string[], status: string) {
-  const accessTokens = Array.from(new Set(accountIdsOrTokens.map(resolveToken).filter(Boolean)))
-  if (!accessTokens.length) {
+  const target = targetFields(accountIdsOrTokens)
+  if (!target.account_ids.length && !target.access_tokens.length) {
     return { status: 'ok', success_count: 0, errors: [] as string[] }
   }
   const response = await apiClient.post<
-    { access_tokens: string[]; status: string },
+    Record<string, unknown>,
     BackendAccountMutationResponse
-  >('/api/accounts/batch-update', { access_tokens: accessTokens, status })
+  >('/api/accounts/batch-update', { ...target, status })
   return {
     status: 'ok',
     success_count: Number(response.updated || 0),
-    errors: Array.isArray(response.errors)
-      ? response.errors.map((item) => (typeof item === 'string' ? item : String(item.error || item.token || ''))).filter(Boolean)
-      : [],
+    errors: mutationErrors(response.errors),
   }
 }
 
 async function deleteAccountsByIds(accountIdsOrTokens: string[]) {
-  const accessTokens = Array.from(new Set(accountIdsOrTokens.map(resolveToken).filter(Boolean)))
-  if (!accessTokens.length) {
+  const target = targetFields(accountIdsOrTokens)
+  if (!target.account_ids.length && !target.access_tokens.length) {
     return { status: 'ok', success_count: 0, errors: [] as string[] }
   }
   const response = await apiClient.request<unknown, BackendAccountMutationResponse>({
     method: 'DELETE',
     url: '/api/accounts',
-    data: { tokens: accessTokens },
+    data: { account_ids: target.account_ids, tokens: target.access_tokens },
   })
-  for (const accountId of accountIdsOrTokens) accountTokenById.delete(accountId)
+  for (const accountId of accountIdsOrTokens) {
+    accountTokenById.delete(accountId)
+    accountLabelById.delete(accountId)
+  }
   return {
     status: 'ok',
     success_count: Number(response.removed || 0),
-    errors: Array.isArray(response.errors)
-      ? response.errors.map((item) => (typeof item === 'string' ? item : String(item.error || item.token || ''))).filter(Boolean)
-      : [],
+    errors: mutationErrors(response.errors),
   }
 }
 
@@ -737,7 +1186,31 @@ export const accountsApi = {
       `/api/account-groups/${encodeURIComponent(id)}`,
     ),
 
-  upsert: async (payload: Partial<Account>) => {
+  upsert: async (payload: Partial<Account> & { refresh_token?: string }) => {
+    const editingId = cleanString(payload.id)
+    if (isAccountManagementId(editingId)) {
+      // 编辑：用稳定管理 ID 定位；AT / RT 留空表示不覆盖，已有凭据保持不变。
+      const account = accountFromPayload(payload, false)
+      const response = await apiClient.post<Record<string, unknown>, BackendAccountMutationResponse>(
+        '/api/accounts/update',
+        {
+          id: editingId,
+          access_token: account.access_token || '',
+          refresh_token: cleanString(payload.refresh_token),
+          type: account.type,
+          source_type: account.source_type,
+          status: account.status,
+          quota: account.quota,
+          proxy: account.proxy,
+          group_id: account.group_id,
+        },
+      )
+      return {
+        status: 'ok',
+        account: response.item ? mapBackendAccount(response.item, 0, new Set()) : undefined,
+      }
+    }
+
     const account = accountFromPayload(payload)
     const existingToken = payload.id ? accountTokenById.get(payload.id) : ''
     if (existingToken && existingToken === account.access_token) {
@@ -799,7 +1272,15 @@ export const accountsApi = {
     }
     const accounts = Array.from(deduped.values())
     if (!accounts.length) {
-      return { status: 'ok', added: 0, skipped: 0, refreshed: 0, errors: [] as string[] }
+      return {
+        status: 'ok',
+        added: 0,
+        skipped: 0,
+        refreshed: 0,
+        verified: 0,
+        rejected: [] as AccountImportRejected[],
+        errors: [] as string[],
+      }
     }
     const response = await apiClient.post<
       {
@@ -807,6 +1288,9 @@ export const accountsApi = {
         accounts: Array<Record<string, unknown>>
         refresh?: boolean
         return_items?: boolean
+        verify_on_import?: boolean
+        restore?: boolean
+        target_group_id?: string
       },
       BackendAccountMutationResponse
     >('/api/accounts', {
@@ -814,12 +1298,17 @@ export const accountsApi = {
       accounts,
       refresh: options.refresh ?? true,
       return_items: options.returnItems ?? false,
+      verify_on_import: options.verifyOnImport ?? false,
+      ...(options.restore ? { restore: true } : {}),
+      ...(options.targetGroupId !== undefined ? { target_group_id: options.targetGroupId } : {}),
     })
     return {
       status: 'ok',
       added: Number(response.added || 0),
       skipped: Number(response.skipped || 0),
       refreshed: Number(response.refreshed || 0),
+      verified: Number(response.verified || 0),
+      rejected: Array.isArray(response.rejected) ? response.rejected : [],
       errors: Array.isArray(response.errors)
         ? response.errors.map((item) => (typeof item === 'string' ? item : [item.token, item.error].filter(Boolean).join(': '))).filter(Boolean)
         : [],
@@ -857,6 +1346,115 @@ export const accountsApi = {
     }
   },
 
+  poolHealth: () => apiClient.get<never, AccountPoolHealthResponse>('/api/accounts/health'),
+
+  /** Probe one account with a remote info check; spends no image quota. */
+  testAccount: (accountId: string) => {
+    const target = targetFields([accountId])
+    return apiClient.post<Record<string, unknown>, AccountTestResult>('/api/accounts/test', target.account_ids.length
+      ? { id: target.account_ids[0] }
+      : { access_token: target.access_tokens[0] || '' })
+  },
+
+  /** 真实测试：发起一次对话或画图，返回内容与额度扣减情况。 */
+  testAccountCapability: (
+    accountId: string,
+    payload: { mode: 'chat' | 'image'; model: string; prompt: string },
+  ) => {
+    const target = targetFields([accountId])
+    return apiClient.post<Record<string, unknown>, AccountCapabilityTestResult>('/api/accounts/test', {
+      ...(target.account_ids.length ? { id: target.account_ids[0] } : { access_token: target.access_tokens[0] || '' }),
+      ...payload,
+    }, { timeout: 5 * 60 * 1000 })
+  },
+
+  /** 申请换出口（对接 services/egress_slots.request_switch）：先停用到期再切换并恢复。 */
+  switchEgress: (accountIds: readonly string[], target: string) =>
+    apiClient.post<Record<string, unknown>, AccountEgressSwitchResult>('/api/accounts/egress/switch', {
+      account_ids: [...accountIds],
+      target,
+    }),
+
+  cancelEgressSwitch: (accountIds: readonly string[]) =>
+    apiClient.post<Record<string, unknown>, { cancelled: string[] }>('/api/accounts/egress/cancel-switch', {
+      account_ids: [...accountIds],
+    }),
+
+  /** 仅管理员可用；每次调用都会写入审计日志。 */
+  getAccessToken: async (accountId: string) => {
+    const response = await apiClient.get<never, { access_token: string }>(
+      `/api/accounts/${encodeURIComponent(accountId)}/access-token`,
+    )
+    return cleanString(response.access_token)
+  },
+
+  getRefreshToken: async (accountId: string) => {
+    const response = await apiClient.get<never, { refresh_token: string }>(
+      `/api/accounts/${encodeURIComponent(accountId)}/refresh-token`,
+    )
+    return cleanString(response.refresh_token)
+  },
+
+  /** 跨分页选择：按筛选条件解析出全部匹配账号 ID（已扣除 excluded）。 */
+  previewSelection: (selection: AccountSelectionScope) =>
+    apiClient.post<{ selection: AccountSelectionScope }, AccountSelectionPreview>(
+      '/api/accounts/selection-preview',
+      { selection },
+    ),
+
+  /** 只用 refresh_token 换新 access_token，不拉取账号信息也不查询额度。 */
+  refreshAccessTokensWithProgress: (
+    accountIdsOrTokens: string[],
+    onProgress?: (progress: AccountRefreshProgress) => void,
+  ) => runProgressTask('refresh-access-token', accountIdsOrTokens, onProgress),
+
+  /** 导入本地 Sub2API 导出文件（content 为文件 JSON 文本）。 */
+  importSub2apiFile: async (
+    content: string,
+    options: { refresh?: boolean; targetGroupId?: string } = {},
+  ) => {
+    const response = await apiClient.post<Record<string, unknown>, {
+      parsed?: number
+      added?: number
+      skipped?: number
+      refreshed?: number
+      errors?: BackendAccountMutationResponse['errors']
+    }>('/api/accounts/import-sub2api-file', {
+      content,
+      refresh: options.refresh ?? true,
+      ...(options.targetGroupId !== undefined ? { target_group_id: options.targetGroupId } : {}),
+    })
+    return {
+      parsed: Number(response.parsed || 0),
+      added: Number(response.added || 0),
+      skipped: Number(response.skipped || 0),
+      refreshed: Number(response.refreshed || 0),
+      errors: mutationErrors(response.errors),
+    }
+  },
+
+  clearAutoPause: async (accountIds: string[]) => {
+    const target = targetFields(accountIds)
+    if (!target.account_ids.length && !target.access_tokens.length) return { cleared: 0 }
+    const response = await apiClient.post<Record<string, unknown>, { cleared?: number }>(
+      '/api/accounts/clear-auto-pause',
+      target,
+    )
+    return { cleared: Number(response.cleared || 0) }
+  },
+
+  startCodexOAuth: (emailHint = '') =>
+    apiClient.post<{ email_hint: string }, CodexOAuthStartResponse>(
+      '/api/accounts/codex-oauth/start',
+      { email_hint: emailHint },
+    ),
+
+  finishCodexOAuth: (sessionId: string, callback: string, accountId: string) =>
+    apiClient.post<Record<string, unknown>, CodexOAuthBindResult>(
+      '/api/accounts/codex-oauth/finish',
+      { session_id: sessionId, callback, account_id: accountId },
+    ),
+
   delete: async (accountId: string) => {
     await deleteAccountsByIds([accountId])
     accountTokenById.delete(accountId)
@@ -864,7 +1462,7 @@ export const accountsApi = {
   },
 
   refreshToken: async (accountId: string) => {
-    await refreshAndPoll([resolveToken(accountId)])
+    await refreshAndPoll([accountId])
     return { status: 'ok', account: undefined as unknown as Account }
   },
 
@@ -909,9 +1507,9 @@ export const accountsApi = {
     onProgress?: (progress: AccountRefreshProgress) => void,
   ) => refreshAndPollWithProgress([], onProgress, { all: true }),
 
-  exportAccounts: (accountIdsOrTokens: string[], format: 'json' | 'zip' | 'cpa' | 'sub2api' | 'agent_identity' = 'json') =>
-    apiClient.post<{ access_tokens: string[]; format: 'json' | 'zip' | 'cpa' | 'sub2api' | 'agent_identity' }, Blob>('/api/accounts/export', {
-      access_tokens: Array.from(new Set(accountIdsOrTokens.map(resolveToken).filter(Boolean))),
+  exportAccounts: (accountIdsOrTokens: string[], format: AccountExportFormat = 'json') =>
+    apiClient.post<Record<string, unknown>, Blob>('/api/accounts/export', {
+      ...targetFields(accountIdsOrTokens),
       format,
     }, {
       responseType: 'blob',
@@ -922,12 +1520,11 @@ export const accountsApi = {
   },
 
   bindGroup: async (accountIdsOrTokens: string[], groupId: string) => {
-    const accessTokens = Array.from(new Set(accountIdsOrTokens.map(resolveToken).filter(Boolean)))
     const response = await apiClient.post<
-      { access_tokens: string[]; group_id: string },
+      Record<string, unknown>,
       BackendAccountMutationResponse
     >('/api/accounts/group', {
-      access_tokens: accessTokens,
+      ...targetFields(accountIdsOrTokens),
       group_id: groupId,
     })
     return {

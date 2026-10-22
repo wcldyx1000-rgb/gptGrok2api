@@ -32,25 +32,25 @@
     --input: 0 0% 27%;
     --ring: 0 0% 96%;
 
-    --tone-success-border: 0 0% 36%;
-    --tone-success-bg: 0 0% 14%;
-    --tone-success-foreground: 0 0% 88%;
-    --tone-success-strong: 0 0% 96%;
+    --tone-success-border: 160 50% 35%;
+    --tone-success-bg: 160 35% 12%;
+    --tone-success-foreground: 151 70% 82%;
+    --tone-success-strong: 160 75% 62%;
 
-    --tone-warning-border: 0 0% 36%;
-    --tone-warning-bg: 0 0% 14%;
-    --tone-warning-foreground: 0 0% 88%;
-    --tone-warning-strong: 0 0% 96%;
+    --tone-warning-border: 43 65% 38%;
+    --tone-warning-bg: 38 35% 14%;
+    --tone-warning-foreground: 48 96% 82%;
+    --tone-warning-strong: 43 96% 64%;
 
-    --tone-error-border: 0 0% 36%;
-    --tone-error-bg: 0 0% 14%;
-    --tone-error-foreground: 0 0% 88%;
-    --tone-error-strong: 0 0% 96%;
+    --tone-error-border: 346 55% 38%;
+    --tone-error-bg: 346 32% 15%;
+    --tone-error-foreground: 351 95% 83%;
+    --tone-error-strong: 351 89% 66%;
 
-    --tone-info-border: 0 0% 36%;
-    --tone-info-bg: 0 0% 14%;
-    --tone-info-foreground: 0 0% 88%;
-    --tone-info-strong: 0 0% 96%;
+    --tone-info-border: 196 55% 38%;
+    --tone-info-bg: 198 35% 15%;
+    --tone-info-foreground: 199 95% 82%;
+    --tone-info-strong: 198 90% 65%;
 
     --shadow-elevated: 0 10px 28px rgba(0, 0, 0, 0.38);
     --shadow-floating: 0 14px 32px rgba(0, 0, 0, 0.46);

@@ -193,3 +193,141 @@ export function proxyNodeTestClass(
   if (node.last_checked_at) return 'text-emerald-600'
   return 'text-muted-foreground'
 }
+
+// ---- Ported from yukkcat/chatgpt2api (AGPL-3.0-only): 出口时区 / 语言分组选项 ----
+/** 时区输入的即时提示：当前 UTC 偏移（含夏令时）；空串表示未填写，null 表示浏览器无法识别。 */
+export function proxyNodeTimezoneHint(timezone: string): string | null {
+  const value = timezone.trim()
+  if (!value) return ''
+  try {
+    const part = new Intl.DateTimeFormat('en-US', { timeZone: value, timeZoneName: 'longOffset' })
+      .formatToParts(new Date())
+      .find((item) => item.type === 'timeZoneName')
+    const offset = (part?.value || 'GMT').replace('GMT', '')
+    return `UTC${offset || '+00:00'}`
+  } catch {
+    return null
+  }
+}
+
+type ProxyLocaleRegion = { label: string, timezone: string, language: string }
+
+/** 常用出口地区：选时区时自动带出当地浏览器语言。时区名与后端 utils/locale_env.py 的长名称表保持一致。 */
+const PROXY_LOCALE_REGIONS: ReadonlyArray<{ group: string, regions: ProxyLocaleRegion[] }> = [
+  {
+    group: '亚洲',
+    regions: [
+      { label: '中国大陆', timezone: 'Asia/Shanghai', language: 'zh-CN' },
+      { label: '台湾', timezone: 'Asia/Taipei', language: 'zh-TW' },
+      { label: '香港', timezone: 'Asia/Hong_Kong', language: 'zh-HK' },
+      { label: '澳门', timezone: 'Asia/Macau', language: 'zh-MO' },
+      { label: '日本', timezone: 'Asia/Tokyo', language: 'ja-JP' },
+      { label: '韩国', timezone: 'Asia/Seoul', language: 'ko-KR' },
+      { label: '新加坡', timezone: 'Asia/Singapore', language: 'en-SG' },
+      { label: '马来西亚', timezone: 'Asia/Kuala_Lumpur', language: 'ms-MY' },
+      { label: '泰国', timezone: 'Asia/Bangkok', language: 'th-TH' },
+      { label: '越南', timezone: 'Asia/Ho_Chi_Minh', language: 'vi-VN' },
+      { label: '菲律宾', timezone: 'Asia/Manila', language: 'en-PH' },
+      { label: '印度尼西亚', timezone: 'Asia/Jakarta', language: 'id-ID' },
+      { label: '印度', timezone: 'Asia/Kolkata', language: 'en-IN' },
+      { label: '阿联酋', timezone: 'Asia/Dubai', language: 'en-AE' },
+    ],
+  },
+  {
+    group: '美洲',
+    regions: [
+      { label: '美国东部', timezone: 'America/New_York', language: 'en-US' },
+      { label: '美国中部', timezone: 'America/Chicago', language: 'en-US' },
+      { label: '美国山地', timezone: 'America/Denver', language: 'en-US' },
+      { label: '美国亚利桑那', timezone: 'America/Phoenix', language: 'en-US' },
+      { label: '美国西部', timezone: 'America/Los_Angeles', language: 'en-US' },
+      { label: '美国阿拉斯加', timezone: 'America/Anchorage', language: 'en-US' },
+      { label: '美国夏威夷', timezone: 'Pacific/Honolulu', language: 'en-US' },
+      { label: '加拿大东部', timezone: 'America/Toronto', language: 'en-CA' },
+      { label: '加拿大西部', timezone: 'America/Vancouver', language: 'en-CA' },
+      { label: '墨西哥', timezone: 'America/Mexico_City', language: 'es-MX' },
+      { label: '巴西', timezone: 'America/Sao_Paulo', language: 'pt-BR' },
+    ],
+  },
+  {
+    group: '欧洲',
+    regions: [
+      { label: '英国', timezone: 'Europe/London', language: 'en-GB' },
+      { label: '爱尔兰', timezone: 'Europe/Dublin', language: 'en-IE' },
+      { label: '葡萄牙', timezone: 'Europe/Lisbon', language: 'pt-PT' },
+      { label: '德国', timezone: 'Europe/Berlin', language: 'de-DE' },
+      { label: '法国', timezone: 'Europe/Paris', language: 'fr-FR' },
+      { label: '荷兰', timezone: 'Europe/Amsterdam', language: 'nl-NL' },
+      { label: '比利时', timezone: 'Europe/Brussels', language: 'nl-BE' },
+      { label: '西班牙', timezone: 'Europe/Madrid', language: 'es-ES' },
+      { label: '意大利', timezone: 'Europe/Rome', language: 'it-IT' },
+      { label: '瑞士', timezone: 'Europe/Zurich', language: 'de-CH' },
+      { label: '瑞典', timezone: 'Europe/Stockholm', language: 'sv-SE' },
+      { label: '波兰', timezone: 'Europe/Warsaw', language: 'pl-PL' },
+      { label: '芬兰', timezone: 'Europe/Helsinki', language: 'fi-FI' },
+      { label: '俄罗斯（莫斯科）', timezone: 'Europe/Moscow', language: 'ru-RU' },
+    ],
+  },
+  {
+    group: '大洋洲',
+    regions: [
+      { label: '澳大利亚东部', timezone: 'Australia/Sydney', language: 'en-AU' },
+      { label: '澳大利亚墨尔本', timezone: 'Australia/Melbourne', language: 'en-AU' },
+      { label: '澳大利亚西部', timezone: 'Australia/Perth', language: 'en-AU' },
+      { label: '新西兰', timezone: 'Pacific/Auckland', language: 'en-NZ' },
+    ],
+  },
+  {
+    group: '其他',
+    regions: [{ label: 'UTC', timezone: 'UTC', language: 'en-US' }],
+  },
+]
+
+const DEFAULT_LOCALE_OPTION = { label: '默认', value: '' }
+
+function withCurrentValue(groups: { label: string, options: { label: string, value: string }[] }[], value: string) {
+  const known = groups.some((group) => group.options.some((option) => option.value === value))
+  if (!value || known) return groups
+  return [{ label: '当前值', options: [{ label: value, value }] }, ...groups]
+}
+
+/** 时区下拉分组；保存过但不在常用列表里的值单独列出，避免被静默替换。 */
+export function proxyTimezoneGroups(current: string) {
+  return withCurrentValue([
+    { label: '', options: [DEFAULT_LOCALE_OPTION] },
+    ...PROXY_LOCALE_REGIONS.map((item) => ({
+      label: item.group,
+      options: item.regions.map((region) => ({
+        label: `${region.label} · ${region.timezone} · ${proxyNodeTimezoneHint(region.timezone) || ''}`,
+        value: region.timezone,
+      })),
+    })),
+  ], current)
+}
+
+function languageLabel(language: string) {
+  try {
+    const name = new Intl.DisplayNames(['zh-CN'], { type: 'language' }).of(language)
+    return name && name !== language ? `${name} · ${language}` : language
+  } catch {
+    return language
+  }
+}
+
+/** 语言下拉分组，取常用地区的语言去重。 */
+export function proxyLanguageGroups(current: string) {
+  const languages = [...new Set(PROXY_LOCALE_REGIONS.flatMap((item) => item.regions.map((region) => region.language)))]
+  return withCurrentValue([
+    { label: '', options: [DEFAULT_LOCALE_OPTION] },
+    { label: '语言', options: languages.map((language) => ({ label: languageLabel(language), value: language })) },
+  ], current)
+}
+
+/** 选中时区对应的当地语言；未收录的时区返回空串。 */
+export function proxyRegionLanguage(timezone: string) {
+  for (const item of PROXY_LOCALE_REGIONS) {
+    const region = item.regions.find((entry) => entry.timezone === timezone)
+    if (region) return region.language
+  }
+  return ''
+}

@@ -19,17 +19,18 @@
 
     <div
       v-if="newUserKey"
-      class="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900"
+      class="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-100"
     >
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div class="min-w-0">
           <p class="font-medium">新密钥只展示一次，请现在复制保存。</p>
+          <p class="mt-1 text-xs opacity-80">出于安全考虑，明文将在 2 分钟后或离开页面时自动清除。</p>
           <p class="mt-2 break-all font-mono text-xs">{{ newUserKey }}</p>
         </div>
         <Button
           size="xs"
           variant="outline"
-          root-class="shrink-0 border-emerald-200 bg-white text-emerald-700"
+          root-class="shrink-0 border-emerald-200 bg-white text-emerald-700 dark:border-emerald-800 dark:bg-transparent dark:text-emerald-200"
           @click="$emit('copy', newUserKey)"
         >
           复制

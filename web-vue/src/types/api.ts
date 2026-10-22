@@ -16,6 +16,9 @@ export interface ProxyRuntimeClearance {
   timeout_sec: number
   refresh_interval: number
   warm_up_on_start: boolean
+  max_sessions: number
+  session_idle_sec: number
+  early_refresh_ratio: number
 }
 
 export interface ProxyRuntimeSettings {
@@ -25,7 +28,18 @@ export interface ProxyRuntimeSettings {
   resource_proxy_url: string
   skip_ssl_verify: boolean
   reset_session_status_codes: number[]
+  timezone: string
+  language: string
+  node_fail_threshold: number
+  node_cooldown_sec: number
   clearance: ProxyRuntimeClearance
+}
+
+export interface DisabledProxyNode {
+  proxy: string
+  disabled_until: number
+  remaining_sec: number
+  last_error: string
 }
 
 export interface ProxyRuntimeStatus {
@@ -38,6 +52,8 @@ export interface ProxyRuntimeStatus {
   clearance_mode: string
   has_clearance_bundle: boolean
   cached_clearance_hosts: string[]
+  flaresolverr_sessions?: number
+  disabled_proxy_nodes?: DisabledProxyNode[]
 }
 
 export interface ClearanceTestResult {
@@ -70,13 +86,42 @@ export interface Settings {
   proxy_runtime: ProxyRuntimeSettings
   base_url?: string
   refresh_account_interval_minute?: number
-  image_retention_days?: number
-  log_retention_days?: number
+  image_retention_hours?: number
+  log_retention_hours?: number
+  image_min_free_mb?: number
   image_poll_timeout_secs?: number
   image_stream_timeout_secs?: number
+  console_request_timeout_secs?: number
+  image_queue_limit?: number
+  account_processing_concurrency?: number
   image_poll_interval_secs?: number
   image_poll_initial_wait_secs?: number
   image_account_concurrency?: number
+  image_account_cooldown_secs?: number
+  image_preflight_fresh_secs?: number
+  /** 旧字段，仅兼容读取；以 image_max_account_attempts 为准 */
+  image_account_retry_count?: number
+  image_account_retry_enabled?: boolean
+  image_max_account_attempts?: number
+  image_stream_post_tool_wait_secs?: number
+  image_poll_adaptive?: boolean
+  image_warm_enabled?: boolean
+  chat_sentinel_vm_enabled?: boolean
+  chat_temporary_mode?: boolean
+  image_stream_direct_resolve?: boolean
+  image_drop_extra_variants?: boolean
+  image_upscale_enabled?: boolean
+  image_upscale_engine?: 'pillow_lanczos' | 'sharp_lanczos3'
+  account_auto_pause_strikes?: number
+  account_auto_pause_hours?: number
+  new_account_cooldown_hours?: number
+  new_account_ramp_days?: number
+  new_account_ramp_daily_images?: number
+  text_account_concurrency?: number
+  account_failure_cooldown_secs?: number
+  account_relogin_enabled?: boolean
+  account_relogin_interval_secs?: number
+  account_relogin_concurrency?: number
   image_parallel_generation?: boolean
   image_remove_conversation_after_result?: boolean
   image_error_friendly_enabled?: boolean
@@ -93,7 +138,10 @@ export interface Settings {
   ai_review: {
     enabled: boolean
     base_url: string
+    /** 读取时恒为空串；留空保存表示沿用已存密钥 */
     api_key: string
+    has_api_key?: boolean
+    clear_api_key?: boolean
     model: string
     prompt: string
   }
@@ -152,22 +200,41 @@ export interface Settings {
     mode: 'local' | 'webdav' | 'both'
     webdav_url: string
     webdav_username: string
+    /** 读取时恒为空串；留空保存表示沿用已存密码 */
     webdav_password: string
+    has_webdav_password?: boolean
+    clear_webdav_password?: boolean
     webdav_root_path: string
     public_base_url: string
+  }
+  genbox_push?: {
+    enabled: boolean
+    base_url: string
+    source_id: string
+    /** 读取时恒为空串；仅在用户输入新密钥时才会发送 */
+    push_key: string
+    has_push_key?: boolean
+    clear_push_key?: boolean
+    timeout_secs: number
+    auto_push_after_studio: boolean
   }
   backup?: {
     enabled: boolean
     provider: string
     account_id: string
     access_key_id: string
+    /** 读取时恒为空串；留空保存表示沿用已存密钥 */
     secret_access_key: string
+    has_secret_access_key?: boolean
+    clear_secret_access_key?: boolean
     bucket: string
     prefix: string
     interval_minutes: number
     rotation_keep: number
     encrypt: boolean
     passphrase: string
+    has_passphrase?: boolean
+    clear_passphrase?: boolean
     include: Record<string, boolean>
   }
   chat_completion_cache?: {
@@ -284,6 +351,19 @@ export interface AdminStatsTrend {
   model_requests?: Record<string, number[]>
   model_ttfb_times?: Record<string, number[]>
   model_total_times?: Record<string, number[]>
+  /** 仅成功请求口径：模型请求分布 */
+  model_success_requests?: Record<string, number[]>
+  /** 仅成功请求口径：各模型平均耗时（毫秒，无数据为 null） */
+  model_avg_success_duration_ms?: Record<string, Array<number | null>>
+  /** 仅成功请求口径：每个时间桶的平均耗时（毫秒，无数据为 null） */
+  success_duration_ms?: Array<number | null>
+}
+
+export interface DashboardSwitchingStats {
+  requests?: number
+  count?: number
+  recovered?: number
+  recovery_rate?: number | null
 }
 
 export interface AdminStats {
@@ -300,6 +380,12 @@ export interface AdminStats {
   account_providers?: Record<string, DashboardProviderAccountStats>
   success_count?: number
   failed_count?: number
+  avg_success_duration_ms?: number | null
+  /** 调用概览口径（后端 dashboard_metrics）：文本回复不计成败，部分成功算成功。 */
+  total_calls?: number
+  text_review_count?: number
+  success_rate?: number | null
+  switching?: DashboardSwitchingStats
   recent_failures?: Array<{
     id?: string
     time?: string
@@ -353,6 +439,57 @@ export interface VersionCheckResponse extends VersionInfoResponse {
   is_latest: boolean
   update_available: boolean
   check_error?: string
+  /** 当前部署是否支持管理台一键更新（受管运行目录） */
+  can_update?: boolean
+  /** 后端给出的更新状态说明（含不支持一键更新时的升级指引） */
+  status_message?: string
+}
+
+export interface DashboardRuntime {
+  runtime_mode: 'docker' | 'native'
+  instance_name: string
+  distribution: string
+  kernel_version: string
+  architecture: string
+  python_version: string
+  cpu_capacity: number
+  service_started_at: string
+  service_uptime_seconds: number
+  process_cpu_percent: number | null
+  process_memory_bytes: number | null
+  process_memory_percent: number | null
+  memory_scope: 'container' | 'system' | 'visible'
+  memory_percent: number | null
+  storage_percent: number | null
+  network_rx_bytes_per_sec: number | null
+  network_tx_bytes_per_sec: number | null
+}
+
+export type SystemUpdateState = 'idle' | 'queued' | 'running' | 'succeeded' | 'failed'
+
+export interface SystemUpdateEvent {
+  id: string
+  timestamp: string
+  label: string
+  message: string
+  tone: 'info' | 'success' | 'warning' | 'danger'
+}
+
+export interface SystemUpdateTask {
+  task_id: string
+  state: SystemUpdateState
+  stage: string
+  current: number
+  total: number
+  status_label: string
+  message: string
+  tone: 'info' | 'success' | 'warning' | 'danger'
+  busy: boolean
+  current_tag: string
+  latest_tag: string
+  error: string
+  updated_at: string
+  events: SystemUpdateEvent[]
 }
 
 export interface DashboardProviderAccountStats {
@@ -380,6 +517,10 @@ export interface DashboardLogSummary {
   total: number
   success: number
   failed: number
+  text_review?: number
+  success_rate?: number | null
+  avg_success_duration_ms?: number | null
+  switching?: DashboardSwitchingStats
   by_endpoint: Record<string, number>
   by_model?: Record<string, number>
   by_status: Record<string, number>

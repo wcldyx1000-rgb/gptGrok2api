@@ -7,6 +7,11 @@
         @click="isSidebarOpen = false"
       ></div>
       <aside
+        id="app-sidebar"
+        ref="sidebarRef"
+        :inert="isMobileViewport && !isSidebarOpen ? '' : undefined"
+        aria-label="主导航"
+        @keydown="handleSidebarKeydown"
         class="fixed inset-y-0 left-0 z-40 w-64 -translate-x-full overflow-x-hidden bg-card border-r border-border
                transition-[transform,width] duration-200 ease-out will-change-[transform,width] transform-gpu flex flex-col lg:static lg:translate-x-0 lg:w-[var(--sidebar-width)] lg:bg-card
                lg:border-b-0 lg:border-r lg:sticky lg:top-0 lg:h-screen"
@@ -111,6 +116,9 @@
               root-class="shrink-0 rounded-2xl text-muted-foreground"
               @click="isSidebarCollapsed = !isSidebarCollapsed"
               :title="isSidebarCollapsed ? '展开侧边栏' : '收起侧边栏'"
+              :aria-label="isSidebarCollapsed ? '展开侧边栏' : '收起侧边栏'"
+              :aria-expanded="isSidebarCollapsed ? 'false' : 'true'"
+              aria-controls="app-sidebar"
             >
               <svg
                 aria-hidden="true"
@@ -125,26 +133,42 @@
         </div>
       </aside>
 
-      <main class="relative min-w-0 flex-1 overflow-hidden lg:ml-0">
-        <div
-          v-if="isRoutePending"
-          class="route-pending-bar"
-          role="status"
-          :aria-label="routePendingText"
-        ></div>
+      <main
+        :inert="isMobileViewport && isSidebarOpen ? '' : undefined"
+        :aria-hidden="isMobileViewport && isSidebarOpen ? 'true' : undefined"
+        class="relative min-w-0 flex-1 overflow-hidden lg:ml-0"
+        :class="{ 'lg:flex lg:h-dvh lg:min-h-0 lg:flex-col': isContainedManagementPage }"
+      >
+        <Transition name="route-progress">
+          <div
+            v-if="routeProgressPhase !== 'idle'"
+            class="shell-route-progress pointer-events-none absolute inset-x-0 top-0 z-[80] h-0.5 overflow-hidden"
+            role="progressbar"
+            :aria-label="routePendingText"
+          >
+            <div
+              class="shell-route-progress-bar h-full w-full bg-primary"
+              :class="{ 'shell-route-progress-bar--finishing': routeProgressPhase === 'finishing' }"
+            ></div>
+          </div>
+        </Transition>
 
         <header
           v-if="!isImmersivePage"
           class="min-w-0 flex flex-col gap-4 border-b border-border bg-card px-6 py-5 lg:flex-row lg:items-center lg:justify-between lg:px-10"
+          :class="{ 'lg:shrink-0': isContainedManagementPage }"
         >
           <div class="flex items-center gap-3">
             <Button
               size="xs"
               variant="outline"
               icon-only
+              ref="menuButtonRef"
               root-class="lg:hidden"
               @click="isSidebarOpen = true"
               aria-label="打开导航"
+              aria-controls="app-sidebar"
+              :aria-expanded="isSidebarOpen ? 'true' : 'false'"
             >
               <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5" fill="currentColor">
                 <path d="M4 6h16v2H4V6zm0 5h16v2H4v-2zm0 5h16v2H4v-2z" />
@@ -241,18 +265,39 @@
 
         <div
           class="relative h-full overflow-y-auto overflow-x-hidden bg-card"
-          :class="isImmersivePage ? 'p-0' : 'px-4 pb-10 pt-6 lg:px-10 lg:pt-10'"
+          :class="[
+            isImmersivePage ? 'p-0' : 'px-4 pb-10 pt-6 lg:px-10 lg:pt-10',
+            isContainedManagementPage ? 'lg:h-auto lg:min-h-0 lg:flex-1' : '',
+          ]"
         >
+          <div
+            v-if="showUpdateNotice"
+            class="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-800 dark:text-amber-200"
+            :class="isImmersivePage ? 'm-3' : ''"
+            role="status"
+          >
+            <span class="min-w-0 flex-1 font-medium">
+              发现新版本 {{ latestVersionLabel }}（当前 {{ currentVersionLabel }}）
+              <template v-if="updateStatus?.can_update">，可在版本更新中一键更新。</template>
+              <template v-else>，请查看版本更新了解升级方式。</template>
+            </span>
+            <span class="flex shrink-0 items-center gap-2">
+              <Button size="xs" variant="outline" @click="openUpdateDialog">查看更新</Button>
+              <Button size="xs" variant="ghost" @click="dismissUpdateNotice">稍后提醒</Button>
+            </span>
+          </div>
           <RouterView v-slot="{ Component, route: currentRoute }">
             <Suspense :timeout="120">
               <template #default>
                 <div class="route-view-content" :class="{ 'h-full': isImmersivePage }">
-                  <KeepAlive :include="cachedRouteNames" :max="cachedRouteMax">
-                    <component
-                      :is="Component"
-                      :key="String(currentRoute.name || currentRoute.path)"
-                    />
-                  </KeepAlive>
+                  <Transition name="route-view">
+                    <KeepAlive :include="cachedRouteNames" :max="cachedRouteMax">
+                      <component
+                        :is="Component"
+                        :key="String(currentRoute.name || currentRoute.path)"
+                      />
+                    </KeepAlive>
+                  </Transition>
                 </div>
               </template>
               <template #fallback>
@@ -479,6 +524,8 @@
         </MetaChip>
       </div>
 
+      <SystemUpdatePanel :status="updateStatus" />
+
       <div class="mt-5 max-h-[56vh] space-y-5 overflow-y-auto pr-1">
         <div
           v-for="release in releaseEntries"
@@ -551,7 +598,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { settingsApi } from '@/api/settings'
 import { versionApi } from '@/api/version'
@@ -563,16 +610,19 @@ import { useModelCatalog } from '@/composables/useModelCatalog'
 import { Button, ValueSurface } from 'nanocat-ui'
 import ConfirmDialog from '@/components/ui/AppConfirmDialog.vue'
 import MetaChip from '@/components/ai/MetaChip.vue'
+import SystemUpdatePanel from '@/components/ai/SystemUpdatePanel.vue'
 import ModalFooter from '@/components/ai/ModalFooter.vue'
 import ModalHeader from '@/components/ai/ModalHeader.vue'
 import ModalShell from '@/components/ai/ModalShell.vue'
 import PageLoadingState from '@/components/ai/PageLoadingState.vue'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { useToast } from '@/composables/useToast'
+import { useListLayoutPreference } from '@/composables/useListLayoutPreference'
+import { focusFirstWithin, focusRefTarget, trapFocusWithin } from '@/lib/focusLoop'
 import { getBooleanPreference, preferenceKeys, setBooleanPreference } from '@/lib/preferences'
 import { applyThemeMode, getStoredThemeMode, setStoredThemeMode, type ThemeMode } from '@/lib/theme'
 import { isNewerVersion, normalizeVersionTag, parseChangelog, type ReleaseInfo } from '@/lib/release'
-import type { Settings } from '@/types/api'
+import type { Settings, VersionCheckResponse } from '@/types/api'
 import localVersion from '../../../VERSION?raw'
 
 const route = useRoute()
@@ -591,10 +641,34 @@ const currentVersionTag = ref(bundledVersionTag)
 const latestVersionTag = ref('')
 const releaseEntries = ref<ReleaseInfo[]>([])
 const updateCheckMessage = ref('')
+const updateStatus = ref<VersionCheckResponse | null>(null)
+const DISMISSED_UPDATE_KEY = 'gptgrok2api:dismissed-update-tag'
+const dismissedUpdateTag = ref('')
+try {
+  dismissedUpdateTag.value = window.localStorage.getItem(DISMISSED_UPDATE_KEY) || ''
+} catch {
+  dismissedUpdateTag.value = ''
+}
+// 登录后检查到新版本时显示黄色提示；“稍后提醒”只对当前这个版本生效，更新的版本会再次提示。
+const showUpdateNotice = computed(() => Boolean(
+  authStore.isAdmin &&
+  updateStatus.value?.update_available &&
+  latestVersionLabel.value &&
+  dismissedUpdateTag.value !== latestVersionLabel.value,
+))
+function dismissUpdateNotice() {
+  dismissedUpdateTag.value = latestVersionLabel.value
+  try {
+    window.localStorage.setItem(DISMISSED_UPDATE_KEY, latestVersionLabel.value)
+  } catch {
+    // 忽略存储不可用
+  }
+}
 const currentAuthToken = ref('')
 const thirdPartyApps = ref<Settings['third_party_apps'] | null>(null)
 const themeMode = ref<ThemeMode>(getStoredThemeMode())
-const isRoutePending = ref(false)
+type RouteProgressPhase = 'idle' | 'running' | 'finishing'
+const routeProgressPhase = ref<RouteProgressPhase>('idle')
 const pendingRouteTitle = ref('')
 const cachedRouteNames = ['Studio', 'Accounts', 'Logs', 'Monitor', 'Gallery', 'Proxy', 'Register', 'ICloud', 'Settings']
 const cachedRouteMax = cachedRouteNames.length
@@ -707,7 +781,19 @@ function titleForRoute(name: unknown, path: string) {
 }
 
 const isImmersivePage = computed(() => Boolean(route.meta.immersive))
-const isSidebarRail = computed(() => isSidebarCollapsed.value || isImmersivePage.value)
+const isMobileViewport = ref(typeof window !== 'undefined'
+  ? !window.matchMedia('(min-width: 1024px)').matches
+  : false)
+// 手机端侧边栏是抽屉，展开时不沿用桌面端的折叠（图标栏）状态。
+const isSidebarRail = computed(() => (
+  !isMobileViewport.value && (isSidebarCollapsed.value || isImmersivePage.value)
+))
+// 列表页支持「工作区滚动（固定视口）」与「随页面展开」两种布局，偏好存 localStorage。
+const managementRoutePaths = new Set(['/accounts', '/logs', '/gallery', '/proxy'])
+const { isWorkspaceLayout } = useListLayoutPreference()
+const isContainedManagementPage = computed(() => (
+  managementRoutePaths.has(normalizedRoutePath(route.path)) && isWorkspaceLayout.value
+))
 const sidebarStyle = computed(() => ({
   '--sidebar-width': isSidebarRail.value ? '4rem' : '16rem',
 }))
@@ -833,7 +919,11 @@ const themeButtonText = computed(() => themeOptions.find(option => option.value 
 const themeButtonTitle = computed(() => `当前主题：${themeButtonText.value}，点击切换`)
 const routePendingText = computed(() => `正在打开${pendingRouteTitle.value || currentPageTitle.value}`)
 let systemThemeMedia: MediaQueryList | null = null
+const routeProgressDelayMs = 140
+const routeProgressFinishMs = 140
 let routePendingTimer: number | null = null
+let routeProgressFinishTimer: number | null = null
+let viewportMedia: MediaQueryList | null = null
 let stopRoutePendingBeforeEach: (() => void) | null = null
 let stopRoutePendingAfterEach: (() => void) | null = null
 let stopRoutePendingError: (() => void) | null = null
@@ -973,6 +1063,7 @@ async function checkForUpdates(showMessage = true) {
   try {
     const result = await versionApi.check(showMessage)
     if (result.check_error) throw new Error(result.check_error)
+    updateStatus.value = result
     currentVersionTag.value = currentVersionCandidate(result.tag || result.version || '')
     if (!result.latest_tag && !result.latest_version) throw new Error('GitHub 未返回有效版本')
     latestVersionTag.value = normalizeVersionTag(result.latest_tag || result.latest_version)
@@ -1069,20 +1160,69 @@ function handleNavClick() {
   isSidebarOpen.value = false
 }
 
-function stopRoutePending() {
+// 移动端抽屉式侧栏的键盘与焦点管理：Esc 关闭、Tab 在侧栏内循环、打开时聚焦、关闭后焦点回到汉堡按钮。
+const sidebarRef = ref<HTMLElement | null>(null)
+const menuButtonRef = ref<unknown>(null)
+
+function handleSidebarKeydown(event: KeyboardEvent) {
+  if (!isMobileViewport.value || !isSidebarOpen.value) return
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    isSidebarOpen.value = false
+    return
+  }
+  trapFocusWithin(sidebarRef.value, event)
+}
+
+watch(isSidebarOpen, async (open, wasOpen) => {
+  if (!isMobileViewport.value) return
+  const focusWasInside = Boolean(sidebarRef.value?.contains(document.activeElement))
+  await nextTick()
+  if (open) {
+    focusFirstWithin(sidebarRef.value, 'a[aria-current="page"]')
+  } else if (wasOpen && focusWasInside) {
+    focusRefTarget(menuButtonRef.value)
+  }
+})
+
+function clearRouteProgressTimers() {
   if (routePendingTimer !== null) {
     window.clearTimeout(routePendingTimer)
     routePendingTimer = null
   }
-  isRoutePending.value = false
+  if (routeProgressFinishTimer !== null) {
+    window.clearTimeout(routeProgressFinishTimer)
+    routeProgressFinishTimer = null
+  }
+}
+
+// 页面切换很快时不显示进度条；超过延迟才出现，结束时先补满再淡出。
+function stopRoutePending() {
+  clearRouteProgressTimers()
+  if (routeProgressPhase.value !== 'running') {
+    routeProgressPhase.value = 'idle'
+    return
+  }
+  routeProgressPhase.value = 'finishing'
+  routeProgressFinishTimer = window.setTimeout(() => {
+    routeProgressFinishTimer = null
+    routeProgressPhase.value = 'idle'
+  }, routeProgressFinishMs)
 }
 
 function startRoutePending(title: string) {
-  stopRoutePending()
+  clearRouteProgressTimers()
+  routeProgressPhase.value = 'idle'
   pendingRouteTitle.value = title
   routePendingTimer = window.setTimeout(() => {
-    isRoutePending.value = true
-  }, 120)
+    routePendingTimer = null
+    routeProgressPhase.value = 'running'
+  }, routeProgressDelayMs)
+}
+
+function handleViewportChange(event: MediaQueryListEvent) {
+  isMobileViewport.value = !event.matches
+  if (event.matches) isSidebarOpen.value = false
 }
 
 function setupRoutePendingGuards() {
@@ -1114,6 +1254,11 @@ onMounted(() => {
   applyThemeMode(themeMode.value)
   setupSystemThemeListener()
   setupRoutePendingGuards()
+  if (typeof window !== 'undefined') {
+    viewportMedia = window.matchMedia('(min-width: 1024px)')
+    isMobileViewport.value = !viewportMedia.matches
+    viewportMedia.addEventListener('change', handleViewportChange)
+  }
   void initializeVersionStatus()
   void loadThirdPartyApps()
 })
@@ -1121,6 +1266,8 @@ onMounted(() => {
 onBeforeUnmount(() => {
   systemThemeMedia?.removeEventListener('change', handleSystemThemeChange)
   systemThemeMedia = null
+  viewportMedia?.removeEventListener('change', handleViewportChange)
+  viewportMedia = null
   teardownRoutePendingGuards()
 })
 
@@ -1131,30 +1278,63 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 
-.route-pending-bar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 80;
-  height: 2px;
-  overflow: hidden;
-  background: hsl(var(--primary) / 0.16);
-  pointer-events: none;
+/* Ported from yukkcat/chatgpt2api (AGPL-3.0-only). */
+.route-view-enter-active {
+  transition: opacity 140ms ease-out;
 }
 
-.route-pending-bar::after {
-  display: block;
-  width: 100%;
-  height: 100%;
-  content: '';
-  background: hsl(var(--primary));
-  box-shadow: 0 0 14px hsl(var(--primary) / 0.3);
-  animation: route-pending-pulse 0.9s ease-in-out infinite alternate;
+.route-view-enter-from {
+  opacity: 0.88;
 }
 
-@keyframes route-pending-pulse {
-  from { opacity: 0.36; }
-  to { opacity: 1; }
+.route-progress-enter-active,
+.route-progress-leave-active {
+  transition: opacity 100ms ease-out;
+}
+
+.route-progress-enter-from,
+.route-progress-leave-to {
+  opacity: 0;
+}
+
+.shell-route-progress {
+  background: hsl(var(--primary) / 0.12);
+}
+
+.shell-route-progress-bar {
+  transform: scaleX(0.08);
+  transform-origin: left center;
+  animation: shell-route-progress-running 1.4s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+
+.shell-route-progress-bar--finishing {
+  animation: none;
+  transform: scaleX(1);
+  transition: transform 120ms ease-out;
+}
+
+@keyframes shell-route-progress-running {
+  0% { transform: scaleX(0.08); }
+  60% { transform: scaleX(0.62); }
+  100% { transform: scaleX(0.84); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .route-view-enter-active,
+  .route-progress-enter-active,
+  .route-progress-leave-active,
+  .shell-route-progress-bar,
+  .shell-route-progress-bar--finishing {
+    animation: none;
+    transition: none;
+  }
+
+  .shell-route-progress-bar {
+    transform: scaleX(0.84);
+  }
+
+  .shell-route-progress-bar--finishing {
+    transform: scaleX(1);
+  }
 }
 </style>

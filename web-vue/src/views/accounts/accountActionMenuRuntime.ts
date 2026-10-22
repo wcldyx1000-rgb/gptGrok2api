@@ -36,17 +36,27 @@ type AccountActionMenuRuntimeOptions = {
   exportAccounts: (scope: AccountExportScope, format: AccountExportFormat) => Promise<void>
   refreshAllAccounts: () => Promise<void>
   extractSelectedCheckout: () => Promise<void>
+  refreshSelectedAccessTokens?: () => Promise<void>
   runBulkAction: (action: AccountBulkAction) => Promise<void>
   bindSelectedAccountsToGroup: () => Promise<void>
+  openBatchTest?: () => void
+  openLoginImport?: () => void
+  reactivateSelected?: () => Promise<void>
+  /** 对选中账号更换出口 / 取消更换出口 / 取消选择。 */
+  switchEgressSelected?: () => Promise<void> | void
+  cancelEgressSelected?: () => Promise<void> | void
+  clearSelection?: () => void
 }
 
 const BIND_ACCOUNT_GROUP_ACTION_PREFIX = 'bind_group:'
 
 const accountImportActions = new Set<AccountImportMode>([
   'oauth_login',
+  'backup_json',
   'access_token',
   'session_json',
   'cpa_json',
+  'sub2api_json',
   'remote_cpa',
   'sub2api',
 ])
@@ -103,9 +113,12 @@ export function useAccountActionMenuRuntime(options: AccountActionMenuRuntimeOpt
     ],
     [
       { key: 'oauth_login', label: 'OAuth 登录已有账号' },
+      { key: 'login_import', label: '邮箱密码登录导入' },
       { key: 'access_token', label: '导入 Access Token' },
       { key: 'session_json', label: '导入 Session JSON' },
       { key: 'cpa_json', label: '导入 CPA JSON 文件' },
+      { key: 'sub2api_json', label: '导入 Sub2API JSON 文件' },
+      { key: 'backup_json', label: '导入完整备份文件' },
       { key: 'remote_cpa', label: '从远程 CPA 服务器导入' },
       { key: 'sub2api', label: '从 Sub2API 服务器导入' },
     ],
@@ -121,6 +134,8 @@ export function useAccountActionMenuRuntime(options: AccountActionMenuRuntimeOpt
           { key: 'selected_sub2api', label: 'Sub2API 格式 (.json)' },
           { key: 'selected_cpa', label: 'CPA 格式 (.zip)' },
           { key: 'selected_agent_identity', label: 'Agent Identity (.zip)' },
+          { key: 'selected_txt', label: 'Access Token 列表 (.txt)' },
+          { key: 'selected_backup', label: '完整备份 (.json，含全部凭据)' },
         ],
       },
     ],
@@ -133,6 +148,8 @@ export function useAccountActionMenuRuntime(options: AccountActionMenuRuntimeOpt
           { key: 'all_sub2api', label: 'Sub2API 格式 (.json)' },
           { key: 'all_cpa', label: 'CPA 格式 (.zip)' },
           { key: 'all_agent_identity', label: 'Agent Identity (.zip)' },
+          { key: 'all_txt', label: 'Access Token 列表 (.txt)' },
+          { key: 'all_backup', label: '完整备份 (.json，含全部凭据)' },
         ],
       },
     ],
@@ -142,13 +159,23 @@ export function useAccountActionMenuRuntime(options: AccountActionMenuRuntimeOpt
     [
       { key: 'extract_checkout', label: '批量持续提链' },
       { key: 'refresh', label: '批量刷新账号信息和额度' },
+      { key: 'refresh_access_token', label: '批量仅刷新 Access Token' },
+      { key: 'batch_test', label: '批量测试 / 真实对话与画图' },
+      { key: 'reactivate', label: '批量重新激活（Outlook 登录）' },
       { key: 'reset', label: '批量重置' },
     ],
     bindAccountGroupBatchItems.value,
     [
+      { key: 'egress_switch', label: '更换出口（先停 24 小时）' },
+      { key: 'egress_cancel', label: '取消更换出口' },
+    ],
+    [
       { key: 'enable', label: '批量启用' },
       { key: 'disable', label: '批量禁用' },
       { key: 'delete', label: '批量删除', danger: true },
+    ],
+    [
+      { key: 'clear_selection', label: `取消选择 (${options.selectedCount.value})` },
     ],
   ))
 
@@ -173,13 +200,35 @@ export function useAccountActionMenuRuntime(options: AccountActionMenuRuntimeOpt
           label: `刷新选中${options.selectedCount.value ? ` (${options.selectedCount.value})` : ''}`,
           disabled: noSelection,
         },
+        {
+          key: 'refresh_access_token',
+          label: `仅刷新选中的 Access Token${options.selectedCount.value ? ` (${options.selectedCount.value})` : ''}`,
+          disabled: noSelection,
+        },
+        {
+          key: 'batch_test',
+          label: `测试选中账号（探测 / 对话 / 画图）${options.selectedCount.value ? ` (${options.selectedCount.value})` : ''}`,
+          disabled: noSelection,
+        },
+        {
+          key: 'reactivate',
+          label: `重新激活选中（Outlook 登录）${options.selectedCount.value ? ` (${options.selectedCount.value})` : ''}`,
+          disabled: noSelection,
+        },
         { key: 'reset', label: '重置选中状态', disabled: noSelection },
       ],
       bindAccountGroupBatchItems.value,
       [
+        { key: 'egress_switch', label: '更换出口（先停 24 小时）', disabled: noSelection },
+        { key: 'egress_cancel', label: '取消更换出口', disabled: noSelection },
+      ],
+      [
         { key: 'enable', label: '启用选中', disabled: noSelection },
         { key: 'disable', label: '禁用选中', disabled: noSelection },
         { key: 'delete', label: '删除选中', disabled: noSelection, danger: true },
+      ],
+      [
+        { key: 'clear_selection', label: `取消选择${options.selectedCount.value ? ` (${options.selectedCount.value})` : ''}`, disabled: noSelection },
       ],
     )
   })
@@ -187,6 +236,30 @@ export function useAccountActionMenuRuntime(options: AccountActionMenuRuntimeOpt
   async function handleBatchAction(action: string) {
     if (action === 'extract_checkout') {
       await options.extractSelectedCheckout()
+      return
+    }
+    if (action === 'refresh_access_token') {
+      await options.refreshSelectedAccessTokens?.()
+      return
+    }
+    if (action === 'batch_test') {
+      options.openBatchTest?.()
+      return
+    }
+    if (action === 'egress_switch') {
+      await options.switchEgressSelected?.()
+      return
+    }
+    if (action === 'egress_cancel') {
+      await options.cancelEgressSelected?.()
+      return
+    }
+    if (action === 'clear_selection') {
+      options.clearSelection?.()
+      return
+    }
+    if (action === 'reactivate') {
+      await options.reactivateSelected?.()
       return
     }
     if (action.startsWith(BIND_ACCOUNT_GROUP_ACTION_PREFIX)) {
@@ -212,13 +285,17 @@ export function useAccountActionMenuRuntime(options: AccountActionMenuRuntimeOpt
       options.openCreateModal()
       return
     }
+    if (key === 'login_import') {
+      options.openLoginImport?.()
+      return
+    }
     if (isAccountImportAction(key)) {
       options.openImportModal(key)
     }
   }
 
   async function handleExportAction(key: string) {
-    const match = key.match(/^(selected|all)_(sub2api|cpa|agent_identity)$/)
+    const match = key.match(/^(selected|all)_(sub2api|cpa|agent_identity|txt|backup)$/)
     if (!match) return
     await options.exportAccounts(match[1] as AccountExportScope, match[2] as AccountExportFormat)
   }

@@ -1,7 +1,8 @@
 <template>
   <div
     v-memo="[signature]"
-    class="rounded-2xl border border-border bg-background px-3 py-3"
+    class="cursor-pointer rounded-2xl border border-border bg-background px-3 py-3 transition-colors hover:bg-muted/30"
+    @click="emit('open-detail', row)"
   >
     <div class="flex items-start justify-between gap-3">
       <div class="min-w-0">
@@ -11,7 +12,7 @@
         </p>
         <p class="mt-1 text-xs text-muted-foreground">{{ row.endpoint || '-' }}</p>
       </div>
-      <StateBadge :tone="statusTone(row.status)" size="xs" shape="rounded" :bordered="false">
+      <StateBadge :tone="statusTone(row)" size="xs" shape="rounded" :bordered="false">
         {{ formatMs(row.duration_ms) }}
       </StateBadge>
     </div>
@@ -49,6 +50,10 @@ import {
 const props = defineProps<{
   row: RealtimeMonitorRecord
   signature: string
+}>()
+
+const emit = defineEmits<{
+  (e: 'open-detail', row: RealtimeMonitorRecord): void
 }>()
 
 const metricItems = computed(() => slowMetricItems(props.row))

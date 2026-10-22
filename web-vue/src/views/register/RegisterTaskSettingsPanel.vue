@@ -131,6 +131,89 @@
       </div>
     </FormSection>
 
+    <FormSection v-if="config.target === 'openai' && config.egress" title="注册出口策略" density="roomy">
+      <template #actions>
+        <Button size="sm" variant="outline" :disabled="egressChecking" @click="runEgressCheck">
+          {{ egressChecking ? '检测中...' : '检测出口' }}
+        </Button>
+      </template>
+
+      <div class="register-form-grid">
+        <label class="register-toggle register-field--full">
+          <Checkbox
+            :model-value="config.egress.check_enabled"
+            :disabled="config.enabled"
+            @update:model-value="config.egress.check_enabled = Boolean($event)"
+          />
+          <span>
+            <strong>开跑前检测出口</strong>
+            <small>通过 auth.openai.com/cdn-cgi/trace 查看 OpenAI 实际看到的出口 IP 与地区，再查询是否机房 IP；全部出口都连不上 OpenAI 时不启动。</small>
+          </span>
+        </label>
+
+        <label class="register-toggle register-field--full">
+          <Checkbox
+            :model-value="config.egress.block_unsupported"
+            :disabled="config.enabled || !config.egress.check_enabled"
+            @update:model-value="config.egress.block_unsupported = Boolean($event)"
+          />
+          <span>
+            <strong>拦截不支持地区</strong>
+            <small>任一出口落在 OpenAI 不支持的地区（如 CN/HK/RU）时阻止启动；机房 IP、被标记为代理的 IP 只提示不拦。</small>
+          </span>
+        </label>
+
+        <label class="register-field">
+          <span class="register-label">每个出口每日上限</span>
+          <Input
+            v-model.number="config.egress.daily_limit"
+            type="number"
+            min="0"
+            block
+            placeholder="0 = 不限制"
+            :disabled="config.enabled"
+          />
+        </label>
+
+        <label class="register-field">
+          <span class="register-label">同一出口最短间隔（秒）</span>
+          <Input
+            v-model.number="config.egress.min_gap_secs"
+            type="number"
+            min="0"
+            block
+            placeholder="0 = 不限制"
+            :disabled="config.enabled"
+          />
+        </label>
+
+        <p class="register-proxy-hint register-field--full">
+          上限和间隔按出口（代理组里的每个节点、单个代理或直连）分别计算，今日用量按北京时间切日、重启不丢；
+          所有出口都用满当日上限时本批注册自动停止。连续失败的节点会被临时停用，冷却后自动恢复（阈值在“设置 → 稳定代理”中配置）。
+        </p>
+
+        <div v-if="egressReport" class="register-field--full space-y-1 text-xs">
+          <p :class="egressReport.ok ? 'text-emerald-600' : 'text-rose-600'">{{ egressReport.message }}</p>
+          <p
+            v-for="item in egressReport.results"
+            :key="item.proxy"
+            class="break-all"
+            :class="egressVerdictClass(item.verdict)"
+          >
+            {{ describeEgress(item) }}
+          </p>
+        </div>
+        <p v-if="egressError" class="register-field--full text-xs text-rose-600">{{ egressError }}</p>
+
+        <div v-if="egressHealth?.quota_usage?.length" class="register-field--full space-y-1 text-xs text-muted-foreground">
+          <p>今日各出口注册数：</p>
+          <p v-for="row in egressHealth.quota_usage" :key="row.proxy" class="break-all font-mono">
+            {{ row.proxy }} · {{ row.count_today }} 个<span v-if="row.next_available_in"> · {{ row.next_available_in }}s 后可用</span>
+          </p>
+        </div>
+      </div>
+    </FormSection>
+
     <FormSection v-if="config.target === 'openai'" title="Checkout / 支付链接" density="roomy">
       <div class="register-form-grid">
         <label class="register-toggle register-field--full">
@@ -332,6 +415,18 @@
           </span>
         </label>
 
+        <label v-if="config.target !== 'grok'" class="register-toggle register-field--full">
+          <Checkbox
+            :model-value="config.confirm_refresh_token"
+            :disabled="config.enabled"
+            @update:model-value="config.confirm_refresh_token = Boolean($event)"
+          />
+          <span>
+            <strong>注册后验证 refresh_token</strong>
+            <small>默认关闭。入池前用号池同款指纹刷新一次凭据；返回 401 时用原邮箱（需支持收登录验证码，如 OutlookToken）重新登录换新凭据，其它失败保留注册时的凭据。</small>
+          </span>
+        </label>
+
         <div class="register-field--full border-t border-border pt-4"></div>
 
         <label class="register-toggle register-field--full">
@@ -459,6 +554,18 @@
 
     <FormSection v-if="config.target === 'grok'" title="Grok 注册协议" density="roomy">
       <div class="register-form-grid register-form-grid--grok">
+        <label class="register-toggle register-field--full">
+          <Checkbox
+            :model-value="config.grok.turnstile_prefetch"
+            :disabled="config.enabled"
+            @update:model-value="config.grok.turnstile_prefetch = Boolean($event)"
+          />
+          <span>
+            <strong>等待邮件时预先求解 Turnstile</strong>
+            <small>默认开启。发出验证码后在后台同时求解 Turnstile，缩短单号耗时；结果超过 240 秒或失败时当场重新求解。浏览器流程不预取。</small>
+          </span>
+        </label>
+
         <label class="register-field">
           <span class="register-label">注册链路</span>
           <GroupedSelectMenu
@@ -487,9 +594,16 @@
             v-model.trim="config.grok.api_key"
             type="password"
             autocomplete="off"
+            :placeholder="config.grok.api_key_set ? '已配置，留空不修改' : ''"
             block
             root-class="font-mono"
             :disabled="config.enabled"
+          />
+          <RegisterSecretClear
+            :visible="Boolean(config.grok.api_key_set) && !String(config.grok.api_key || '').trim()"
+            :model-value="Boolean(config.grok.clear_api_key)"
+            :disabled="config.enabled"
+            @update:model-value="value => { config.grok.clear_api_key = value }"
           />
         </label>
 
@@ -881,9 +995,11 @@ import { Button, Checkbox, Input, SegmentedTabs } from 'nanocat-ui'
 
 import FormSection from '@/components/ai/FormSection.vue'
 import GroupedSelectMenu from '@/components/ui/GroupedSelectMenu.vue'
+import RegisterSecretClear from '@/views/register/RegisterSecretClear.vue'
 import { accountImportsApi } from '@/api/accountImports'
 import type { CPAPool, Sub2APIRemoteGroup, Sub2APIServer } from '@/api/accountImports'
 import { proxyApi, type ProxySampleTestResult } from '@/api/proxy'
+import { egressApi, type EgressCheckResult, type EgressHealth, type EgressPreflightReport } from '@/api/egress'
 import type { LegacyRegisterConfig } from '@/api/register'
 import {
   grokSignupFlowGroups,
@@ -943,6 +1059,38 @@ const oauthDeliveryLoadError = ref('')
 const oauthDeliveryRemoteGroups = ref<Sub2APIRemoteGroup[]>([])
 const cpaPools = ref<CPAPool[]>([])
 const mailRequestExpanded = ref(false)
+const egressChecking = ref(false)
+const egressReport = ref<EgressPreflightReport | null>(null)
+const egressHealth = ref<EgressHealth | null>(null)
+const egressError = ref('')
+
+async function runEgressCheck() {
+  egressChecking.value = true
+  egressError.value = ''
+  try {
+    // 按当前（可能尚未保存的）注册代理设置检测。
+    egressReport.value = await egressApi.check(String(props.config.proxy || ''))
+    egressHealth.value = await egressApi.health()
+  } catch (error) {
+    egressError.value = error instanceof Error ? error.message : '出口检测失败'
+  } finally {
+    egressChecking.value = false
+  }
+}
+
+function egressVerdictClass(verdict: EgressCheckResult['verdict']) {
+  if (verdict === 'ok') return 'text-emerald-600'
+  if (verdict === 'warn') return 'text-amber-600'
+  return 'text-rose-600'
+}
+
+function describeEgress(item: EgressCheckResult) {
+  if (item.verdict === 'error') return `${item.proxy} → ${item.message}`
+  const place = [item.country, item.city].filter(Boolean).join(' ')
+  const kind = item.hosting ? '机房' : '非机房'
+  return `${item.proxy} → ${item.ip || '-'} · ${place || '-'} · ${item.isp || item.org || '-'} · ${kind} · ${item.message}`
+}
+
 let sub2apiGroupRequestVersion = 0
 let oauthDeliveryGroupRequestVersion = 0
 
@@ -1293,6 +1441,14 @@ function updateSub2APIGroupName(value: unknown) {
   if (groupName === props.config.sub2api_sync.group_name) return
   props.config.sub2api_sync.group_name = groupName
 }
+
+// 重新输入了新的 Turnstile API Key 就取消“保存时清除”，避免新值被 clear_api_key 覆盖。
+watch(
+  () => String(props.config.grok.api_key || '').trim(),
+  (value) => {
+    if (value && props.config.grok.clear_api_key) props.config.grok.clear_api_key = false
+  },
+)
 
 watch(
   () => String(props.config.target || '').trim().toLowerCase(),

@@ -9,6 +9,8 @@ type AccountSelectionRuntimeOptions = {
 
 export function useAccountSelectionRuntime(options: AccountSelectionRuntimeOptions) {
   const selectedIds = ref<string[]>([])
+  // 跨分页全选筛选结果后，已选账号不一定在当前页，不能按当前页裁剪。
+  const crossPageActive = ref(false)
   const selectedSet = computed(() => new Set(selectedIds.value))
   const selectedCount = computed(() => selectedIds.value.length)
   const allVisibleSelected = computed(() => {
@@ -20,7 +22,7 @@ export function useAccountSelectionRuntime(options: AccountSelectionRuntimeOptio
   })
 
   function pruneToCurrentAccounts() {
-    if (!selectedIds.value.length) return
+    if (!selectedIds.value.length || crossPageActive.value) return
     const existingIds = new Set(options.accounts.value.map((item) => item.id))
     selectedIds.value = selectedIds.value.filter((id) => existingIds.has(id))
   }
@@ -42,6 +44,13 @@ export function useAccountSelectionRuntime(options: AccountSelectionRuntimeOptio
 
   function clearSelection() {
     selectedIds.value = []
+    crossPageActive.value = false
+  }
+
+  /** 用后端解析出的整批账号 ID 替换当前选择（跨分页全选筛选结果）。 */
+  function selectIds(ids: readonly string[]) {
+    selectedIds.value = Array.from(new Set(ids.filter(Boolean)))
+    crossPageActive.value = selectedIds.value.length > 0
   }
 
   function toggleSelectAllVisible(checked?: boolean) {
@@ -65,6 +74,8 @@ export function useAccountSelectionRuntime(options: AccountSelectionRuntimeOptio
 
   return {
     selectedIds,
+    crossPageActive,
+    selectIds,
     selectedSet,
     selectedCount,
     allVisibleSelected,

@@ -149,6 +149,22 @@ export function useStudioImageTaskRuntime(input: StudioImageTaskRuntimeInput) {
     lastSuccessfulImageRefreshSignature = ''
   }
 
+  /** 轮询超时的任务继续等待：后端把任务重置为 running 并追加轮询时间。 */
+  async function resumePoll(taskId: string) {
+    const normalizedTaskId = cleanStudioText(taskId)
+    if (!normalizedTaskId) return null
+    try {
+      const task = await imageTasksApi.resumePoll(normalizedTaskId)
+      merge([task])
+      syncMessageStatuses()
+      schedulePoll()
+      return task
+    } catch (error) {
+      input.hooks.onRefreshError(input.hooks.formatError(error, '继续图片任务失败'))
+      return null
+    }
+  }
+
   function reset() {
     imageTasks.value = []
     lastSuccessfulImageRefreshSignature = ''
@@ -235,6 +251,7 @@ export function useStudioImageTaskRuntime(input: StudioImageTaskRuntimeInput) {
     activeRunningTaskCount,
     conversationBadges,
     rememberTask,
+    resumePoll,
     refresh,
     merge,
     reset,

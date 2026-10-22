@@ -1,12 +1,18 @@
 <template>
   <div
-    v-if="totalCount > 0"
+    v-if="totalCount > 0 || layoutMode"
     class="flex flex-col gap-3 border-t border-border/60 pt-4 md:flex-row md:items-center md:justify-between"
   >
-    <div class="text-xs text-muted-foreground">
+    <div v-if="totalCount > 0" class="text-xs text-muted-foreground">
       当前展示 {{ visibleCount }} / {{ totalCount }} {{ unit }}
     </div>
-    <div class="flex flex-wrap items-center gap-2">
+    <div v-if="totalCount > 0 || layoutMode" class="flex flex-wrap items-center gap-2">
+      <ListLayoutControl
+        v-if="layoutMode"
+        :model-value="layoutMode"
+        @update:model-value="emit('update:layoutMode', $event)"
+      />
+      <template v-if="totalCount > 0">
       <span class="text-xs text-muted-foreground">每页</span>
       <div class="w-[110px] shrink-0">
         <GroupedSelectMenu
@@ -34,6 +40,7 @@
       >
         下一页
       </Button>
+      </template>
     </div>
   </div>
 </template>
@@ -42,6 +49,8 @@
 import { computed } from 'vue'
 import { Button } from 'nanocat-ui'
 import GroupedSelectMenu from '../ui/GroupedSelectMenu.vue'
+import ListLayoutControl from './ListLayoutControl.vue'
+import type { ListLayoutMode } from '@/composables/useListLayoutPreference'
 
 type MenuPlacement = 'auto' | 'top' | 'bottom' | 'left' | 'right' | 'up' | 'down'
 
@@ -53,6 +62,7 @@ const props = withDefaults(defineProps<{
   unit?: string
   disabled?: boolean
   placement?: MenuPlacement
+  layoutMode?: ListLayoutMode
 }>(), {
   pageSizeOptions: () => [20, 50, 100],
   unit: '条',
@@ -63,6 +73,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   (e: 'update:page', value: number): void
   (e: 'update:pageSize', value: number): void
+  (e: 'update:layoutMode', value: ListLayoutMode): void
 }>()
 
 const pageCount = computed(() => Math.max(1, Math.ceil(props.totalCount / Math.max(1, props.pageSize))))

@@ -6,7 +6,19 @@ import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { useToast } from '@/composables/useToast'
 import type { useAccountBulkProgressRuntime } from './accountBulkProgressRuntime'
 
-export type AccountImportMode = 'oauth_login' | 'access_token' | 'session_json' | 'cpa_json' | 'remote_cpa' | 'sub2api'
+export type AccountImportMode =
+  | 'oauth_login'
+  | 'backup_json'
+  | 'access_token'
+  | 'session_json'
+  | 'cpa_json'
+  | 'sub2api_json'
+  | 'remote_cpa'
+  | 'sub2api'
+
+export const BACKUP_FORMAT = 'gptgrok2api-accounts-backup'
+export const TARGET_GROUP_KEEP = '__keep__'
+export const TARGET_GROUP_UNGROUPED = '__ungrouped__'
 
 const IMPORT_BATCH_SIZE = 20
 
@@ -98,14 +110,27 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
   const oauthRedirectUriPrefix = ref('')
   const manualTokenText = ref('')
   const sessionJsonText = ref('')
+  // 入池前验证：先用 refresh_token 换一次 token 并同步额度，不可用的账号不留在号池。
+  const verifyOnImport = ref(false)
+  // 导入目标账号组：__keep__ 不改动分组，__ungrouped__ 归入未分组，其它为账号组 ID。
+  const importTargetGroup = ref<string>(TARGET_GROUP_KEEP)
   const toast = useToast()
   const confirmDialog = useConfirmDialog()
 
+  /** undefined 表示保持账号原分组；'' 表示未分组。 */
+  function targetGroupParam(): string | undefined {
+    if (importTargetGroup.value === TARGET_GROUP_KEEP) return undefined
+    if (importTargetGroup.value === TARGET_GROUP_UNGROUPED) return ''
+    return importTargetGroup.value
+  }
+
   const importModeOptions = [
     { label: 'OAuth 登录已有账号', value: 'oauth_login' },
+    { label: '导入完整备份文件', value: 'backup_json' },
     { label: '导入 Access Token', value: 'access_token' },
     { label: '导入 Session JSON', value: 'session_json' },
     { label: '导入 CPA JSON 文件', value: 'cpa_json' },
+    { label: '导入 Sub2API JSON 文件', value: 'sub2api_json' },
     { label: '从远程 CPA 服务器导入', value: 'remote_cpa' },
     { label: '从 Sub2API 服务器导入', value: 'sub2api' },
   ] as const
@@ -159,7 +184,12 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
     }
   }
 
-  async function importAccountPayloadBatch(accountPayloads: AccountImportPayload[], sourceType: string, title: string) {
+  async function importAccountPayloadBatch(
+    accountPayloads: AccountImportPayload[],
+    sourceType: string,
+    title: string,
+    extra: { restore?: boolean } = {},
+  ) {
     const payloadsByToken = new Map<string, AccountImportPayload>()
     for (const payload of accountPayloads) {
       const accessToken = accountPayloadToken(payload)
@@ -172,9 +202,15 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
       return
     }
 
+    const restore = Boolean(extra.restore)
+    const verify = restore ? false : verifyOnImport.value
     const confirmed = await confirmDialog.ask({
       title,
-      message: `即将导入 ${normalizedTokens.length} 个账号，已存在账号会刷新远端信息。是否继续？`,
+      message: restore
+        ? `即将还原 ${normalizedTokens.length} 个账号，保留备份里的账号 ID、分组、代理和统计，不会联网同步。已存在的账号会被备份内容覆盖。是否继续？`
+        : verify
+        ? `即将验证并导入 ${normalizedTokens.length} 个账号，验证不通过的账号不会留在号池。是否继续？`
+        : `即将导入 ${normalizedTokens.length} 个账号，已存在账号会刷新远端信息。是否继续？`,
       confirmText: '确认导入',
       cancelText: '取消',
     })
@@ -187,6 +223,7 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
     let refreshedCount = 0
     let processed = 0
     const errors: string[] = []
+    const rejected: string[] = []
     try {
       for (let index = 0; index < normalizedTokens.length; index += IMPORT_BATCH_SIZE) {
         if (options.bulkProgress.bulkStopRequested.value) break
@@ -195,11 +232,18 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
           const result = await accountsApi.importAccounts(
             batch,
             sourceType,
-            { refresh: true, returnItems: false },
+            {
+              refresh: !restore,
+              returnItems: false,
+              verifyOnImport: verify,
+              restore,
+              targetGroupId: targetGroupParam(),
+            },
           )
           addedCount += Number(result.added || 0)
           skippedCount += Number(result.skipped || 0)
           refreshedCount += Number(result.refreshed || 0)
+          rejected.push(...result.rejected.map((item) => `${item.email || '未知邮箱'}：${item.reason || item.status || '验证未通过'}`))
           errors.push(...(Array.isArray(result.errors) ? result.errors.filter(Boolean) : []))
         } catch (error) {
           errors.push(`${accountPayloadToken(batch[0])?.slice(0, 6) || '-'}... 等 ${batch.length} 个账号：${options.normalizeErrorMessage(error)}`)
@@ -223,6 +267,20 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
       })
       if (stopped) {
         toast.warning(`${title}已停止：已处理 ${processed}/${normalizedTokens.length} 个`)
+      } else if (verify) {
+        const summary = `${title}完成：验证通过并入池 ${addedCount}，未通过 ${rejected.length}，失败 ${errors.length}`
+        if (rejected.length || errors.length) {
+          toast.warning(summary)
+          await confirmDialog.ask({
+            title: '入池验证未通过的账号',
+            message: [...rejected, ...errors].slice(0, 30).join('\n')
+              + (rejected.length + errors.length > 30 ? `\n…… 共 ${rejected.length + errors.length} 条` : ''),
+            confirmText: '知道了',
+            cancelText: '关闭',
+          })
+        } else {
+          toast.success(summary)
+        }
       } else if (errors.length > 0) {
         toast.warning(`${title}完成：新增 ${addedCount}，跳过 ${skippedCount}，刷新 ${refreshedCount}，失败 ${errors.length}`)
       } else {
@@ -232,7 +290,8 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
         manualTokenText.value = ''
         sessionJsonText.value = ''
       }
-      if (!stopped && errors.length > 0) {
+      // 入池验证已把不可用账号移出号池，不必再提示清理。
+      if (!stopped && !verify && errors.length > 0) {
         await promptRemoveImportedAbnormalAccounts(normalizedTokens, errors.length)
       }
     } catch (error) {
@@ -270,6 +329,79 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
     const text = await file.text()
     manualTokenText.value = text
     await importManualTokenText()
+  }
+
+  function parseBackupAccounts(rawText: string, label: string): AccountImportPayload[] {
+    const text = rawText.trim()
+    if (!text) throw new Error(`${label} 是空文件`)
+    const parsed = JSON.parse(text)
+    const rows = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === 'object' && Array.isArray((parsed as { accounts?: unknown }).accounts)
+        ? (parsed as { accounts: unknown[] }).accounts
+        : []
+    if (!Array.isArray(parsed) && (parsed as { format?: unknown })?.format !== BACKUP_FORMAT) {
+      throw new Error(`${label} 不是本系统导出的完整备份文件（导出时请选择「完整备份」）`)
+    }
+    const accounts = rows.filter(
+      (row): row is AccountImportPayload => Boolean(row) && typeof row === 'object' && !Array.isArray(row)
+        && Boolean(accountPayloadToken(row)),
+    )
+    if (!accounts.length) throw new Error(`${label} 中没有找到账号`)
+    return accounts
+  }
+
+  async function importBackupFile(file: File | null | undefined) {
+    if (!file) return
+    let accounts: AccountImportPayload[]
+    try {
+      accounts = parseBackupAccounts(await file.text(), file.name)
+    } catch (error) {
+      options.setError('读取备份文件失败', error)
+      return
+    }
+    await importAccountPayloadBatch(accounts, 'backup', '导入完整备份文件', { restore: true })
+  }
+
+  async function importSub2apiFiles(files: FileList | File[] | null | undefined) {
+    const fileList = Array.from(files || [])
+    if (!fileList.length) return
+    const confirmed = await confirmDialog.ask({
+      title: '导入 Sub2API JSON 文件',
+      message: `即将读取 ${fileList.length} 个 Sub2API JSON 文件，保存账号后同步账号与额度。是否继续？`,
+      confirmText: '开始导入',
+      cancelText: '取消',
+    })
+    if (!confirmed) return
+    importBusy.value = true
+    let parsed = 0
+    let added = 0
+    let skipped = 0
+    let refreshed = 0
+    const errors: string[] = []
+    try {
+      for (const file of fileList) {
+        try {
+          const result = await accountsApi.importSub2apiFile(await file.text(), {
+            refresh: true,
+            targetGroupId: targetGroupParam(),
+          })
+          parsed += result.parsed
+          added += result.added
+          skipped += result.skipped
+          refreshed += result.refreshed
+          errors.push(...result.errors)
+        } catch (error) {
+          errors.push(`${file.name}：${options.normalizeErrorMessage(error)}`)
+        }
+      }
+      await options.loadData({ silentErrorToast: true })
+      const summary = `Sub2API JSON 导入完成：解析 ${parsed}，新增 ${added}，跳过 ${skipped}，刷新 ${refreshed}`
+      if (errors.length) toast.warning(`${summary}，失败 ${errors.length}：${errors[0]}`)
+      else toast.success(summary)
+    } finally {
+      importBusy.value = false
+    }
   }
 
   async function importSessionJson() {
@@ -332,7 +464,7 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
 
     importBusy.value = true
     try {
-      const result = await accountImportsApi.finishOAuthLogin(sessionId, callback)
+      const result = await accountImportsApi.finishOAuthLogin(sessionId, callback, targetGroupParam())
       await options.loadData({ silentErrorToast: true })
       const added = Number(result.added || 0)
       const skipped = Number(result.skipped || 0)
@@ -386,6 +518,11 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
     oauthRedirectUriPrefix,
     manualTokenText,
     sessionJsonText,
+    verifyOnImport,
+    importTargetGroup,
+    targetGroupParam,
+    importBackupFile,
+    importSub2apiFiles,
     setImportMode,
     openImportModal,
     closeImportModal,

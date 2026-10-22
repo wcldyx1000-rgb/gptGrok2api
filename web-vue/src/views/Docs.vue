@@ -193,7 +193,7 @@ const operationSections = [
     title: '图片和存储',
     items: [
       '图库使用 /api/images 服务端分页，避免大图库一次性压到浏览器。',
-      '图片保留口径使用 image_retention_days，和设置页、后端自动清理保持一致。',
+      '图片保留口径使用 image_retention_hours（小时，旧的天数配置会自动换算），和设置页、后端自动清理保持一致。',
       'WebDAV/R2 测试、同步、备份都属于外部副作用动作，需要确认后再执行。',
     ],
   },

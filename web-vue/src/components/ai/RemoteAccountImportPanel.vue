@@ -175,10 +175,21 @@
 
     <div class="flex flex-wrap items-center justify-between gap-3">
       <p class="text-xs text-muted-foreground">{{ progressText }}</p>
-      <Button size="xs" variant="primary" :disabled="busy || selectedCount === 0" @click="startImport">
-        {{ busy ? '处理中...' : '导入选中' }}
-      </Button>
+      <div class="flex items-center gap-2">
+        <Button
+          v-if="importTracker.state.job && !importTracker.state.open"
+          size="xs"
+          variant="outline"
+          @click="importTracker.state.open = true"
+        >
+          查看进度
+        </Button>
+        <Button size="xs" variant="primary" :disabled="busy || selectedCount === 0 || importRunning" @click="startImport">
+          {{ busy ? '处理中...' : importRunning ? '已有导入任务运行中' : '导入选中' }}
+        </Button>
+      </div>
     </div>
+    <RemoteImportProgressDrawer />
   </section>
 </template>
 
@@ -197,9 +208,11 @@ import type {
   Sub2APIServer,
 } from '@/api/accountImports'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
+import { useRemoteImportTracker } from '@/composables/useRemoteImportTracker'
 import { useToast } from '@/composables/useToast'
 import GroupedSelectMenu from '@/components/ui/GroupedSelectMenu.vue'
 import ImportModePanel from './ImportModePanel.vue'
+import RemoteImportProgressDrawer from './RemoteImportProgressDrawer.vue'
 import SelectableListPanel from './SelectableListPanel.vue'
 
 type RemoteImportMode = 'cpa' | 'sub2api'
@@ -220,11 +233,14 @@ const props = withDefaults(defineProps<{
   sub2apiServerId?: string
   sub2apiGroupId?: string
   showModeSwitch?: boolean
+  /** undefined 不改动分组；'' 归入未分组；其它为已存在的账号组 ID。 */
+  targetGroupId?: string
 }>(), {
   cpaPoolId: '',
   sub2apiServerId: '',
   sub2apiGroupId: undefined,
   showModeSwitch: false,
+  targetGroupId: undefined,
 })
 
 const emit = defineEmits<{
@@ -251,6 +267,12 @@ const sub2apiDuplicateCount = ref(0)
 const collapsedSub2APIGroups = ref<Record<string, boolean>>({})
 const importSub2APIByGroups = ref(true)
 const importJob = ref<CPAImportJob | null>(null)
+const importTracker = useRemoteImportTracker()
+// 远程导入全局只运行一个任务：有任务在跑时（包括离开页面前启动的）禁用新的导入。
+const importRunning = computed(() => importTracker.state.tracking)
+watch(() => importTracker.state.job, (job) => {
+  if (job && importTracker.state.source === activeMode.value) importJob.value = job
+})
 
 const modeOptions = [
   { label: 'CPA', value: 'cpa' },
@@ -423,7 +445,25 @@ watch(() => [props.cpaPoolId, props.sub2apiServerId, props.sub2apiGroupId], () =
 onMounted(() => {
   applyInitialSelection()
   void refreshSources(hasFixedSource())
+  void resumeActiveImport()
 })
+
+/** 离开页面或刷新后回来：恢复后端仍在进行的远程导入并继续展示进度。 */
+async function resumeActiveImport() {
+  const active = await importTracker.resume()
+  if (!active || active.job.status === 'completed' || active.job.status === 'failed') return
+  if (active.source !== props.mode || busy.value) return
+  activeMode.value = active.source
+  busy.value = true
+  try {
+    const job = await importTracker.whenDone()
+    importJob.value = job
+    showImportResult(active.source === 'cpa' ? '远程 CPA 导入完成' : 'Sub2API 导入完成', job)
+    emit('imported')
+  } finally {
+    busy.value = false
+  }
+}
 
 function uniqueRemoteCPAFiles(files: CPARemoteFile[]) {
   const seen = new Set<string>()
@@ -774,16 +814,15 @@ function clearSelection() {
 }
 
 async function pollImportJob(sourceId: string) {
-  for (let index = 0; index < 180; index += 1) {
-    const response = activeMode.value === 'cpa'
-      ? await accountImportsApi.getCPAImportJob(sourceId)
-      : await accountImportsApi.getSub2APIImportJob(sourceId)
-    importJob.value = response.import_job || null
-    const status = importJob.value?.status
-    if (status === 'completed' || status === 'failed') return importJob.value
-    await new Promise((resolve) => window.setTimeout(resolve, 1000))
+  if (!importTracker.state.tracking) {
+    const name = activeMode.value === 'cpa'
+      ? cpaPools.value.find((pool) => pool.id === sourceId)?.name
+      : sub2apiServers.value.find((server) => server.id === sourceId)?.name
+    importTracker.track({ source: activeMode.value, id: sourceId, name, job: importJob.value })
   }
-  throw new Error('导入进度超时')
+  const job = await importTracker.whenDone()
+  importJob.value = job
+  return job
 }
 
 async function startImport() {
@@ -809,13 +848,14 @@ async function startCPAImport() {
 
   await runBusy(async () => {
     try {
-      const start = await accountImportsApi.startCPAImport(poolId, names)
+      const start = await accountImportsApi.startCPAImport(poolId, names, props.targetGroupId)
       importJob.value = start.import_job || null
       const job = await pollImportJob(poolId)
       showImportResult('远程 CPA 导入完成', job)
       emit('imported')
     } catch (error: any) {
       toast.error(error.message || '远程 CPA 导入失败')
+      void importTracker.resume()
     }
   })
 }
@@ -859,6 +899,7 @@ async function startSub2APIImport() {
       const start = await accountImportsApi.startSub2APIImport(serverId, accountIds, {
         group_bindings: groupBindings,
         create_account_groups: importSub2APIByGroups.value,
+        ...(props.targetGroupId !== undefined ? { target_group_id: props.targetGroupId } : {}),
       })
       importJob.value = start.import_job || null
       const job = await pollImportJob(serverId)
@@ -866,6 +907,7 @@ async function startSub2APIImport() {
       emit('imported')
     } catch (error: any) {
       toast.error(error.message || 'Sub2API 导入失败')
+      void importTracker.resume()
     }
   })
 }

@@ -63,12 +63,50 @@ function adaptDashboardToStats(dashboard: DashboardResponse): AdminStats {
     account_providers: accounts.providers || {},
     success_count: successCount,
     failed_count: failedCount,
+    avg_success_duration_ms: logs.avg_success_duration_ms ?? null,
+    total_calls: Number(logs.total || 0),
+    text_review_count: Number(logs.text_review || 0),
+    success_rate: logs.success_rate ?? null,
+    switching: logs.switching,
     recent_failures: Array.isArray(logs.recent_failures) ? logs.recent_failures : [],
     trend,
   }
 }
 
+export type DashboardSnapshot = {
+  version: string
+  generatedAt: number
+  overviews: Record<'24h' | '7d' | '30d', AdminStats>
+}
+
+type DashboardSnapshotResponse = {
+  version: string
+  generated_at: number
+  accounts: DashboardResponse['accounts']
+  ranges: Record<string, DashboardResponse['logs']>
+}
+
 export const statsApi = {
+  /** 概览单次快照：账号统计与三个统计周期一次取回。 */
+  async snapshot(signal?: AbortSignal): Promise<DashboardSnapshot> {
+    const snapshot = await apiClient.get<never, DashboardSnapshotResponse>('/api/dashboard/snapshot', {
+      timeout: 20000,
+      signal,
+    })
+    const overviews = {} as DashboardSnapshot['overviews']
+    for (const range of ['24h', '7d', '30d'] as const) {
+      overviews[range] = adaptDashboardToStats({
+        status: 'ok',
+        healthy: true,
+        version: snapshot.version,
+        accounts: snapshot.accounts,
+        storage: { backend: {}, health: {}, images: {} },
+        logs: snapshot.ranges?.[range] || ({} as DashboardResponse['logs']),
+      })
+    }
+    return { version: snapshot.version, generatedAt: Number(snapshot.generated_at || 0), overviews }
+  },
+
   async overview(timeRange: string = '24h') {
     const dashboard = await apiClient.get<never, DashboardResponse>('/api/dashboard', {
       params: {

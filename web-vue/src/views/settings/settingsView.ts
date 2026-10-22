@@ -43,6 +43,7 @@ export type SettingsBackupIncludeKey =
   | 'logs'
   | 'dashboard_metrics'
   | 'image_tasks'
+  | 'editable_files'
   | 'accounts_snapshot'
   | 'auth_keys_snapshot'
   | 'images'
@@ -177,9 +178,15 @@ export const backupIncludeOptions: SettingsBackupIncludeOption[] = [
   { value: 'logs', label: '调度与调用日志' },
   { value: 'dashboard_metrics', label: '概览统计' },
   { value: 'image_tasks', label: '图片任务记录' },
+  { value: 'editable_files', label: 'PPT / PSD 可编辑文件' },
   { value: 'accounts_snapshot', label: '账号快照' },
   { value: 'auth_keys_snapshot', label: '用户密钥快照' },
   { value: 'images', label: '图片文件目录' },
+]
+
+export const imageUpscaleEngineOptions: SettingsSelectOption[] = [
+  { label: 'Pillow Lanczos（默认）', value: 'pillow_lanczos' },
+  { label: 'sharp Lanczos3（需要 Node sharp，不可用时回退 Pillow）', value: 'sharp_lanczos3' },
 ]
 
 export const imageStorageModeOptions: SettingsSelectOption[] = [
@@ -201,7 +208,7 @@ export const proxyClearanceModeOptions: SettingsSelectOption[] = [
 
 export function backupStatusText(state: BackupState | null | undefined) {
   if (!state) return '未加载'
-  if (state.running) return '备份中'
+  if (state.running || state.last_status === 'running') return '备份中'
   if (state.last_status === 'success') return '最近成功'
   if (state.last_status === 'error') return '最近失败'
   return state.last_status || '未执行'

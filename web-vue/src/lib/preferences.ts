@@ -19,6 +19,7 @@ export const preferenceKeys = {
   studioImageModel: 'studio-image-model',
   studioSidebarWidth: 'studio-sidebar-width',
   themeMode: 'theme-mode',
+  listLayoutMode: 'list-layout-mode',
 } as const
 
 type PreferenceKey = typeof preferenceKeys[keyof typeof preferenceKeys]
@@ -33,12 +34,20 @@ function storage(): Storage | null {
 }
 
 export function getStringPreference(key: PreferenceKey, fallback = ''): string {
-  const value = storage()?.getItem(key)
-  return value == null ? fallback : value
+  try {
+    const value = storage()?.getItem(key)
+    return value == null ? fallback : value
+  } catch {
+    return fallback
+  }
 }
 
 export function setStringPreference(key: PreferenceKey, value: string): void {
-  storage()?.setItem(key, value)
+  try {
+    storage()?.setItem(key, value)
+  } catch {
+    // 隐私模式或存储已满时忽略，偏好只在当前页面生效。
+  }
 }
 
 export function getBooleanPreference(key: PreferenceKey, fallback = false): boolean {

@@ -1,13 +1,14 @@
 <template>
-  <tr v-memo="[signature]">
+  <tr v-memo="[signature]" class="monitor-clickable-row" @click="emit('open-detail', row)">
     <td>
       <p class="font-mono text-xs text-foreground">{{ shortCallId(row.call_id) }}</p>
       <p class="mt-1 text-[11px] text-muted-foreground">{{ row.ended_at || row.updated_at || '-' }}</p>
     </td>
     <td>
-      <StateBadge :tone="statusTone(row.status)" shape="rounded" :bordered="false">
-        {{ statusLabel(row.status) }}
+      <StateBadge :tone="statusTone(row)" shape="rounded" :bordered="false">
+        {{ statusLabel(row) }}
       </StateBadge>
+      <p v-if="row.switch_count" class="mt-1 text-[11px] text-amber-600">切换 {{ row.switch_count }} 次</p>
     </td>
     <td class="max-w-[12rem] truncate">{{ row.model || '-' }}</td>
     <td>{{ formatMs(row.duration_ms) }}</td>
@@ -31,5 +32,9 @@ import {
 defineProps<{
   row: RealtimeMonitorRecord
   signature: string
+}>()
+
+const emit = defineEmits<{
+  (e: 'open-detail', row: RealtimeMonitorRecord): void
 }>()
 </script>

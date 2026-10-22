@@ -117,6 +117,9 @@
             :size-label="formatSize(file.size)"
             :dimensions="formatDimensions(file)"
             :time-remaining="galleryCardTimeRemaining(file)"
+            :genbox-push-enabled="genboxPushEnabled"
+            :genbox-busy="genboxPushBusyPath === file.path"
+            :genbox-status-label="genboxStatusLabel(file)"
             @preview="openPreview"
             @select="handleCardSelect"
             @image-error="handleCardImageError"
@@ -124,6 +127,7 @@
             @edit-tags="openTagEditor"
             @download="downloadFile"
             @delete="handleDelete"
+            @genbox-push="handleGenBoxPush"
             @tag-click="setTagFilter"
           />
         </div>
@@ -133,6 +137,7 @@
           v-model:page-size="pageSize"
           :total-count="totalItems"
           :page-size-options="galleryPageSizeOptions"
+          v-model:layout-mode="listLayoutMode"
           unit="张图片"
           :disabled="isLoading"
         />
@@ -293,6 +298,7 @@ import DateRangeInputs from '@/components/ai/DateRangeInputs.vue'
 import FilterToolbar from '@/components/ai/FilterToolbar.vue'
 import GalleryImageCard from '@/components/ai/GalleryImageCard.vue'
 import ListPagination from '@/components/ai/ListPagination.vue'
+import { useListLayoutPreference } from '@/composables/useListLayoutPreference'
 import MetricStrip from '@/components/ai/MetricStrip.vue'
 import ModalBody from '@/components/ai/ModalBody.vue'
 import ModalCloseButton from '@/components/ai/ModalCloseButton.vue'
@@ -304,6 +310,7 @@ import PanelHeader from '@/components/ai/PanelHeader.vue'
 import SelectionBulkBar from '@/components/ai/SelectionBulkBar.vue'
 import StateBlock from '@/components/ai/StateBlock.vue'
 import GroupedSelectMenu from '@/components/ui/GroupedSelectMenu.vue'
+import { useNowTicker } from '@/composables/useNowTicker'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { useToast } from '@/composables/useToast'
 import { usePageRuntime } from '@/composables/usePageRuntime'
@@ -320,6 +327,7 @@ import {
   formatTimeRemaining,
   galleryFileCardSignature,
   galleryPageSizeOptions,
+  genboxStatusLabel,
   storageUsageBarWidth as getStorageUsageBarWidth,
   storageLabel,
 } from '@/views/gallery/galleryView'
@@ -354,6 +362,7 @@ const endDate = galleryQueryRuntime.endDate
 const pageSize = galleryQueryRuntime.pageSize
 const counts = galleryQueryRuntime.counts
 const allTags = galleryQueryRuntime.allTags
+const genboxPushEnabled = galleryQueryRuntime.genboxPushEnabled
 const tagOptions = galleryQueryRuntime.tagOptions
 const currentPage = galleryQueryRuntime.currentPage
 const totalItems = galleryQueryRuntime.totalItems
@@ -403,6 +412,7 @@ const pruneSelection = galleryInteractions.pruneSelection
 const canPreviewFile = galleryInteractions.canPreviewFile
 const handleImageError = galleryInteractions.handleImageError
 const clearBrokenImages = galleryInteractions.clearBrokenImages
+const { listLayoutMode } = useListLayoutPreference()
 const galleryOperations = useGalleryOperationsRuntime({
   runtime: pageRuntime,
   confirmDialog,
@@ -418,6 +428,8 @@ const galleryOperations = useGalleryOperationsRuntime({
 })
 const {
   batchBusy,
+  genboxPushBusyPath,
+  handleGenBoxPush,
   isStorageModalOpen,
   isStorageBusy,
   storageActionMessage,
@@ -443,7 +455,13 @@ function galleryCardImageUrl(file: GalleryFile) {
   return getFileUrl(file.thumbnail_url || file.url)
 }
 
+// 剩余时间随全页时钟（30 秒一跳）倒计时，不再停在拉取那一刻的快照上。
+const nowSeconds = useNowTicker()
+
 function galleryCardTimeRemaining(file: GalleryFile) {
+  if (file.expires_at_ms) {
+    return formatTimeRemaining(Math.max(0, Math.floor(file.expires_at_ms / 1000 - nowSeconds.value)))
+  }
   return file.expires_in_seconds !== null ? formatTimeRemaining(file.expires_in_seconds) : ''
 }
 
@@ -457,6 +475,8 @@ function galleryCardSignature(file: GalleryFile) {
     sizeLabel: formatSize(file.size),
     dimensions: formatDimensions(file),
     timeRemaining: galleryCardTimeRemaining(file),
+    genboxPushEnabled: genboxPushEnabled.value,
+    genboxBusy: genboxPushBusyPath.value === file.path,
   })
 }
 

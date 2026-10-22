@@ -138,7 +138,9 @@
                       <div class="studio-result-media studio-result-placeholder">
                         <Icon icon="lucide:loader-circle" class="h-5 w-5 animate-spin" />
                         <span>正在处理图片</span>
-                        <small>{{ message.imagePendingStageText }}</small>
+                        <small>
+                          {{ message.imagePendingStageText }}<template v-if="message.imagePendingElapsedText"> · {{ message.imagePendingElapsedText }}</template>
+                        </small>
                       </div>
                       <div v-if="message.imageSlotCount > 1" class="studio-result-caption">
                         <span>图片 {{ slot + 1 }}</span>
@@ -155,7 +157,7 @@
                 </div>
 
                 <div v-else class="studio-result-block">
-                  <div class="studio-result-grid" :class="{ 'is-single': message.assets.length <= 1 }">
+                  <div class="studio-result-grid" :class="{ 'is-single': message.assets.length + message.missingImageCount <= 1 }">
                     <div
                       v-for="(asset, assetIndex) in message.assets"
                       :key="`${message.id}-${assetIndex}`"
@@ -217,6 +219,20 @@
                         </div>
                       </div>
                     </div>
+                    <div
+                      v-for="slot in message.missingImageCount"
+                      :key="`${message.id}-missing-${slot}`"
+                      class="studio-result-item"
+                    >
+                      <div class="studio-result-media studio-result-placeholder is-missing">
+                        <Icon icon="lucide:image-off" class="h-5 w-5" />
+                        <span>未生成</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-if="message.partialImageNote" class="studio-image-status is-partial">
+                    <Icon icon="lucide:triangle-alert" class="h-4 w-4" />
+                    <span>{{ message.partialImageNote }}</span>
                   </div>
                 </div>
               </template>
@@ -263,7 +279,7 @@ import { hasStudioCodeContent } from '@/lib/studioMarkdownRenderer'
 import StudioMarkdownContent from './StudioMarkdownContent.vue'
 import type { StudioImageAssetView, StudioImageCompareSource, StudioMessage } from './types'
 
-export type StudioMessageActionKey = 'copy' | 'edit' | 'resend' | 'fill' | 'retry' | 'delete'
+export type StudioMessageActionKey = 'copy' | 'edit' | 'resend' | 'fill' | 'resume-poll' | 'retry' | 'delete'
 
 export interface StudioMessageAction {
   key: StudioMessageActionKey
@@ -282,6 +298,12 @@ export type StudioMessageView = StudioMessage & {
   imageSlotCount: number
   pendingSlots: number[]
   imagePendingStageText: string
+  /** 排队/生成已用时，如 "已用 12s"；未知时为空。 */
+  imagePendingElapsedText: string
+  /** 部分成功时没有生成的张数（请求 n 张、只产出若干张），用于渲染「未生成」占位。 */
+  missingImageCount: number
+  /** 部分成功提示，如 "部分成功：生成 1/2 张图片"；全部成功时为空。 */
+  partialImageNote: string
   primaryMessage: string
   imagePreviewStyle?: CSSProperties
   isCollapsible: boolean
@@ -312,6 +334,10 @@ function actionsForMessage(message: StudioMessageView): StudioMessageAction[] {
     if (message.content) actions.push({ key: 'edit', label: '编辑', icon: 'lucide:pencil' })
     actions.push({ key: 'resend', label: '重发', icon: 'lucide:refresh-cw' })
     if (message.content) actions.push({ key: 'fill', label: '填入', icon: 'lucide:clipboard-paste' })
+  } else if (message.mode === 'image' && message.task?.status === 'error' && message.task.can_resume_poll) {
+    // 轮询超时但上游可能仍在生成：可以继续等待，也可以重试。
+    actions.push({ key: 'resume-poll', label: '继续任务', icon: 'lucide:refresh-cw' })
+    actions.push({ key: 'retry', label: '重试', icon: 'lucide:undo-2' })
   } else if (message.mode !== 'image' || message.status === 'error') {
     actions.push({ key: 'retry', label: '重试', icon: 'lucide:refresh-cw' })
   }
@@ -1088,6 +1114,13 @@ function isCodeMessage(message: StudioMessageView) {
   line-height: 1.6;
 }
 
+.studio-image-status.is-partial {
+  min-height: 0;
+  margin-top: 0.5rem;
+  align-items: flex-start;
+  color: rgb(180 83 9);
+}
+
 .studio-image-status.is-error {
   align-items: flex-start;
   color: rgb(185 28 28);
@@ -1175,6 +1208,12 @@ function isCodeMessage(message: StudioMessageView) {
   flex-direction: column;
   gap: 0.625rem;
   text-align: center;
+}
+
+.studio-result-placeholder.is-missing {
+  border: 1px dashed hsl(var(--border));
+  background: hsl(var(--muted) / 0.35);
+  min-height: 6rem;
 }
 
 .studio-result-placeholder svg {

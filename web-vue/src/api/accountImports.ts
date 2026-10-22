@@ -29,6 +29,13 @@ export interface CPAImportJob {
   errors: Array<{ name: string; error: string }>
 }
 
+export interface ActiveRemoteImport {
+  source: 'cpa' | 'sub2api'
+  id: string
+  name: string
+  job: CPAImportJob
+}
+
 export interface CPAPool {
   id: string
   name: string
@@ -88,11 +95,19 @@ export const accountImportsApi = {
       { email_hint: emailHint },
     ),
 
-  finishOAuthLogin: (sessionId: string, callback: string) =>
-    apiClient.post<{ session_id: string; callback: string }, AccountMutationResponse>(
+  finishOAuthLogin: (sessionId: string, callback: string, targetGroupId?: string) =>
+    apiClient.post<Record<string, unknown>, AccountMutationResponse>(
       '/api/accounts/oauth/finish',
-      { session_id: sessionId, callback },
+      {
+        session_id: sessionId,
+        callback,
+        ...(targetGroupId !== undefined ? { target_group_id: targetGroupId } : {}),
+      },
     ),
+
+  /** 全局唯一进行中的远程导入（CPA / Sub2API）；没有则 active 为 null。 */
+  getActiveRemoteImport: () =>
+    apiClient.get<never, { active: ActiveRemoteImport | null }>('/api/accounts/remote-imports/active'),
 
   listCPAPools: () =>
     apiClient.get<never, { pools: CPAPool[] }>('/api/cpa/pools'),
@@ -119,10 +134,10 @@ export const accountImportsApi = {
       `/api/cpa/pools/${encodeURIComponent(poolId)}/files`,
     ),
 
-  startCPAImport: (poolId: string, names: string[]) =>
-    apiClient.post<{ names: string[] }, { import_job: CPAImportJob | null }>(
+  startCPAImport: (poolId: string, names: string[], targetGroupId?: string) =>
+    apiClient.post<Record<string, unknown>, { import_job: CPAImportJob | null }>(
       `/api/cpa/pools/${encodeURIComponent(poolId)}/import`,
-      { names },
+      { names, ...(targetGroupId !== undefined ? { target_group_id: targetGroupId } : {}) },
     ),
 
   getCPAImportJob: (poolId: string) =>
@@ -202,10 +217,16 @@ export const accountImportsApi = {
     options: {
       group_bindings?: Sub2APIImportGroupBinding[]
       create_account_groups?: boolean
+      target_group_id?: string
     } = {},
   ) =>
     apiClient.post<
-      { account_ids: string[]; group_bindings?: Sub2APIImportGroupBinding[]; create_account_groups?: boolean },
+      {
+        account_ids: string[]
+        group_bindings?: Sub2APIImportGroupBinding[]
+        create_account_groups?: boolean
+        target_group_id?: string
+      },
       { import_job: CPAImportJob | null }
     >(
       `/api/sub2api/servers/${encodeURIComponent(serverId)}/import`,

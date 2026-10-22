@@ -1,7 +1,10 @@
 import { computed, ref, watch } from 'vue'
+import { hasInvalidNumberSettings } from './useNumberSettingField'
 import { storeToRefs } from 'pinia'
 
 import {
+  getKnownSettingsRevision,
+  isSettingsRevisionConflict,
   prepareSettingsForEdit,
   prepareSettingsPatch,
   settingsApi,
@@ -41,8 +44,8 @@ function formatBytes(value: unknown): string {
 
 function cleanupRequest(settings: Settings): RetentionCleanupRequest {
   return {
-    log_retention_days: settings.log_retention_days,
-    image_retention_days: settings.image_retention_days,
+    log_retention_hours: settings.log_retention_hours,
+    image_retention_hours: settings.image_retention_hours,
   }
 }
 
@@ -64,8 +67,8 @@ function hasAccountCleanupTargets(result: AccountCleanupResult): boolean {
 function retentionCleanupMessage(result: RetentionCleanupResult): string {
   return [
     `按当前保留策略检测到 ${result.total_removed} 项可清理数据，预计释放 ${formatBytes(result.total_size_bytes)}。`,
-    `日志：${result.logs.removed || 0} 条，保留 ${result.logs.retention_days} 天。`,
-    `图片：${result.images.removed || 0} 个，保留 ${result.images.retention_days} 天。`,
+    `日志：${result.logs.removed || 0} 条，保留 ${result.logs.retention_hours} 小时。`,
+    `图片：${result.images.removed || 0} 个，保留 ${result.images.retention_hours} 小时。`,
     '是否立即删除这些过期数据？',
   ].join('\n')
 }
@@ -98,6 +101,8 @@ export function useSettingsConfigRuntime(options: SettingsConfigRuntimeOptions) 
   const activeSettingsTab = ref('basic')
   const isSaving = ref(false)
   const settingsLoadError = ref('')
+  // 设置已在别处被修改（保存 409，或页面重新可见时发现 revision 变化）：保留当前编辑，提示重新加载。
+  const revisionStale = ref(false)
 
   const settingsReloadQuery = usePageQuery({
     runtime: options.runtime,
@@ -143,7 +148,18 @@ export function useSettingsConfigRuntime(options: SettingsConfigRuntimeOptions) 
   async function persistSettings(showToast = false) {
     if (!localSettings.value) return null
     const payload = prepareSettingsPatch(localSettings.value, savedSettingsBaseline.value)
-    const result = await settingsStore.updateSettingsPatch(payload)
+    let result
+    try {
+      result = await settingsStore.updateSettingsPatch(payload)
+    } catch (error) {
+      if (isSettingsRevisionConflict(error)) {
+        revisionStale.value = true
+        toast.warning('设置已在别处被修改，当前编辑已保留；请点击“重新加载”获取最新设置后再保存')
+        return null
+      }
+      throw error
+    }
+    revisionStale.value = false
     if (result.config) applySettings(result.config, false)
     await options.afterSave?.()
     if (showToast) toast.success('设置保存成功')
@@ -222,8 +238,32 @@ export function useSettingsConfigRuntime(options: SettingsConfigRuntimeOptions) 
     )
   }
 
+  // 丢弃本地编辑并重新加载最新设置（冲突提示里的“重新加载”）。
+  async function reloadDiscardingEdits() {
+    await reloadSettings()
+    if (settingsStore.settings) applySettings(settingsStore.settings, false)
+    revisionStale.value = false
+  }
+
+  // 页面从隐藏回到可见：对比服务端 revision，变化则提示重载（不打断未保存的编辑）。
+  async function checkRevisionStale() {
+    const known = getKnownSettingsRevision()
+    if (known === null || revisionStale.value) return
+    try {
+      const latest = await settingsApi.fetchRevision()
+      if (Number.isFinite(latest) && latest !== known) revisionStale.value = true
+    } catch {
+      // 检查失败不打扰用户
+    }
+  }
+
   async function handleSave() {
     if (!localSettings.value) return
+    // 数值输入存在非法项时不保存（按钮也已禁用，这里兜底快捷触发）。
+    if (hasInvalidNumberSettings.value) {
+      toast.warning('有数值设置超出范围，请先修正标红的输入')
+      return
+    }
     const confirmed = await confirmDialog.ask({
       title: '确认保存系统设置',
       message: '即将保存当前系统设置，可能影响接口地址、并发、存储和备份策略。是否继续？',
@@ -234,13 +274,62 @@ export function useSettingsConfigRuntime(options: SettingsConfigRuntimeOptions) 
 
     isSaving.value = true
     try {
-      await persistSettings(true)
+      const saved = await persistSettings(true)
+      if (!saved) return
       await offerAccountCleanup()
       await offerRetentionCleanup()
     } catch (error) {
       toast.error(errorMessage(error, '保存失败'))
     } finally {
       isSaving.value = false
+    }
+  }
+
+  // 设置页“清理预览 / 立即清理”按钮：使用已保存的保留策略，不依赖保存流程。
+  const cleanupBusy = ref<'' | 'preview' | 'run'>('')
+
+  async function previewCleanupNow() {
+    if (!requireSavedSettings('预览清理')) return
+    if (!localSettings.value) return
+    cleanupBusy.value = 'preview'
+    try {
+      const preview = await settingsApi.previewRetentionCleanup(cleanupRequest(localSettings.value))
+      if (!hasRetentionCleanupTargets(preview)) {
+        toast.success('当前没有超过保留期的日志或图片')
+      } else {
+        toast.info(retentionCleanupMessage(preview).split('\n').slice(0, 3).join(' '))
+      }
+    } catch (error) {
+      toast.error(`清理预览失败：${errorMessage(error, '无法检测日志和图片清理项')}`)
+    } finally {
+      cleanupBusy.value = ''
+    }
+  }
+
+  async function runCleanupNow() {
+    if (!requireSavedSettings('立即清理')) return
+    if (!localSettings.value) return
+    cleanupBusy.value = 'run'
+    try {
+      const payload = cleanupRequest(localSettings.value)
+      const preview = await settingsApi.previewRetentionCleanup(payload)
+      if (!hasRetentionCleanupTargets(preview)) {
+        toast.success('当前没有超过保留期的日志或图片')
+        return
+      }
+      const confirmed = await confirmDialog.ask({
+        title: '立即清理过期数据',
+        message: retentionCleanupMessage(preview),
+        confirmText: '立即清理',
+        cancelText: '取消',
+      })
+      if (!confirmed) return
+      const result = await settingsApi.runRetentionCleanup(payload)
+      toast.success(cleanupDoneMessage(result))
+    } catch (error) {
+      toast.error(`清理失败：${errorMessage(error, '无法删除过期日志和图片')}`)
+    } finally {
+      cleanupBusy.value = ''
     }
   }
 
@@ -257,10 +346,16 @@ export function useSettingsConfigRuntime(options: SettingsConfigRuntimeOptions) 
     isSaving,
     settingsLoadError,
     hasUnsavedSettings,
+    revisionStale,
+    reloadDiscardingEdits,
+    checkRevisionStale,
     requireSavedSettings,
     persistSettings,
     reloadSettings,
     handleSave,
+    cleanupBusy,
+    previewCleanupNow,
+    runCleanupNow,
     invalidate,
   }
 }

@@ -1,4 +1,4 @@
-import apiClient from './client'
+import apiClient, { setConsoleRequestTimeoutSecs } from './client'
 import type { ImageErrorMessages, ProxyRuntimeSettings, Settings, SettingsUpdateResponse } from '@/types/api'
 
 export type RawSettings = Record<string, any>
@@ -22,15 +22,15 @@ export interface ImageStorageSyncResult {
 }
 
 export interface RetentionCleanupRequest {
-  log_retention_days?: number
-  image_retention_days?: number
+  log_retention_hours?: number
+  image_retention_hours?: number
 }
 
 export interface RetentionCleanupSection {
   removed: number
   kept?: number
   removed_size_bytes: number
-  retention_days: number
+  retention_hours: number
   dry_run: boolean
 }
 
@@ -104,13 +104,40 @@ const SETTINGS_SAVE_KEYS = [
   'proxy_runtime',
   'base_url',
   'refresh_account_interval_minute',
-  'image_retention_days',
-  'log_retention_days',
+  'image_retention_hours',
+  'log_retention_hours',
+  'image_min_free_mb',
   'image_poll_timeout_secs',
   'image_stream_timeout_secs',
+  'console_request_timeout_secs',
+  'image_queue_limit',
+  'account_processing_concurrency',
   'image_poll_interval_secs',
   'image_poll_initial_wait_secs',
   'image_account_concurrency',
+  'image_account_cooldown_secs',
+  'image_preflight_fresh_secs',
+  'image_account_retry_enabled',
+  'image_max_account_attempts',
+  'image_stream_post_tool_wait_secs',
+  'image_poll_adaptive',
+  'image_warm_enabled',
+  'chat_sentinel_vm_enabled',
+  'chat_temporary_mode',
+  'image_stream_direct_resolve',
+  'image_drop_extra_variants',
+  'image_upscale_enabled',
+  'image_upscale_engine',
+  'account_auto_pause_strikes',
+  'account_auto_pause_hours',
+  'new_account_cooldown_hours',
+  'new_account_ramp_days',
+  'new_account_ramp_daily_images',
+  'text_account_concurrency',
+  'account_failure_cooldown_secs',
+  'account_relogin_enabled',
+  'account_relogin_interval_secs',
+  'account_relogin_concurrency',
   'image_parallel_generation',
   'image_remove_conversation_after_result',
   'image_error_friendly_enabled',
@@ -129,6 +156,7 @@ const SETTINGS_SAVE_KEYS = [
   'quota_limits',
   'runtime_capacity',
   'image_storage',
+  'genbox_push',
   'backup',
   'chat_completion_cache',
   'third_party_apps',
@@ -138,10 +166,17 @@ function cleanString(value: unknown): string {
   return String(value || '').trim()
 }
 
-function numberValue(value: unknown, fallback: number, min?: number) {
+function numberValue(value: unknown, fallback: number, min?: number, max?: number) {
   const parsed = Number(value)
   const next = Number.isFinite(parsed) ? parsed : fallback
-  return typeof min === 'number' ? Math.max(min, next) : next
+  const lowered = typeof min === 'number' ? Math.max(min, next) : next
+  return typeof max === 'number' ? Math.min(max, lowered) : lowered
+}
+
+// 旧版保留期单位是天，新版是小时；仅用于读取旧配置时换算。
+function legacyDaysToHours(days: unknown): number | undefined {
+  const parsed = Number(days)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed * 24 : undefined
 }
 
 function boolValue(value: unknown, fallback: boolean) {
@@ -153,6 +188,53 @@ function boolValue(value: unknown, fallback: boolean) {
   }
   if (value == null) return fallback
   return Boolean(value)
+}
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number) {
+  return Math.min(max, numberValue(value, fallback, min))
+}
+
+type PoolTuning = Pick<Settings,
+  | 'image_account_cooldown_secs' | 'image_preflight_fresh_secs'
+  | 'image_account_retry_enabled' | 'image_max_account_attempts'
+  | 'image_stream_post_tool_wait_secs' | 'image_poll_adaptive' | 'image_warm_enabled'
+  | 'chat_sentinel_vm_enabled' | 'chat_temporary_mode' | 'image_stream_direct_resolve' | 'image_drop_extra_variants'
+  | 'image_upscale_enabled' | 'image_upscale_engine' | 'account_auto_pause_strikes' | 'account_auto_pause_hours' | 'account_relogin_enabled'
+  | 'account_relogin_interval_secs' | 'account_relogin_concurrency'
+  | 'new_account_cooldown_hours' | 'new_account_ramp_days' | 'new_account_ramp_daily_images'
+  | 'text_account_concurrency' | 'account_failure_cooldown_secs'
+  | 'console_request_timeout_secs' | 'image_queue_limit' | 'account_processing_concurrency'>
+
+// Defaults and ranges mirror services/config.py.
+function normalizePoolTuning(source: RawSettings): Required<PoolTuning> {
+  return {
+    image_account_cooldown_secs: clampNumber(source.image_account_cooldown_secs, 0, 0, 600),
+    image_preflight_fresh_secs: clampNumber(source.image_preflight_fresh_secs, 600, 0, 3600),
+    image_account_retry_enabled: boolValue(source.image_account_retry_enabled, true),
+    image_max_account_attempts: clampNumber(source.image_max_account_attempts, 4, 1, 10),
+    image_stream_post_tool_wait_secs: clampNumber(source.image_stream_post_tool_wait_secs, 45, 0, 120),
+    image_poll_adaptive: boolValue(source.image_poll_adaptive, true),
+    image_warm_enabled: boolValue(source.image_warm_enabled, true),
+    chat_sentinel_vm_enabled: boolValue(source.chat_sentinel_vm_enabled, false),
+    chat_temporary_mode: boolValue(source.chat_temporary_mode, true),
+    image_stream_direct_resolve: boolValue(source.image_stream_direct_resolve, true),
+    image_drop_extra_variants: boolValue(source.image_drop_extra_variants, true),
+    image_upscale_enabled: boolValue(source.image_upscale_enabled, false),
+    image_upscale_engine: cleanString(source.image_upscale_engine) === 'sharp_lanczos3' ? 'sharp_lanczos3' : 'pillow_lanczos',
+    account_auto_pause_strikes: clampNumber(source.account_auto_pause_strikes, 3, 0, 20),
+    account_auto_pause_hours: clampNumber(source.account_auto_pause_hours, 6, 1, 72),
+    new_account_cooldown_hours: clampNumber(source.new_account_cooldown_hours, 12, 0, 168),
+    new_account_ramp_days: clampNumber(source.new_account_ramp_days, 3, 0, 30),
+    new_account_ramp_daily_images: clampNumber(source.new_account_ramp_daily_images, 5, 1, 200),
+    text_account_concurrency: clampNumber(source.text_account_concurrency, 3, 1, 20),
+    account_failure_cooldown_secs: clampNumber(source.account_failure_cooldown_secs, 300, 0, 3600),
+    account_relogin_enabled: boolValue(source.account_relogin_enabled, false),
+    account_relogin_interval_secs: clampNumber(source.account_relogin_interval_secs, 300, 60, 3600),
+    account_relogin_concurrency: clampNumber(source.account_relogin_concurrency, 1, 1, 4),
+    console_request_timeout_secs: clampNumber(source.console_request_timeout_secs, 600, 30, 3600),
+    image_queue_limit: clampNumber(source.image_queue_limit, 0, 0, 10000),
+    account_processing_concurrency: clampNumber(source.account_processing_concurrency, 30, 1, 100),
+  }
 }
 
 function cloneRawSettings<T>(value: T | null | undefined): RawSettings {
@@ -198,6 +280,10 @@ export function normalizeProxyRuntime(raw: unknown): ProxyRuntimeSettings {
     resource_proxy_url: cleanString(source.resource_proxy_url),
     skip_ssl_verify: boolValue(source.skip_ssl_verify, false),
     reset_session_status_codes: statusCodes.length ? Array.from(new Set(statusCodes)) : [403],
+    timezone: cleanString(source.timezone),
+    language: cleanString(source.language),
+    node_fail_threshold: Math.min(20, numberValue(source.node_fail_threshold, 1, 1)),
+    node_cooldown_sec: Math.min(86400, numberValue(source.node_cooldown_sec, 600, 10)),
     clearance: {
       enabled: boolValue(clearance.enabled, false),
       mode: ['manual', 'flaresolverr'].includes(clearanceMode) ? clearanceMode as ProxyRuntimeSettings['clearance']['mode'] : 'none',
@@ -211,6 +297,9 @@ export function normalizeProxyRuntime(raw: unknown): ProxyRuntimeSettings {
       timeout_sec: numberValue(clearance.timeout_sec, 60, 1),
       refresh_interval: numberValue(clearance.refresh_interval, 3600, 60),
       warm_up_on_start: boolValue(clearance.warm_up_on_start, false),
+      max_sessions: Math.min(16, numberValue(clearance.max_sessions, 4, 1)),
+      session_idle_sec: numberValue(clearance.session_idle_sec, 600, 30),
+      early_refresh_ratio: Math.min(0.95, numberValue(clearance.early_refresh_ratio, 0.8, 0.1)),
     },
   }
 }
@@ -231,6 +320,7 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
   const imageStorage = source.image_storage && typeof source.image_storage === 'object' ? source.image_storage : {}
   const aiReview = source.ai_review && typeof source.ai_review === 'object' ? source.ai_review : {}
   const backup = source.backup && typeof source.backup === 'object' ? source.backup : {}
+  const genboxPush = source.genbox_push && typeof source.genbox_push === 'object' ? source.genbox_push : {}
   const backupInclude = backup.include && typeof backup.include === 'object' ? backup.include : {}
   const thirdPartyApps = normalizeThirdPartyApps(source.third_party_apps)
   const proxyRuntime = normalizeProxyRuntime(source.proxy_runtime)
@@ -241,21 +331,23 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
     fallback_proxy: cleanString(source.fallback_proxy),
     proxy_runtime: proxyRuntime,
     base_url: cleanString(source.base_url ?? basic.base_url),
-    refresh_account_interval_minute: numberValue(source.refresh_account_interval_minute, 5, 1),
-    image_retention_days: numberValue(source.image_retention_days ?? basic.image_expire_hours, 15, 1),
-    log_retention_days: numberValue(source.log_retention_days, 30, 1),
+    refresh_account_interval_minute: numberValue(source.refresh_account_interval_minute, 5, 1, 10080),
+    image_retention_hours: numberValue(source.image_retention_hours ?? legacyDaysToHours(source.image_retention_days ?? basic.image_expire_hours), 720, 1),
+    log_retention_hours: numberValue(source.log_retention_hours ?? legacyDaysToHours(source.log_retention_days), 720, 1),
+    image_min_free_mb: numberValue(source.image_min_free_mb, 500, 0),
     image_poll_timeout_secs: numberValue(source.image_poll_timeout_secs, 120, 1),
     image_stream_timeout_secs: numberValue(source.image_stream_timeout_secs, 300, 1),
-    image_poll_interval_secs: numberValue(source.image_poll_interval_secs, 10, 0.5),
-    image_poll_initial_wait_secs: numberValue(source.image_poll_initial_wait_secs, 10, 0),
-    image_account_concurrency: numberValue(source.image_account_concurrency, 3, 1),
+    image_poll_interval_secs: numberValue(source.image_poll_interval_secs, 2, 0.5, 60),
+    image_poll_initial_wait_secs: numberValue(source.image_poll_initial_wait_secs, 1, 0, 60),
+    image_account_concurrency: clampNumber(source.image_account_concurrency, 1, 1, 3),
+    ...normalizePoolTuning(source),
     image_parallel_generation: boolValue(source.image_parallel_generation, true),
     image_remove_conversation_after_result: boolValue(source.image_remove_conversation_after_result, false),
     image_error_friendly_enabled: boolValue(source.image_error_friendly_enabled, false),
     image_error_messages: normalizeImageErrorMessages(source.image_error_messages),
     image_settle_enabled: boolValue(source.image_settle_enabled, true),
     image_check_before_hit_enabled: boolValue(source.image_check_before_hit_enabled, true),
-    image_settle_secs: numberValue(source.image_settle_secs, 5, 0.5),
+    image_settle_secs: numberValue(source.image_settle_secs, 1.5, 0.5),
     image_timeout_retry_secs: numberValue(source.image_timeout_retry_secs, 30, 1),
     auto_remove_invalid_accounts: boolValue(source.auto_remove_invalid_accounts, false),
     auto_remove_rate_limited_accounts: boolValue(source.auto_remove_rate_limited_accounts, false),
@@ -270,6 +362,8 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
       enabled: boolValue(aiReview.enabled, false),
       base_url: cleanString(aiReview.base_url),
       api_key: cleanString(aiReview.api_key),
+      has_api_key: boolValue(aiReview.has_api_key, false),
+      clear_api_key: boolValue(aiReview.clear_api_key, false),
       model: cleanString(aiReview.model),
       prompt: cleanString(aiReview.prompt),
     },
@@ -278,7 +372,8 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
       api_key: cleanString(basic.api_key),
       base_url: cleanString(source.base_url ?? basic.base_url),
       proxy: cleanString(source.proxy ?? basic.proxy),
-      image_expire_hours: numberValue(source.image_retention_days ?? basic.image_expire_hours, 15, 1),
+      // 历史字段（实际单位为天），仅为兼容旧后端保留。
+      image_expire_hours: Math.max(1, Math.ceil(numberValue(source.image_retention_hours ?? legacyDaysToHours(source.image_retention_days ?? basic.image_expire_hours), 720, 1) / 24)),
     },
     image_generation: {
       enabled: boolValue(source.image_generation?.enabled, true),
@@ -312,8 +407,20 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
       webdav_url: cleanString(imageStorage.webdav_url),
       webdav_username: cleanString(imageStorage.webdav_username),
       webdav_password: cleanString(imageStorage.webdav_password),
+      has_webdav_password: boolValue(imageStorage.has_webdav_password, false),
+      clear_webdav_password: boolValue(imageStorage.clear_webdav_password, false),
       webdav_root_path: cleanString(imageStorage.webdav_root_path) || 'chatgpt2api/images',
       public_base_url: cleanString(imageStorage.public_base_url),
+    },
+    genbox_push: {
+      enabled: boolValue(genboxPush.enabled, false),
+      base_url: cleanString(genboxPush.base_url),
+      source_id: cleanString(genboxPush.source_id),
+      push_key: cleanString(genboxPush.push_key),
+      has_push_key: boolValue(genboxPush.has_push_key, false),
+      clear_push_key: boolValue(genboxPush.clear_push_key, false),
+      timeout_secs: clampNumber(genboxPush.timeout_secs, 20, 5, 120),
+      auto_push_after_studio: boolValue(genboxPush.auto_push_after_studio, false),
     },
     backup: {
       enabled: boolValue(backup.enabled, false),
@@ -321,12 +428,16 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
       account_id: cleanString(backup.account_id),
       access_key_id: cleanString(backup.access_key_id),
       secret_access_key: cleanString(backup.secret_access_key),
+      has_secret_access_key: boolValue(backup.has_secret_access_key, false),
+      clear_secret_access_key: boolValue(backup.clear_secret_access_key, false),
       bucket: cleanString(backup.bucket),
       prefix: cleanString(backup.prefix) || 'backups',
       interval_minutes: numberValue(backup.interval_minutes, 1440, 1),
       rotation_keep: numberValue(backup.rotation_keep, 10, 0),
       encrypt: boolValue(backup.encrypt, false),
       passphrase: cleanString(backup.passphrase),
+      has_passphrase: boolValue(backup.has_passphrase, false),
+      clear_passphrase: boolValue(backup.clear_passphrase, false),
       include: {
         config: boolValue(backupInclude.config, true),
         register: boolValue(backupInclude.register, true),
@@ -335,6 +446,7 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
         logs: boolValue(backupInclude.logs, true),
         dashboard_metrics: boolValue(backupInclude.dashboard_metrics, true),
         image_tasks: boolValue(backupInclude.image_tasks, true),
+        editable_files: boolValue(backupInclude.editable_files, true),
         accounts_snapshot: boolValue(backupInclude.accounts_snapshot, true),
         auth_keys_snapshot: boolValue(backupInclude.auth_keys_snapshot, true),
         images: boolValue(backupInclude.images, false),
@@ -363,19 +475,20 @@ function toBackendSettings(settings: Settings): RawSettings {
     fallback_proxy: cleanString(normalized.fallback_proxy),
     proxy_runtime: normalizeProxyRuntime(normalized.proxy_runtime),
     base_url: cleanString(normalized.base_url),
-    refresh_account_interval_minute: numberValue(normalized.refresh_account_interval_minute, 5, 1),
+    refresh_account_interval_minute: numberValue(normalized.refresh_account_interval_minute, 5, 1, 10080),
     image_poll_timeout_secs: numberValue(normalized.image_poll_timeout_secs, 120, 1),
     image_stream_timeout_secs: numberValue(normalized.image_stream_timeout_secs, 300, 1),
-    image_poll_interval_secs: numberValue(normalized.image_poll_interval_secs, 10, 0.5),
-    image_poll_initial_wait_secs: numberValue(normalized.image_poll_initial_wait_secs, 10, 0),
-    image_account_concurrency: numberValue(normalized.image_account_concurrency, 3, 1),
+    image_poll_interval_secs: numberValue(normalized.image_poll_interval_secs, 2, 0.5, 60),
+    image_poll_initial_wait_secs: numberValue(normalized.image_poll_initial_wait_secs, 1, 0, 60),
+    image_account_concurrency: clampNumber(normalized.image_account_concurrency, 1, 1, 3),
+    ...normalizePoolTuning(normalized),
     image_parallel_generation: boolValue(normalized.image_parallel_generation, true),
     image_remove_conversation_after_result: boolValue(normalized.image_remove_conversation_after_result, false),
     image_error_friendly_enabled: boolValue(normalized.image_error_friendly_enabled, false),
     image_error_messages: cloneRawSettings(normalized.image_error_messages),
     image_settle_enabled: boolValue(normalized.image_settle_enabled, true),
     image_check_before_hit_enabled: boolValue(normalized.image_check_before_hit_enabled, true),
-    image_settle_secs: numberValue(normalized.image_settle_secs, 5, 0.5),
+    image_settle_secs: numberValue(normalized.image_settle_secs, 1.5, 0.5),
     image_timeout_retry_secs: numberValue(normalized.image_timeout_retry_secs, 30, 1),
     auto_remove_invalid_accounts: boolValue(normalized.auto_remove_invalid_accounts, false),
     auto_remove_rate_limited_accounts: boolValue(normalized.auto_remove_rate_limited_accounts, false),
@@ -387,20 +500,23 @@ function toBackendSettings(settings: Settings): RawSettings {
     quota_limits: cloneRawSettings(normalized.quota_limits),
     runtime_capacity: cloneRawSettings(normalized.runtime_capacity),
     image_storage: cloneRawSettings(normalized.image_storage),
+    genbox_push: {
+      enabled: boolValue(normalized.genbox_push?.enabled, false),
+      base_url: cleanString(normalized.genbox_push?.base_url),
+      source_id: cleanString(normalized.genbox_push?.source_id),
+      // 空串表示沿用服务端已保存的密钥；只有填写新值或勾选清除时才会改动。
+      push_key: cleanString(normalized.genbox_push?.push_key),
+      clear_push_key: boolValue(normalized.genbox_push?.clear_push_key, false),
+      timeout_secs: clampNumber(normalized.genbox_push?.timeout_secs, 20, 5, 120),
+      auto_push_after_studio: boolValue(normalized.genbox_push?.auto_push_after_studio, false),
+    },
     backup: cloneRawSettings(normalized.backup),
     chat_completion_cache: cloneRawSettings(normalized.chat_completion_cache),
     third_party_apps: cloneRawSettings(normalized.third_party_apps),
   }
-  payload.image_retention_days = numberValue(
-    normalized.image_retention_days,
-    15,
-    1,
-  )
-  payload.log_retention_days = numberValue(
-    normalized.log_retention_days,
-    30,
-    1,
-  )
+  payload.image_retention_hours = numberValue(normalized.image_retention_hours, 720, 1)
+  payload.log_retention_hours = numberValue(normalized.log_retention_hours, 720, 1)
+  payload.image_min_free_mb = numberValue(normalized.image_min_free_mb, 500, 0)
   return payload
 }
 
@@ -419,31 +535,86 @@ export function prepareSettingsPatch(settings: Settings, baseline?: Settings | n
   )
 }
 
+// 设置乐观并发：最近一次读取/保存拿到的服务端 revision，保存时回传，服务端发现已被他处修改则返回 409。
+let knownSettingsRevision: number | null = null
+let lastReadOnlyFields: Record<string, SettingsReadOnlyField> = {}
+
+export type SettingsReadOnlyField = { source: string; env?: string; message?: string }
+
+function rememberRevision(value: unknown) {
+  const revision = Number(value)
+  if (Number.isFinite(revision) && revision >= 0) knownSettingsRevision = revision
+}
+
+export function getKnownSettingsRevision() {
+  return knownSettingsRevision
+}
+
+export function isSettingsRevisionConflict(error: unknown): boolean {
+  const failure = error as { status?: number; data?: { detail?: { code?: string } } } | null
+  return failure?.status === 409 && failure?.data?.detail?.code === 'settings_revision_conflict'
+}
+
+function withRevision<T extends RawSettings>(payload: T): T {
+  return knownSettingsRevision === null ? payload : { ...payload, revision: knownSettingsRevision }
+}
+
 export const settingsApi = {
   async get() {
-    const response = await apiClient.get<never, { config: RawSettings }>('/api/settings')
-    return normalizeSettings(response.config)
+    const response = await apiClient.get<never, { config: RawSettings; revision?: number; read_only?: Record<string, SettingsReadOnlyField> }>('/api/settings')
+    const settings = normalizeSettings(response.config)
+    rememberRevision(response.revision)
+    lastReadOnlyFields = response.read_only || {}
+    setConsoleRequestTimeoutSecs(settings.console_request_timeout_secs)
+    return settings
+  },
+  async fetchRevision() {
+    const response = await apiClient.get<never, { revision: number }>('/api/settings/revision')
+    return Number(response.revision)
+  },
+  getReadOnlyFields() {
+    return lastReadOnlyFields
   },
   async getThirdPartyApps() {
-    const response = await apiClient.get<never, { third_party_apps: RawSettings }>('/api/third-party-apps')
+    const response = await apiClient.get<never, { third_party_apps: RawSettings; console_request_timeout_secs?: number }>('/api/third-party-apps')
+    if (response.console_request_timeout_secs !== undefined) {
+      setConsoleRequestTimeoutSecs(response.console_request_timeout_secs)
+    }
     return normalizeThirdPartyApps(response.third_party_apps)
   },
 
+  async getPublicRuntime() {
+    const response = await apiClient.get<never, { third_party_apps: RawSettings; api_base_url?: string; console_request_timeout_secs?: number }>('/api/third-party-apps')
+    if (response.console_request_timeout_secs !== undefined) {
+      setConsoleRequestTimeoutSecs(response.console_request_timeout_secs)
+    }
+    return {
+      thirdPartyApps: normalizeThirdPartyApps(response.third_party_apps),
+      apiBaseUrl: cleanString(response.api_base_url),
+    }
+  },
+
   async update(settings: Settings): Promise<SettingsUpdateResponse> {
-    const response = await apiClient.post<RawSettings, { config: RawSettings }>('/api/settings', toBackendSettings(settings))
+    const response = await apiClient.post<RawSettings, { config: RawSettings; revision?: number }>('/api/settings', withRevision(toBackendSettings(settings)))
+    rememberRevision(response.revision)
+    const saved = normalizeSettings(response.config)
+    setConsoleRequestTimeoutSecs(saved.console_request_timeout_secs)
     return {
       status: 'ok',
       message: 'saved',
-      config: normalizeSettings(response.config),
+      config: saved,
     }
   },
 
   async updatePartial(payload: RawSettings): Promise<SettingsUpdateResponse> {
-    const response = await apiClient.post<RawSettings, { config: RawSettings }>('/api/settings', cloneRawSettings(payload))
+    const response = await apiClient.post<RawSettings, { config: RawSettings; revision?: number }>('/api/settings', withRevision(cloneRawSettings(payload)))
+    rememberRevision(response.revision)
+    const saved = normalizeSettings(response.config)
+    setConsoleRequestTimeoutSecs(saved.console_request_timeout_secs)
     return {
       status: 'ok',
       message: 'saved',
-      config: normalizeSettings(response.config),
+      config: saved,
     }
   },
 

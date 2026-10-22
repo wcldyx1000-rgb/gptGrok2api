@@ -14,6 +14,19 @@
       <p v-if="runtimeStatus?.cached_clearance_hosts?.length" class="mt-2 break-all text-xs text-muted-foreground">
         已缓存：{{ runtimeStatus.cached_clearance_hosts.join(' / ') }}
       </p>
+      <p v-if="runtimeStatus?.flaresolverr_sessions" class="mt-1 text-xs text-muted-foreground">
+        FlareSolverr 复用会话：{{ runtimeStatus.flaresolverr_sessions }} 个
+      </p>
+      <div v-if="runtimeStatus?.disabled_proxy_nodes?.length" class="mt-2 space-y-1 text-xs">
+        <p class="text-amber-600">临时停用的出口（冷却后自动恢复）：</p>
+        <p
+          v-for="node in runtimeStatus.disabled_proxy_nodes"
+          :key="node.proxy"
+          class="break-all font-mono text-muted-foreground"
+        >
+          {{ node.proxy }} · 剩余 {{ Math.ceil(node.remaining_sec / 60) }} 分钟<span v-if="node.last_error"> · {{ node.last_error }}</span>
+        </p>
+      </div>
     </div>
 
     <div class="settings-check-grid">
@@ -87,6 +100,44 @@
         />
       </FormField>
 
+      <FormField label="默认出口时区">
+        <template #label-extra>
+          <HelpTip text="未单独配置时区/语言的出口（含直连）使用的 IANA 时区，应与服务器出口 IP 所在地一致；与语言同时填写才生效，留空沿用 Asia/Shanghai。" />
+        </template>
+        <Input
+          v-model.trim="proxyRuntime.timezone"
+          block
+          root-class="font-mono"
+          placeholder="如 America/New_York"
+        />
+      </FormField>
+
+      <FormField label="默认出口语言">
+        <template #label-extra>
+          <HelpTip text="BCP 47 语言标签，用于 Accept-Language、OAI-Language 和 pow/sentinel 环境；与时区同时填写才生效，留空沿用 zh-CN。" />
+        </template>
+        <Input
+          v-model.trim="proxyRuntime.language"
+          block
+          root-class="font-mono"
+          placeholder="如 en-US"
+        />
+      </FormField>
+
+      <FormField label="出口失败停用阈值">
+        <template #label-extra>
+          <HelpTip text="代理组里的节点连续失败达到这个次数后临时停用（不再被选中），整组都停用时照常选。只影响运行时选择，不改动代理配置。1–20，默认 1。" />
+        </template>
+        <SettingsNumberInput :field="nodeFailThresholdField" />
+      </FormField>
+
+      <FormField label="出口停用时长">
+        <template #label-extra>
+          <HelpTip text="单位秒，最小 10；停用到期后节点自动恢复参与选择。默认 600。" />
+        </template>
+        <SettingsNumberInput :field="nodeCooldownField" />
+      </FormField>
+
       <FormField
         v-if="proxyRuntime.clearance.mode === 'flaresolverr'"
         label="FlareSolverr URL"
@@ -137,27 +188,38 @@
         <template #label-extra>
           <HelpTip text="单位秒。" />
         </template>
-        <Input
-          :model-value="clearanceTimeoutField.input.value"
-          type="number"
-          block
-          placeholder="60"
-          @update:model-value="clearanceTimeoutField.update"
-        />
+        <SettingsNumberInput :field="clearanceTimeoutField" />
       </FormField>
 
       <FormField label="缓存刷新间隔">
         <template #label-extra>
           <HelpTip text="单位秒，最小 60。" />
         </template>
-        <Input
-          :model-value="clearanceRefreshIntervalField.input.value"
-          type="number"
-          block
-          placeholder="3600"
-          @update:model-value="clearanceRefreshIntervalField.update"
-        />
+        <SettingsNumberInput :field="clearanceRefreshIntervalField" />
       </FormField>
+
+      <template v-if="proxyRuntime.clearance.mode === 'flaresolverr'">
+        <FormField label="提前续期比例">
+          <template #label-extra>
+            <HelpTip text="凭证用掉这个比例的有效期（以缓存刷新间隔计）后在后台换新，请求不用原地等清障。0.1–0.95，默认 0.8。" />
+          </template>
+          <SettingsNumberInput :field="earlyRefreshRatioField" />
+        </FormField>
+
+        <FormField label="FlareSolverr 会话上限">
+          <template #label-extra>
+            <HelpTip text="每个出口复用一个常驻浏览器会话，再次过验证不用冷启动；每个会话约占数百 MB 内存。1–16，默认 4。" />
+          </template>
+          <SettingsNumberInput :field="maxSessionsField" />
+        </FormField>
+
+        <FormField label="会话空闲回收">
+          <template #label-extra>
+            <HelpTip text="单位秒，最小 30；会话空闲超过这个时间自动关闭释放内存。" />
+          </template>
+          <SettingsNumberInput :field="sessionIdleField" />
+        </FormField>
+      </template>
 
       <FormField label="测试目标" class="md:col-span-2">
         <div class="flex flex-col gap-2 sm:flex-row">
@@ -202,6 +264,7 @@
 </template>
 
 <script setup lang="ts">
+import SettingsNumberInput from './SettingsNumberInput.vue'
 import { computed } from 'vue'
 import { Button, Checkbox, FormField, FormSection, HelpTip, Input } from 'nanocat-ui'
 import type { ClearanceTestResult, ProxyRuntimeStatus, Settings } from '@/types/api'
@@ -211,7 +274,7 @@ import {
   proxyClearanceModeOptions,
   proxyRuntimeEgressOptions,
 } from '@/views/settings/settingsView'
-import type { NumberSettingField } from '@/views/settings/useNumberSettingField'
+import { useNumberSettingField, type NumberSettingField } from '@/views/settings/useNumberSettingField'
 
 const props = defineProps<{
   settings: Settings
@@ -233,6 +296,32 @@ defineEmits<{
 
 const proxyRuntime = computed(() => props.settings.proxy_runtime)
 const summaryItems = computed(() => buildProxyRuntimeSummaryItems(props.runtimeStatus))
+
+const earlyRefreshRatioField = useNumberSettingField(
+  () => proxyRuntime.value.clearance.early_refresh_ratio ?? 0.8,
+  (value) => { proxyRuntime.value.clearance.early_refresh_ratio = value },
+  { min: 0.1, max: 0.95, fallback: 0.8 },
+)
+const maxSessionsField = useNumberSettingField(
+  () => proxyRuntime.value.clearance.max_sessions ?? 4,
+  (value) => { proxyRuntime.value.clearance.max_sessions = value },
+  { integer: true, min: 1, max: 16, fallback: 4 },
+)
+const sessionIdleField = useNumberSettingField(
+  () => proxyRuntime.value.clearance.session_idle_sec ?? 600,
+  (value) => { proxyRuntime.value.clearance.session_idle_sec = value },
+  { integer: true, min: 30, fallback: 600 },
+)
+const nodeFailThresholdField = useNumberSettingField(
+  () => proxyRuntime.value.node_fail_threshold ?? 1,
+  (value) => { proxyRuntime.value.node_fail_threshold = value },
+  { integer: true, min: 1, max: 20, fallback: 1 },
+)
+const nodeCooldownField = useNumberSettingField(
+  () => proxyRuntime.value.node_cooldown_sec ?? 600,
+  (value) => { proxyRuntime.value.node_cooldown_sec = value },
+  { integer: true, min: 10, max: 86400, fallback: 600 },
+)
 </script>
 
 <style scoped>

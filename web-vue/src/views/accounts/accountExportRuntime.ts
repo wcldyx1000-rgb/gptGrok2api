@@ -6,7 +6,7 @@ import { useToast } from '@/composables/useToast'
 import { saveBlob } from '@/lib/downloads'
 
 type AccountExportScope = 'selected' | 'all' | 'auto'
-export type AccountExportFormat = 'cpa' | 'sub2api' | 'agent_identity'
+export type AccountExportFormat = 'cpa' | 'sub2api' | 'agent_identity' | 'txt' | 'backup'
 
 type AccountExportRuntimeOptions = {
   accounts: Ref<Account[]>
@@ -28,6 +28,8 @@ function createExportFilename(format: AccountExportFormat, count = 0) {
     String(now.getSeconds()).padStart(2, '0'),
   ]
   if (format === 'cpa') return `codex-accounts-cpa-${parts.join('')}.zip`
+  if (format === 'txt') return `access-tokens-${parts.join('')}.txt`
+  if (format === 'backup') return `accounts-backup-${parts.join('')}.json`
   if (format === 'agent_identity') {
     return count === 1 ? 'auth.json' : `openai-agent-identities-${parts.join('')}.zip`
   }
@@ -40,9 +42,13 @@ export function useAccountExportRuntime(options: AccountExportRuntimeOptions) {
   const confirmDialog = useConfirmDialog()
 
   async function exportAccounts(scope: AccountExportScope = 'auto', format: AccountExportFormat = 'sub2api') {
-    const formatLabel = format === 'cpa'
-      ? 'CPA ZIP'
-      : format === 'agent_identity' ? 'Agent Identity' : 'Sub2API JSON'
+    const formatLabel = {
+      cpa: 'CPA ZIP',
+      agent_identity: 'Agent Identity',
+      sub2api: 'Sub2API JSON',
+      txt: 'Access Token 列表',
+      backup: '完整备份',
+    }[format]
     const targetIds = new Set(scope === 'all' ? [] : options.selectedIds.value)
     if (scope === 'all' || (scope === 'auto' && targetIds.size === 0)) {
       const totalHint = options.accountAllTotal.value || options.accountListTotal.value || options.accounts.value.length

@@ -7,7 +7,7 @@
             进程内实时窗口，用于观察入口、账号、出口、上游生成、断流和本地拒绝/繁忙。
           </p>
           <p class="mt-1 text-xs text-muted-foreground">
-            入口排队高时关注 CHATGPT2API_THREAD_TOKENS；最近更新：{{ monitorData?.updated_at || '未获取' }}
+            入口排队高时关注 GPTGROK2API_THREAD_TOKENS；最近更新：{{ monitorData?.updated_at || '未获取' }}
           </p>
         </template>
         <template #actions>
@@ -122,6 +122,7 @@
               :key="row.call_id"
               :row="row"
               :signature="activeRowSignature(row)"
+              @open-detail="openMonitorDetail"
             />
           </tbody>
         </table>
@@ -163,6 +164,7 @@
                   :key="`recent-${row.call_id}-${row.ended_at}`"
                   :row="row"
                   :signature="recentRowSignature(row)"
+                  @open-detail="openMonitorDetail"
                 />
               </tbody>
             </table>
@@ -191,6 +193,7 @@
             :key="`slow-${row.call_id}-${row.ended_at}`"
             :row="row"
             :signature="slowRowSignature(row)"
+            @open-detail="openMonitorDetail"
           />
         </div>
         <div v-else class="monitor-paired-body px-4 pb-4">
@@ -235,13 +238,19 @@
       </div>
     </PagePanel>
 
+    <MonitorDetailDrawer
+      :record="selectedRecord"
+      @close="selectedRecord = null"
+      @cancelled="selectedRecord = null; loadMonitor(true, 'auto')"
+    />
+
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, ref, shallowRef } from 'vue'
 import { Button, Input } from 'nanocat-ui'
-import { monitorApi, type RealtimeMonitorResponse } from '@/api/monitor'
+import { monitorApi, type RealtimeMonitorRecord, type RealtimeMonitorResponse } from '@/api/monitor'
 import MetaChip from '@/components/ai/MetaChip.vue'
 import PagePanel from '@/components/ai/PagePanel.vue'
 import PanelHeader from '@/components/ai/PanelHeader.vue'
@@ -251,6 +260,7 @@ import TableShell from '@/components/ai/TableShell.vue'
 import { usePageQuery, useSerialVisibilityPolling } from '@/composables/usePageQuery'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import MonitorActiveRow from '@/views/monitor/MonitorActiveRow.vue'
+import MonitorDetailDrawer from '@/views/monitor/MonitorDetailDrawer.vue'
 import MonitorEventRow from '@/views/monitor/MonitorEventRow.vue'
 import MonitorRecentRow from '@/views/monitor/MonitorRecentRow.vue'
 import MonitorSlowCard from '@/views/monitor/MonitorSlowCard.vue'
@@ -268,6 +278,11 @@ import {
 defineOptions({ name: 'Monitor' })
 
 const monitorData = shallowRef<RealtimeMonitorResponse | null>(null)
+const selectedRecord = shallowRef<RealtimeMonitorRecord | null>(null)
+
+function openMonitorDetail(row: RealtimeMonitorRecord) {
+  selectedRecord.value = row
+}
 const isLoading = ref(false)
 const loadError = ref('')
 const autoRefresh = ref(true)
@@ -463,6 +478,10 @@ pageRuntime.onDeactivate(() => {
   max-width: 18rem;
   white-space: normal;
   overflow-wrap: anywhere;
+}
+
+.monitor-table :deep(tr.monitor-clickable-row) {
+  cursor: pointer;
 }
 
 .monitor-table tbody tr:hover td,

@@ -65,6 +65,17 @@ export interface RealtimeMonitorRecord {
   has_proxy?: boolean
   egress_mode?: string
   local_reason?: string
+  /** success / partial_success / text_review / rate_limited / failed，由后端按调用结果归类。 */
+  outcome?: string
+  error_code?: string
+  public_error?: string
+  status_code?: number
+  attempt_count?: number
+  switch_count?: number
+  image_requested_count?: number
+  image_succeeded_count?: number
+  image_failed_count?: number
+  image_result_status?: string
 }
 
 export interface RealtimeMonitorSummary {
@@ -72,6 +83,17 @@ export interface RealtimeMonitorSummary {
   completed: number
   success: number
   failed: number
+  partial_success?: number
+  rate_limited?: number
+  text_review?: number
+  measured?: number
+  account_switch_requests?: number
+  account_switches?: number
+  account_switch_success?: number
+  account_switch_recovery_rate?: number
+  switch_unrecovered?: number
+  switch_average?: number
+  stream_error_requests?: number
   success_rate: number
   avg_duration_ms: number
   p95_duration_ms: number
@@ -127,8 +149,25 @@ export interface RealtimeMonitorResponse {
   metric_labels: Record<string, string>
 }
 
+export type RealtimeMonitorDetail = RealtimeMonitorRecord & {
+  events?: RealtimeMonitorEvent[]
+  cancelled?: boolean
+}
+
 export const monitorApi = {
   realtime() {
     return apiClient.get<never, RealtimeMonitorResponse>('/api/monitor/realtime')
+  },
+  /** 取消一个仍在进行的请求；请求已结束或不存在时返回 404 */
+  cancel(callId: string) {
+    return apiClient.post<never, { ok: boolean; record?: RealtimeMonitorRecord }>(
+      `/api/monitor/realtime/${encodeURIComponent(callId)}/cancel`,
+    )
+  },
+  /** 单个请求的完整监控记录（含阶段事件）；请求已滑出内存窗口时返回 404 */
+  detail(callId: string) {
+    return apiClient.get<never, { detail: RealtimeMonitorDetail }>(
+      `/api/monitor/realtime/${encodeURIComponent(callId)}`,
+    )
   },
 }

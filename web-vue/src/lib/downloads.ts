@@ -67,6 +67,16 @@ function filenameWithExtension(filename: string, blob: Blob, sourceUrl: string) 
   return cleanName
 }
 
+export function downloadFilenameFromUrl(url: string, fallback: string) {
+  try {
+    const path = new URL(url, window.location.origin).pathname
+    const filename = decodeURIComponent(path.split('/').filter(Boolean).pop() || '')
+    return filename || fallback
+  } catch {
+    return fallback
+  }
+}
+
 export function saveBlob(blob: Blob, filename: string, sourceUrl = '') {
   const blobUrl = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
@@ -128,5 +138,17 @@ export async function downloadUrlAsFile(
     saveBlob(blob, filename, value)
   } catch (error: any) {
     throw new Error(error?.message || 'image source is not readable by the browser')
+  }
+}
+
+export async function downloadPublicUrlAsFile(url: string, filename: string) {
+  const value = cleanString(url)
+  if (!value) throw new Error('missing file URL')
+
+  try {
+    const blob = await fetchBlob(value)
+    saveBlob(blob, filename, value)
+  } catch (error: any) {
+    throw new Error(error?.message || 'file source is not readable by the browser')
   }
 }

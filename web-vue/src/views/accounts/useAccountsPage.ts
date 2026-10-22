@@ -3,6 +3,7 @@ import { useRouter } from 'vue-router'
 import { accountsApi } from '@/api/accounts'
 import type {
   Account,
+  AccountHealthFilter,
 } from '@/api/accounts'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import { usePagedQuery } from '@/composables/usePageQuery'
@@ -18,10 +19,16 @@ import { useAccountImportRuntime } from './accountImportRuntime'
 import { useAccountPageLifecycleRuntime } from './accountPageLifecycleRuntime'
 import { useAccountProxyRuntime } from './accountProxyRuntime'
 import { useAccountSelectionRuntime } from './accountSelectionRuntime'
-import { checkoutFinalLinkUrl, statusCategory, type AccountStatusFilter } from './viewUtils'
+import {
+  accountFlagFilterGroups,
+  checkoutFinalLinkUrl,
+  scheduleCodeLabels,
+  statusCategory,
+  type AccountStatusFilter,
+} from './viewUtils'
 
 type AccountsViewMode = 'list' | 'cards'
-type AccountListStatusFilter = AccountStatusFilter | 'valid_checkout'
+type AccountListStatusFilter = AccountStatusFilter | 'valid_checkout' | `sched:${string}`
 export type { AccountImportMode } from './accountImportRuntime'
 
 const ACCOUNT_PAGE_SIZE_OPTIONS = [20, 50, 100]
@@ -40,6 +47,10 @@ export function useAccountsPage() {
   const keyword = ref('')
   const statusFilter = ref<AccountListStatusFilter>('all')
   const groupFilter = ref('all')
+  const healthFilter = ref<AccountHealthFilter>('all')
+  const flagFilter = ref('all')
+  // 调度状态汇总：除“状态”外的其它筛选生效，点芯片即设置 statusFilter = sched:xxx
+  const availabilitySummary = ref<Record<string, number>>({})
   const pageSize = ref(DEFAULT_PAGE_SIZE)
   const accounts = ref<Account[]>([])
   const accountAllTotal = ref(0)
@@ -61,6 +72,8 @@ export function useAccountsPage() {
       keyword: keyword.value.trim(),
       status: statusFilter.value,
       group_id: groupFilter.value,
+      health: healthFilter.value,
+      flag: flagFilter.value,
     }),
     resolvePage: (res) => res.page,
     resolvePageCount: (res) => {
@@ -72,6 +85,7 @@ export function useAccountsPage() {
     resolveTotal: (res) => res.total ?? res.accounts?.length ?? 0,
     apply: (res) => {
       accountAllTotal.value = Number(res.all_total ?? 0)
+      availabilitySummary.value = res.availability_summary || {}
       accounts.value = (res.accounts || []).map((item) => ({
         ...item,
         lanes: Array.isArray(item.lanes) ? item.lanes : [],
@@ -95,13 +109,30 @@ export function useAccountsPage() {
 
   const pagedAccounts = computed(() => accounts.value)
 
-  const statusFilterOptions = [
-    { label: '全部状态', value: 'all' },
-    { label: '正常', value: 'normal' },
-    { label: '限流', value: 'limited' },
-    { label: '异常', value: 'abnormal' },
-    { label: '禁用', value: 'disabled' },
-    { label: '有效支付链接', value: 'valid_checkout' },
+  const statusFilterOptions = computed(() => {
+    const base = [
+      { label: '全部状态', value: 'all' },
+      { label: '正常', value: 'normal' },
+      { label: '限流', value: 'limited' },
+      { label: '异常', value: 'abnormal' },
+      { label: '禁用', value: 'disabled' },
+      { label: '有效支付链接', value: 'valid_checkout' },
+    ]
+    // 选了调度状态芯片时，让状态下拉也能显示当前值
+    if (statusFilter.value.startsWith('sched:')) {
+      const code = statusFilter.value.slice(6)
+      base.push({ label: `调度：${scheduleCodeLabels[code] || code}`, value: statusFilter.value })
+    }
+    return base
+  })
+
+  const healthFilterOptions = [
+    { label: '全部健康度', value: 'all' },
+    { label: '有风险（注意 + 危险）', value: 'risk' },
+    { label: '健康', value: 'healthy' },
+    { label: '注意', value: 'warning' },
+    { label: '危险', value: 'danger' },
+    { label: '未参与调度', value: 'idle' },
   ] as const
 
   const groupFilterOptions = computed(() => [
@@ -187,8 +218,8 @@ export function useAccountsPage() {
   const saving = accountCrud.saving
   const showModal = accountCrud.showModal
   const editingId = accountCrud.editingId
-  const refreshingAccountId = accountCrud.refreshingAccountId
-  const resettingAccountId = accountCrud.resettingAccountId
+  const refreshingAccountIds = accountCrud.refreshingAccountIds
+  const resettingAccountIds = accountCrud.resettingAccountIds
   const accountStatusOptions = accountCrud.accountStatusOptions
   const form = accountCrud.form
 
@@ -237,6 +268,11 @@ export function useAccountsPage() {
   const oauthRedirectUriPrefix = accountImport.oauthRedirectUriPrefix
   const manualTokenText = accountImport.manualTokenText
   const sessionJsonText = accountImport.sessionJsonText
+  const verifyOnImport = accountImport.verifyOnImport
+  const importTargetGroup = accountImport.importTargetGroup
+  const targetGroupParam = accountImport.targetGroupParam
+  const importBackupFile = accountImport.importBackupFile
+  const importSub2apiFiles = accountImport.importSub2apiFiles
 
   const accountBulkActions = useAccountBulkActionsRuntime({
     bulkProgress,
@@ -255,22 +291,67 @@ export function useAccountsPage() {
   })
   const refreshAllAccounts = accountBulkActions.refreshAllAccounts
   const refreshSelectedAccounts = accountBulkActions.refreshSelectedAccounts
+  const refreshSelectedAccessTokens = accountBulkActions.refreshSelectedAccessTokens
+  const refreshAccessTokensFor = accountBulkActions.refreshAccessTokensFor
   const requestStopRefreshProgress = accountBulkActions.requestStopRefreshProgress
   const runBulkAction = accountBulkActions.runBulkAction
   const bindSelectedAccountsToGroup = accountBulkActions.bindSelectedAccountsToGroup
 
-  async function copyAccountToken(item: Account) {
-    const token = String(item.access_token || item.cookie || '').trim()
-    if (!token) {
-      toast.warning('当前账号没有可复制的 Token')
-      return
-    }
+  const filtersActive = computed(() => Boolean(
+    keyword.value.trim()
+    || statusFilter.value !== 'all'
+    || groupFilter.value !== 'all'
+    || healthFilter.value !== 'all'
+    || flagFilter.value !== 'all',
+  ))
 
+  function resetFilters() {
+    keyword.value = ''
+    statusFilter.value = 'all'
+    groupFilter.value = 'all'
+    healthFilter.value = 'all'
+    flagFilter.value = 'all'
+  }
+
+  const selectingAllMatching = ref(false)
+
+  /** 跨分页全选：让后端按当前筛选条件解析出全部匹配账号的 ID。 */
+  async function selectAllMatching() {
+    if (selectingAllMatching.value) return
+    selectingAllMatching.value = true
     try {
-      await navigator.clipboard.writeText(token)
-      toast.success('Token 已复制')
+      const preview = await accountsApi.previewSelection({
+        mode: 'filter',
+        keyword: keyword.value.trim(),
+        status: statusFilter.value,
+        group_id: groupFilter.value,
+        health: healthFilter.value,
+        flag: flagFilter.value,
+        excluded_account_ids: [],
+      })
+      accountSelection.selectIds(preview.account_ids)
+      toast.success(`已选择全部 ${preview.selected_count} 个筛选结果`)
     } catch (error) {
-      setError('复制 Token 失败', error)
+      setError('选择全部筛选结果失败', error)
+    } finally {
+      selectingAllMatching.value = false
+    }
+  }
+
+  /** 复制凭据：走管理员专用接口（no-store，且写审计日志），列表里不携带 refresh_token。 */
+  async function copyAccountCredential(item: Account, kind: 'access' | 'refresh' = 'access') {
+    try {
+      const token = kind === 'refresh'
+        ? await accountsApi.getRefreshToken(item.id)
+        : (item.is_demo ? String(item.access_token || '').trim() : await accountsApi.getAccessToken(item.id))
+      if (!token) {
+        toast.warning(kind === 'refresh' ? '当前账号没有 Refresh Token' : '当前账号没有可复制的 Access Token')
+        return
+      }
+      await navigator.clipboard.writeText(token)
+      toast.success(kind === 'refresh' ? 'Refresh Token 已复制' : 'Access Token 已复制')
+    } catch (error) {
+      setError(kind === 'refresh' ? '复制 Refresh Token 失败' : '复制 Access Token 失败', error)
     }
   }
 
@@ -385,6 +466,7 @@ export function useAccountsPage() {
   const toggleEnabled = accountCrud.toggleEnabled
   const refreshToken = accountCrud.refreshToken
   const resetAccountState = accountCrud.resetAccountState
+  const clearAutoPause = accountCrud.clearAutoPause
   const removeAccount = accountCrud.removeAccount
 
   const pageLifecycle = useAccountPageLifecycleRuntime({
@@ -395,6 +477,9 @@ export function useAccountsPage() {
     keyword,
     statusFilter,
     groupFilter,
+    healthFilter,
+    flagFilter,
+    keepSelectionOnPageChange: () => accountSelection.crossPageActive.value,
     pageSizeDefault: DEFAULT_PAGE_SIZE,
     pageSizeOptions: ACCOUNT_PAGE_SIZE_OPTIONS,
     reloadTimerKey: LIST_RELOAD_TIMER_KEY,
@@ -423,8 +508,15 @@ export function useAccountsPage() {
     keyword,
     statusFilter,
     groupFilter,
+    healthFilter,
+    flagFilter,
+    flagFilterGroups: accountFlagFilterGroups,
+    availabilitySummary,
+    filtersActive,
+    resetFilters,
     statusFilterOptions,
     groupFilterOptions,
+    healthFilterOptions,
     editingId,
     accounts,
     accountListTotal,
@@ -440,8 +532,8 @@ export function useAccountsPage() {
     batchBusy,
     batchActionLabel,
     viewMode,
-    refreshingAccountId,
-    resettingAccountId,
+    refreshingAccountIds,
+    resettingAccountIds,
     importBusy,
     exportBusy,
     showImportModal,
@@ -454,6 +546,11 @@ export function useAccountsPage() {
     oauthRedirectUriPrefix,
     manualTokenText,
     sessionJsonText,
+    verifyOnImport,
+    importTargetGroup,
+    targetGroupParam,
+    importBackupFile,
+    importSub2apiFiles,
     accountGroups,
     proxyGroups,
     accountGroupsLoading,
@@ -521,10 +618,15 @@ export function useAccountsPage() {
     importLocalCPAFiles,
     refreshAllAccounts,
     refreshSelectedAccounts,
+    refreshSelectedAccessTokens,
+    refreshAccessTokensFor,
+    selectAllMatching,
+    selectingAllMatching,
+    crossPageSelected: accountSelection.crossPageActive,
     requestStopRefreshProgress,
     closeRefreshProgress,
     loadData,
-    copyAccountToken,
+    copyAccountCredential,
     extractSelectedCheckout,
     copyFinalCheckoutLink,
     openFinalCheckoutLink,
@@ -535,6 +637,7 @@ export function useAccountsPage() {
     toggleEnabled,
     refreshToken,
     resetAccountState,
+    clearAutoPause,
     removeAccount,
     runBulkAction,
     bindSelectedAccountsToGroup,

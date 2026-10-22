@@ -41,6 +41,10 @@ export function useRegisterProviderRuntime(input: RegisterProviderRuntimeInput) 
     const provider = input.providers.value[index]
     if (!provider) return
     provider[key] = value
+    // 重新输入了新值就不再保留“清除”勾选，避免新值被后端的 clear_<key> 覆盖掉。
+    if (!key.startsWith('clear_') && typeof value === 'string' && value.trim() && provider[`clear_${key}`]) {
+      provider[`clear_${key}`] = false
+    }
   }
 
   function addProvider() {

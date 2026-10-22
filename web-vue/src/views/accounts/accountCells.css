@@ -1,0 +1,39 @@
+/* Ported from yukkcat/chatgpt2api (AGPL-3.0-only). */
+/* 账号表格单元格的通用两行结构：主信息一行，次要说明一行（小号灰字） */
+.account-cell {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  cursor: default;
+}
+
+.account-cell-main {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 500;
+  color: hsl(var(--foreground));
+}
+
+.account-cell-sub {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  line-height: 1.3;
+  color: hsl(var(--muted-foreground));
+  font-variant-numeric: tabular-nums;
+}
+
+.account-cell-sub.is-warning { color: rgb(180 83 9); }
+.account-cell-sub.is-error { color: rgb(225 29 72); }
+.account-cell-sub.is-success { color: rgb(5 150 105); }
+
+html[data-theme="dark"] .account-cell-sub.is-warning { color: rgb(251 191 36); }
+html[data-theme="dark"] .account-cell-sub.is-error { color: rgb(251 113 133); }
+html[data-theme="dark"] .account-cell-sub.is-success { color: rgb(52 211 153); }

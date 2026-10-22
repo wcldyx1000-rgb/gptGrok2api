@@ -2,21 +2,15 @@ import type { Settings } from '@/types/api'
 
 export const FALLBACK_CHAT_MODELS = [
   'auto',
-  'gpt-5',
-  'gpt-5-1',
-  'gpt-5-2',
-  'gpt-5-3',
-  'gpt-5-3-mini',
-  'gpt-5-5',
-  'gpt-5-6',
-  'gpt-5-6-sol',
-  'gpt-5-6-terra',
-  'gpt-5-6-luna',
-  'gpt-5-mini',
+  'gpt-6-t-mini',
+  'gpt-6',
 ]
 
 export const FALLBACK_IMAGE_MODELS = [
   'gpt-image-2',
+  'gpt-image-2.5',
+  'gpt-image-2.5-flare',
+  'gpt-image-2.5-sunburst',
 ]
 
 function normalizeList(raw: unknown): string[] {

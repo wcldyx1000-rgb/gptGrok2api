@@ -118,6 +118,8 @@ export function accountRowSignature(item: Account): string {
     item.source_type,
     item.group_id,
     item.proxy,
+    item.has_refresh_token ? 1 : 0,
+    item.codex_bound ? 1 : 0,
     item.checkout_link_status,
     item.checkout_channel,
     item.checkout_final_kind,
@@ -133,7 +135,53 @@ export function accountRowSignature(item: Account): string {
     item.failure_count || 0,
     item.enabled ? 1 : 0,
     item.is_demo ? 1 : 0,
+    item.auto_paused_until,
+    item.relogin_needed_at,
+    item.relogin_attempts || 0,
+    boundedSignatureText(item.last_relogin_error),
+    item.health_level,
+    boundedSignatureText(accountHealthDetail(item)),
+    item.recent_uses_1h || 0,
+    accountScheduleSignature(item),
+    accountDisplaySignature(item),
   ].map(signatureValue).join('|')
+}
+
+/** 凭据 / 救回 / 额度 / 出口展示字段的签名（行 v-memo 用）。 */
+function accountDisplaySignature(item: Account): string {
+  return [
+    item.access_token_status, item.access_token_issued_at, item.access_token_expires_at,
+    item.refresh_token_status, item.refresh_token_invalid_at, item.last_token_refresh_at,
+    item.last_token_refresh_error_at, boundedSignatureText(item.last_token_refresh_error, 48),
+    item.rescue_code, item.has_outlook_credentials ? 1 : 0, item.has_password ? 1 : 0, item.has_totp ? 1 : 0,
+    item.relogin_failures || 0, boundedSignatureText(item.relogin_last_error, 48),
+    item.quota_state, item.quota_label, item.quota_source, item.quota_reset_at, item.quota_synced_at,
+    item.quota_reset_idle ? 1 : 0, item.group_name,
+    item.egress?.mode, item.egress?.label, item.egress?.usable ? 1 : 0,
+  ].join(',')
+}
+
+const HEALTH_TONE_CLASS: Record<string, string> = {
+  success: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+  warning: 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+  error: 'border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300',
+  neutral: 'border-border bg-muted/30 text-muted-foreground',
+}
+
+export function accountHealthText(item: Account): string {
+  return item.health_label || '—'
+}
+
+export function accountHealthClass(item: Account): string {
+  return HEALTH_TONE_CLASS[item.health_tone || 'neutral'] || HEALTH_TONE_CLASS.neutral
+}
+
+/** Reasons plus recent usage, shown in the health pill's detail card. */
+export function accountHealthDetail(item: Account): string {
+  const lines = [...(item.health_reasons || [])]
+  if (item.health_level === 'healthy' && !lines.length) lines.push('近期没有异常信号')
+  if (item.health_level) lines.push(`近 1 小时使用 ${item.recent_uses_1h || 0} 次，近 24 小时 ${item.recent_uses_24h || 0} 次`)
+  return lines.join('\n')
 }
 
 function includesHint(input: unknown, hints: string[]): boolean {
@@ -179,6 +227,28 @@ export function formatAccountDate(timestampSeconds?: number): string {
   const value = Number(timestampSeconds || 0)
   if (!Number.isFinite(value) || value <= 0) return '-'
   return formatDateTime(value)
+}
+
+export function accountFailureRateText(item: Account): string {
+  const rate = failureRate(item)
+  return rate === null ? '次数太少' : `失败率 ${Math.round(rate * 100)}%`
+}
+
+/** 失败率对应的语义色：>=40% 红，>=20% 黄，其余绿；次数太少不着色。 */
+export function accountFailureRateTone(item: Account): '' | 'is-error' | 'is-warning' | 'is-success' {
+  const rate = failureRate(item)
+  if (rate === null) return ''
+  if (rate >= 0.4) return 'is-error'
+  if (rate >= 0.2) return 'is-warning'
+  return 'is-success'
+}
+
+export function accountLastUsedText(item: Pick<Account, 'last_used_at'>, now: number): string {
+  return item.last_used_at ? `${agoText(item.last_used_at, now)}使用` : '从未使用'
+}
+
+export function accountIdleOverDay(item: Pick<Account, 'last_used_at'>, now: number): boolean {
+  return !item.last_used_at || now - item.last_used_at >= 86400
 }
 
 export function formatDuration(seconds: number): string {
@@ -723,20 +793,68 @@ export function accountStatusDetailText(
 ): string {
   return [
     statusReason(item),
+    ...accountPoolStateLines(item),
     `账号组：${groupLabel(item.group_id)}`,
     `代理：${proxyText(item)}`,
   ].filter(Boolean).join('\n')
 }
 
-export function accountDetailItems(item: Account) {
+export function isAutoPaused(item: Account, now = Date.now()): boolean {
+  const until = Date.parse(cleanString(item.auto_paused_until))
+  return Number.isFinite(until) && until > now
+}
+
+export function isReloginPending(item: Account): boolean {
+  return Boolean(cleanString(item.relogin_needed_at))
+}
+
+/** Short badge text for GPT pool states that sit beside the main status. */
+export function accountPoolStateText(item: Account): string {
+  const parts: string[] = []
+  if (isAutoPaused(item)) parts.push('自动暂停')
+  if (isReloginPending(item)) parts.push(item.relogin_attempts ? `待重登 ${item.relogin_attempts}/3` : '待重登')
+  return parts.join(' · ')
+}
+
+function accountPoolStateLines(item: Account): string[] {
+  const lines: string[] = []
+  if (isAutoPaused(item)) {
+    const until = formatAccountDate(Date.parse(cleanString(item.auto_paused_until)) / 1000)
+    const reason = cleanString(item.auto_pause_reason)
+    lines.push(`自动暂停至 ${until}${reason ? `（${reason}）` : ''}，仅降低优先级`)
+  }
+  if (isReloginPending(item)) {
+    const error = cleanString(item.last_relogin_error)
+    lines.push(`凭据失效待自动重新登录，已尝试 ${item.relogin_attempts || 0} 次${error ? `，最近错误：${error}` : ''}`)
+  }
+  return lines
+}
+
+/** 额度重置的一句话描述（卡片视图用；表格里由 AccountQuotaCell 实时显示）。 */
+export function accountQuotaResetLine(item: Account, now: number): string {
+  if (item.quota_state === 'unlimited') return '不限'
+  if (item.quota_reset_idle) return '未开始计时'
+  const reset = item.quota_reset_at ?? item.restore_at
+  if (!reset) return '重置时间未知'
+  if (reset <= now) return '已过重置点'
+  return `${remainingText(reset, now).replace('剩 ', '')}后重置`
+}
+
+export function accountDetailItems(item: Account, now = Math.floor(Date.now() / 1000)) {
   const survival = item.survival_status
     ? `${item.survival_status}${item.survival_observed_seconds ? ` · ${formatDuration(item.survival_observed_seconds)}` : ''}`
     : '-'
+  const egress = item.egress
+  const egressText = egress
+    ? `${egress.label}${egress.switch_to ? ` → ${egress.switch_to_label}` : ''}${egress.usable ? '' : '（不可用）'}`
+    : accountProxyText(item) || '默认出口'
   return [
     { label: '创建时间', value: accountCreatedText(item) },
-    { label: '恢复时间', value: accountRestoreText(item) },
-    { label: '图片额度', value: accountQuotaText(item) },
-    { label: '成功 / 失败', value: `${item.success_count || 0} / ${item.failure_count || 0}` },
+    { label: '图片额度', value: `${item.quota_label || accountQuotaText(item)} · ${accountQuotaResetLine(item, now)}` },
+    { label: '出口', value: egressText },
+    { label: '分组', value: item.group_name || '—' },
+    { label: '成功 / 失败', value: `${item.success_count || 0} / ${item.failure_count || 0} · ${accountFailureRateText(item)}` },
+    { label: '最近使用', value: item.last_used_at ? `${agoText(item.last_used_at, now)}（${formatAccountDate(item.last_used_at)}）` : '从未使用' },
     { label: '存活确认', value: survival },
   ]
 }
@@ -795,3 +913,203 @@ export function buildAccountProgressMetricItems(
     },
   ]
 }
+
+// ── GPT 号池调度视图（后端 scheduling_view）：与“健康”列互补，回答“此刻调度会怎么对待这个号” ──
+export type AccountScheduleCode =
+  | 'unknown' | 'ready' | 'busy' | 'cooldown' | 'ramp' | 'ramp_full' | 'cooling'
+  | 'auto_paused' | 'auth_pending' | 'no_credential' | 'egress_switching' | 'egress_down'
+
+const SCHEDULE_LABELS: Record<AccountScheduleCode, string> = {
+  unknown: '—',
+  ready: '可接请求',
+  busy: '并发已满',
+  cooldown: '新号冷静期',
+  ramp: '放量期',
+  ramp_full: '今日已满',
+  cooling: '失败冷却',
+  auto_paused: '自动暂停',
+  auth_pending: '待核验',
+  no_credential: '凭据失效',
+  egress_switching: '换出口中',
+  egress_down: '出口不可用',
+}
+
+const SCHEDULE_TONE: Record<AccountScheduleCode, string> = {
+  unknown: 'border-border bg-muted/30 text-muted-foreground',
+  ready: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+  busy: 'border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300',
+  cooldown: 'border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-300',
+  ramp: 'border-violet-500/30 bg-violet-500/10 text-violet-700 dark:text-violet-300',
+  ramp_full: 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+  cooling: 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+  auto_paused: 'border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-300',
+  auth_pending: 'border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300',
+  no_credential: 'border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300',
+  egress_switching: 'border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-300',
+  egress_down: 'border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300',
+}
+
+/** 同时命中多种状态时，按“最能解释为什么现在不接请求”的顺序取一个。 */
+export function accountScheduleCode(item: Account): AccountScheduleCode {
+  const s = item.scheduling
+  if (item.egress?.switch_to) return 'egress_switching'
+  if (!s) return 'unknown'
+  if (item.egress && !item.egress.usable) return 'egress_down'
+  if (s.credential_status === 'unavailable') return 'no_credential'
+  if (s.auth_pending) return 'auth_pending'
+  if (s.new_account_stage === 'cooldown') return 'cooldown'
+  if (s.auto_paused_until) return 'auto_paused'
+  if (s.failure_cooldown_until) return 'cooling'
+  if (s.new_account_stage === 'ramp' && s.ramp_exhausted) return 'ramp_full'
+  if (s.image_inflight >= s.image_concurrency && s.text_inflight >= s.text_concurrency) return 'busy'
+  if (s.new_account_stage === 'ramp') return 'ramp'
+  return 'ready'
+}
+
+export function accountScheduleText(item: Account): string {
+  return SCHEDULE_LABELS[accountScheduleCode(item)]
+}
+
+export function accountScheduleClass(item: Account): string {
+  return SCHEDULE_TONE[accountScheduleCode(item)]
+}
+
+function scheduleTime(seconds: number): string {
+  const date = new Date(seconds * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getMonth() + 1}-${date.getDate()} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/** 悬停详情：每种可能影响调度的因素一行，没有的不显示。 */
+export function accountScheduleDetail(item: Account): string {
+  const s = item.scheduling
+  if (!s) return ''
+  const lines: string[] = []
+  const egress = item.egress
+  if (egress?.switch_to) {
+    lines.push(`换到${egress.switch_to_label}前先停用，期间不接任何请求；${egress.switch_at ? `${scheduleTime(egress.switch_at)} ` : '到点'}自动切换并恢复`)
+  } else if (egress && !egress.usable) {
+    lines.push('绑定的出口槽位没有可用节点（REJECT），不接请求；请到「代理 / 出口槽位」给槽位选节点')
+  }
+  if (s.credential_status === 'unavailable') lines.push('AT 已失效且没有可用 RT，不参与调度（需重新登录或更新凭据）')
+  else if (s.credential_status === 'recoverable') lines.push('AT 已失效，将用 RT 刷新后恢复')
+  if (s.auth_pending) lines.push(`上游返回 401，正在核验（来源：${s.auth_pending_event || '未知'}），核验前暂不接请求`)
+  if (s.new_account_stage === 'cooldown' && s.cooldown_until) lines.push(`新号冷静期至 ${scheduleTime(s.cooldown_until)}，期间不接生图和对话`)
+  if (s.new_account_stage === 'ramp') {
+    lines.push(`放量期至 ${s.ramp_until ? scheduleTime(s.ramp_until) : '—'}，今日生图 ${s.ramp_used_today}/${s.ramp_daily_limit} 张`)
+    if (s.ramp_exhausted && s.ramp_resume_at) lines.push(`今日上限已满，${scheduleTime(s.ramp_resume_at)} 恢复生图（对话不受限）`)
+  }
+  if (s.failure_cooldown_until) lines.push(`连续失败冷却至 ${scheduleTime(s.failure_cooldown_until)}（短时，只在没有其它号时才用）`)
+  if (s.auto_paused_until) lines.push(`自动暂停至 ${scheduleTime(s.auto_paused_until)}${s.auto_pause_reason ? `：${s.auto_pause_reason}` : ''}`)
+  if (s.failure_streak > 0) lines.push(`当前连续失败 ${s.failure_streak} 次`)
+  lines.push(`并发占用：生图 ${s.image_inflight}/${s.image_concurrency}，对话 ${s.text_inflight}/${s.text_concurrency}`)
+  const credential = { valid: '有效', expiring: '即将过期', invalid: '已失效' }[s.access_token_status]
+  const refresh = { valid: '有', missing: '缺失', invalid: '已失效' }[s.refresh_token_status]
+  lines.push(`凭据：AT ${credential}，RT ${refresh}`)
+  return lines.join('\n')
+}
+
+/** 行签名用：调度视图里会变的字段（后端秒级时间点原样参与即可）。 */
+export function accountScheduleSignature(item: Account): string {
+  const s = item.scheduling
+  if (!s) return ''
+  return [
+    s.new_account_stage, s.cooldown_until, s.ramp_until, s.ramp_used_today, s.ramp_exhausted,
+    s.failure_cooldown_until, s.failure_streak, s.auto_paused_until, s.image_inflight, s.text_inflight,
+    s.auth_pending, s.credential_status,
+    item.egress?.switch_to, item.egress?.switch_at, item.egress?.usable,
+  ].join(',')
+}
+
+// ── 时间展示（凭据 / 额度 / 出口单元格共用） ─────────────────────
+function pad2(value: number) {
+  return String(value).padStart(2, '0')
+}
+
+/** 10-17 20:31（今天的只显示 20:31） */
+export function shortTime(seconds: number | null | undefined, now: number): string {
+  if (!seconds) return '—'
+  const date = new Date(seconds * 1000)
+  const today = new Date(now * 1000)
+  const hm = `${pad2(date.getHours())}:${pad2(date.getMinutes())}`
+  if (date.toDateString() === today.toDateString()) return hm
+  return `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${hm}`
+}
+
+/** 只按小时显示：剩 70 小时 / 不到 1 小时 */
+export function remainingText(seconds: number | null | undefined, now: number): string {
+  if (!seconds) return ''
+  const hours = Math.floor((seconds - now) / 3600)
+  return hours >= 1 ? `剩 ${hours} 小时` : '不到 1 小时'
+}
+
+/** 距今多久：刚刚 / 12 分钟前 / 3 小时前 / 2 天前 */
+export function agoText(seconds: number | null | undefined, now: number): string {
+  if (!seconds) return '从未'
+  const diff = Math.max(0, now - seconds)
+  if (diff < 60) return '刚刚'
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`
+  return `${Math.floor(diff / 86400)} 天前`
+}
+
+/** 失败率：总次数太少（<5）时不下结论 */
+export function failureRate(item: Account): number | null {
+  const success = Number(item.success_count || 0)
+  const failure = Number(item.failure_count || 0)
+  const total = success + failure
+  return total >= 5 ? failure / total : null
+}
+
+/** 额度单元格的悬停说明：数值来源 + 同步时间 */
+export function quotaTooltip(item: Account, now: number): string {
+  if (item.quota_state === 'unlimited') return '无限额度'
+  if (item.quota_state === 'unknown') return '额度未知：本地扣到 0 或还没同步过，下次调度会远程确认'
+  const synced = item.quota_synced_at ? `${shortTime(item.quota_synced_at, now)}（${agoText(item.quota_synced_at, now)}）` : '从未'
+  if (item.quota_source === 'estimated') return `估算值：上次远程同步于 ${synced}，之后按本地出图次数扣减`
+  return `远程同步值：同步于 ${synced}`
+}
+
+export const scheduleCodeLabels: Record<string, string> = SCHEDULE_LABELS
+
+// ── 更多筛选：来源 / 套餐 / 凭据风险 / 表现 / 出口（值和后端 _account_matches_flag 对应）──
+export const accountFlagFilterGroups = [
+  { label: '更多筛选', options: [{ label: '更多筛选', value: 'all' }] },
+  {
+    label: '凭据风险',
+    options: [
+      { label: 'RT 缺失或失效', value: 'rt_missing' },
+      { label: 'AT 失效后救不回', value: 'no_rescue' },
+    ],
+  },
+  {
+    label: '表现',
+    options: [
+      { label: '失败率高（≥40%）', value: 'high_failure' },
+      { label: '24 小时没用过', value: 'idle' },
+      { label: '自动暂停中', value: 'auto_paused' },
+    ],
+  },
+  {
+    label: '出口',
+    options: [
+      { label: '未分配槽位', value: 'egress_direct' },
+      { label: '换出口中', value: 'egress_switching' },
+      { label: '出口不可用', value: 'egress_down' },
+    ],
+  },
+  {
+    label: '来源',
+    options: [
+      { label: '网页登录', value: 'source:web' },
+      { label: 'CPA / Sub2API 导入', value: 'source:codex' },
+    ],
+  },
+  {
+    label: '套餐',
+    options: ['free', 'plus', 'pro', 'team'].map((plan) => ({
+      label: plan === 'free' ? 'Free' : plan[0].toUpperCase() + plan.slice(1),
+      value: `plan:${plan}`,
+    })),
+  },
+]

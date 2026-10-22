@@ -30,8 +30,22 @@
         </FormField>
 
         <FormField label="Secret Access Key">
-          <Input v-model="backup.secret_access_key" type="password" block />
+          <Input
+            v-model="backup.secret_access_key"
+            type="password"
+            block
+            autocomplete="new-password"
+            :placeholder="backup.has_secret_access_key ? '已配置，留空不修改' : '请输入 Secret Access Key'"
+          />
         </FormField>
+      </div>
+
+      <div v-if="backup.has_secret_access_key" class="settings-check-grid settings-check-grid--single">
+        <div class="settings-check-item">
+          <div class="settings-check-control">
+            <Checkbox v-model="backup.clear_secret_access_key">保存时清除已配置的 Secret Access Key</Checkbox>
+          </div>
+        </div>
       </div>
 
       <div class="grid grid-cols-1 gap-2.5 md:grid-cols-2">
@@ -40,27 +54,31 @@
         </FormField>
 
         <FormField label="保留份数">
-          <Input
-            :model-value="backupRotationKeepField.input.value"
-            type="number"
-            block
-            @update:model-value="backupRotationKeepField.update"
-          />
+          <SettingsNumberInput :field="backupRotationKeepField" />
         </FormField>
       </div>
 
       <FormField label="备份间隔（分钟）">
-        <Input
-          :model-value="backupIntervalMinutesField.input.value"
-          type="number"
-          block
-          @update:model-value="backupIntervalMinutesField.update"
-        />
+        <SettingsNumberInput :field="backupIntervalMinutesField" />
       </FormField>
 
       <FormField label="加密口令">
-        <Input v-model="backup.passphrase" type="password" block placeholder="留空" />
+        <Input
+          v-model="backup.passphrase"
+          type="password"
+          block
+          autocomplete="new-password"
+          :placeholder="backup.has_passphrase ? '已配置，留空不修改' : '留空'"
+        />
       </FormField>
+
+      <div v-if="backup.has_passphrase" class="settings-check-grid settings-check-grid--single">
+        <div class="settings-check-item">
+          <div class="settings-check-control">
+            <Checkbox v-model="backup.clear_passphrase">保存时清除已配置的加密口令</Checkbox>
+          </div>
+        </div>
+      </div>
 
       <div class="space-y-2">
         <p class="text-xs font-medium text-foreground">备份内容</p>
@@ -136,6 +154,7 @@
 </template>
 
 <script setup lang="ts">
+import SettingsNumberInput from './SettingsNumberInput.vue'
 import { computed } from 'vue'
 import { Button, Checkbox, FormField, FormSection, Input } from 'nanocat-ui'
 import type { BackupItem, BackupState, BackupTestResult } from '@/api/settings'

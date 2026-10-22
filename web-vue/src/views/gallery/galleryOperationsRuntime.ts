@@ -46,6 +46,7 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
   const storageActionError = ref('')
   const targetFreeMb = ref('500')
   const batchBusy = ref(false)
+  const genboxPushBusyPath = ref<string | null>(null)
   const operationProgress = reactive({
     open: false,
     title: '',
@@ -311,6 +312,28 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     }
   }
 
+  async function handleGenBoxPush(file: GalleryFile) {
+    if (genboxPushBusyPath.value) return
+    genboxPushBusyPath.value = file.path
+    try {
+      const result = await galleryApi.pushToGenBox(file.path)
+      const target = options.files.value.find((item) => item.path === file.path)
+      if (target) {
+        target.genbox_push = {
+          status: result.status,
+          label: result.label,
+          sha256: result.sha256,
+          updated_at: result.updated_at,
+        }
+      }
+      options.toast.success(result.label, '推送完成')
+    } catch (error: any) {
+      options.toast.error(error?.message || '推送到 GenBox 失败', '推送失败')
+    } finally {
+      genboxPushBusyPath.value = null
+    }
+  }
+
   function deactivate() {
     storageStatsQuery.invalidate()
     isStorageBusy.value = false
@@ -318,6 +341,8 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
 
   return {
     batchBusy,
+    genboxPushBusyPath,
+    handleGenBoxPush,
     isStorageModalOpen,
     isStorageBusy,
     storageActionMessage,

@@ -5,7 +5,7 @@
         <div class="settings-check-item">
           <div class="settings-check-control">
             <Checkbox v-model="settings.auto_remove_invalid_accounts">自动移除异常账号</Checkbox>
-            <HelpTip text="确认鉴权无效的账号会进入异常处理；开启后直接移除，关闭后保留异常状态。" />
+            <HelpTip text="确认鉴权无效的账号会进入异常处理；开启后直接移除，关闭后保留异常状态。启用“自动重新登录”时，仍可自动重新登录的账号会先保留。" />
           </div>
         </div>
         <div class="settings-check-item">
@@ -33,14 +33,7 @@
         </div>
       </div>
       <FormField label="二次确认等待（秒）">
-        <Input
-          :model-value="imageSettleSecondsField.input.value"
-          type="number"
-          block
-          placeholder="5"
-          :disabled="!settings.image_settle_enabled"
-          @update:model-value="imageSettleSecondsField.update"
-        />
+        <SettingsNumberInput :field="imageSettleSecondsField" :disabled="!settings.image_settle_enabled" />
       </FormField>
     </FormSection>
 
@@ -67,6 +60,7 @@
 </template>
 
 <script setup lang="ts">
+import SettingsNumberInput from './SettingsNumberInput.vue'
 import { Checkbox, FormField, FormSection, HelpTip, Input } from 'nanocat-ui'
 import type { Settings } from '@/types/api'
 import { logLevelOptions } from '@/views/settings/settingsView'

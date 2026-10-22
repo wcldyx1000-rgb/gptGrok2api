@@ -1,5 +1,5 @@
 <template>
-  <tr v-memo="[signature]">
+  <tr v-memo="[signature]" class="monitor-clickable-row" @click="emit('open-detail', row)">
     <td>
       <p class="font-mono text-xs text-foreground">{{ shortCallId(row.call_id) }}</p>
       <p class="mt-1 text-[11px] text-muted-foreground">{{ row.endpoint || '-' }}</p>
@@ -35,5 +35,9 @@ import {
 defineProps<{
   row: RealtimeMonitorRecord
   signature: string
+}>()
+
+const emit = defineEmits<{
+  (e: 'open-detail', row: RealtimeMonitorRecord): void
 }>()
 </script>

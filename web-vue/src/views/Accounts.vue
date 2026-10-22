@@ -36,6 +36,29 @@
               selected-indicator="none"
               aria-label="账号组筛选"
             />
+            <GroupedSelectMenu
+              v-model="healthFilter"
+              :options="healthFilterOptions"
+              placeholder="健康度"
+              selected-indicator="none"
+              aria-label="账号健康度筛选"
+            />
+            <GroupedSelectMenu
+              v-model="flagFilter"
+              :groups="flagFilterGroups"
+              placeholder="更多筛选"
+              selected-indicator="none"
+              aria-label="更多筛选"
+            />
+            <Button
+              v-if="filtersActive"
+              size="sm"
+              variant="ghost"
+              :root-class="accountToolbarSecondaryClass"
+              @click="resetFilters"
+            >
+              清除筛选
+            </Button>
           </FilterToolbar>
 
           <div class="accounts-toolbar-summary">
@@ -44,7 +67,11 @@
               :total-count="accountListTotal"
               :selected-count="selectedCount"
               :view-mode="viewMode"
+              :matching-count="accountListTotal"
+              :selecting-matching="selectingAllMatching"
+              :cross-page="crossPageSelected"
               @toggle-all="toggleSelectAllVisible"
+              @select-all-matching="selectAllMatching"
               @update:view-mode="setViewMode"
             />
           </div>
@@ -103,14 +130,20 @@
         </div>
       </div>
 
+      <AccountScheduleSummary
+        :summary="availabilitySummary"
+        :filter="statusFilter"
+        @select="(value: string) => statusFilter = value as typeof statusFilter"
+      />
+
       <PageLoadingState
         v-if="loading && filteredAccounts.length === 0"
         title="正在加载账号"
         description="读取账号列表、分组和分页状态。"
       />
 
-      <TableShell v-else-if="viewMode === 'list'">
-        <table class="min-w-[1080px] w-full text-left text-sm">
+      <TableShell v-else-if="viewMode === 'list'" sticky-header>
+        <table class="min-w-[1180px] w-full text-left text-sm">
           <thead class="text-xs uppercase tracking-[0.16em] text-muted-foreground">
             <tr>
               <th class="w-12 py-3 pr-4">
@@ -119,20 +152,21 @@
                   @update:model-value="toggleSelectAllVisible"
                 />
               </th>
-              <th class="py-3 pr-5">TOKEN</th>
-              <th class="py-3 pr-5">类型 / 来源</th>
-              <th class="py-3 pr-5">状态</th>
               <th class="py-3 pr-5">账户信息</th>
-              <th class="py-3 pr-5">创建时间</th>
-              <th class="py-3 pr-5">图片额度</th>
-              <th class="py-3 pr-5">恢复时间</th>
+              <th class="py-3 pr-5">状态</th>
+              <th class="py-3 pr-5">健康</th>
+              <th class="py-3 pr-5">调度</th>
+              <th class="py-3 pr-5">凭据</th>
+              <th class="py-3 pr-5">出口</th>
+              <th class="py-3 pr-5">图片额度 / 重置</th>
               <th class="py-3 pr-5">成功 / 失败</th>
+              <th class="py-3 pr-5">最近使用 / 建于</th>
               <th class="py-3 text-right">操作</th>
             </tr>
           </thead>
           <tbody class="text-sm text-foreground">
             <tr v-if="!loading && filteredAccounts.length === 0">
-              <td colspan="10" class="py-6">
+              <td colspan="11" class="py-6">
                 <EmptyState
                   plain
                   title="暂无账号数据"
@@ -145,19 +179,22 @@
               :key="item.id"
               :item="item"
               :selected="isSelected(item.id)"
-              :refreshing="refreshingAccountId === item.id"
-              :resetting="resettingAccountId === item.id"
+              :refreshing="refreshingAccountIds.has(item.id)"
+              :resetting="resettingAccountIds.has(item.id)"
+              :busy="batchBusy"
               :status-detail-card-class="accountStatusDetailCardClass"
               :status-detail-text="accountStatusDetailText"
               @toggle-select="toggleSelect"
-              @copy-token="copyAccountToken"
+              @copy-credential="copyAccountCredential"
               @edit="openEditModal"
               @toggle-enabled="toggleEnabled"
               @refresh-token="refreshToken"
               @reset-state="resetAccountState"
+              @clear-auto-pause="clearAutoPause"
               @copy-final-checkout-link="copyFinalCheckoutLink"
               @open-final-checkout-link="openFinalCheckoutLink"
               @remove="removeAccount"
+              @account-action="handleAccountAction"
             />
           </tbody>
         </table>
@@ -177,19 +214,22 @@
           :key="`${item.id}-card`"
           :item="item"
           :selected="isSelected(item.id)"
-          :refreshing="refreshingAccountId === item.id"
-          :resetting="resettingAccountId === item.id"
+          :refreshing="refreshingAccountIds.has(item.id)"
+          :resetting="resettingAccountIds.has(item.id)"
+          :busy="batchBusy"
           :status-detail-card-class="accountStatusDetailCardClass"
           :status-detail-text="accountStatusDetailText"
           @toggle-select="toggleSelect"
-          @copy-token="copyAccountToken"
+          @copy-credential="copyAccountCredential"
           @edit="openEditModal"
           @toggle-enabled="toggleEnabled"
           @refresh-token="refreshToken"
           @reset-state="resetAccountState"
+          @clear-auto-pause="clearAutoPause"
           @copy-final-checkout-link="copyFinalCheckoutLink"
           @open-final-checkout-link="openFinalCheckoutLink"
           @remove="removeAccount"
+          @account-action="handleAccountAction"
         />
       </div>
 
@@ -198,6 +238,7 @@
         v-model:page-size="pageSize"
         :total-count="accountListTotal"
         :page-size-options="pageSizeOptions"
+        v-model:layout-mode="listLayoutMode"
         unit="个账号"
         :disabled="loading"
       />
@@ -417,6 +458,7 @@
         v-model:page-size="grokPageSize"
         :total-count="grokAccountListTotal"
         :page-size-options="grokPageSizeOptions"
+        v-model:layout-mode="listLayoutMode"
         unit="个 Grok 账号"
         :disabled="grokLoading"
       />
@@ -497,15 +539,59 @@
 
                 <FormSection surface="plain">
                   <label class="block text-xs">
-                    <span class="ui-field-label">Access Token（必填）</span>
+                    <span class="ui-field-label">{{ editingId ? 'Access Token（留空不修改）' : 'Access Token（必填）' }}</span>
                     <textarea
                       v-model.trim="form.access_token"
                       rows="3"
                       class="ui-textarea-sm font-mono"
-                      placeholder="粘贴完整 access token"
-                      :disabled="!!editingId"
+                      :placeholder="editingId ? '留空保持当前 access token' : '粘贴完整 access token'"
                     ></textarea>
                   </label>
+                  <label class="mt-2.5 block text-xs">
+                    <span class="ui-field-label">Refresh Token（选填{{ editingId ? '，留空不修改' : '' }}）</span>
+                    <textarea
+                      v-model.trim="form.refresh_token"
+                      rows="2"
+                      class="ui-textarea-sm font-mono"
+                      :placeholder="editingId ? (editingAccount?.has_refresh_token ? '已保存 refresh token；填写新值才会覆盖' : '当前没有 refresh token') : '填写后可自动续期 access token'"
+                      autocomplete="off"
+                    ></textarea>
+                  </label>
+                </FormSection>
+
+                <FormSection v-if="editingId && editingAccount" title="出口" surface="plain">
+                  <div class="space-y-2 text-xs">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <div class="min-w-0">
+                        <p class="text-sm font-medium text-foreground">
+                          {{ editingAccount.egress?.label || '默认出口' }}
+                          <span class="ml-1 text-xs font-normal text-muted-foreground">{{ editingAccount.egress?.source_label || '' }}</span>
+                        </p>
+                        <p v-if="editingAccount.egress?.switch_to" class="mt-0.5 text-amber-600 dark:text-amber-400">
+                          正在换到 {{ editingAccount.egress.switch_to_label }}：账号已停用，到点后自动切换并恢复接单。
+                        </p>
+                        <p v-else class="mt-0.5 text-muted-foreground">
+                          出口固定不变；要换 IP 请点「更换出口」，会先停用 24 小时再切换。
+                        </p>
+                      </div>
+                      <Button
+                        v-if="editingAccount.egress?.switch_to"
+                        size="sm"
+                        variant="outline"
+                        @click="egress.cancelSwitch(accounts, editingAccount)"
+                      >
+                        取消更换出口
+                      </Button>
+                      <Button
+                        v-else
+                        size="sm"
+                        variant="outline"
+                        @click="egress.openSwitch(accounts, editingAccount)"
+                      >
+                        更换出口
+                      </Button>
+                    </div>
+                  </div>
                 </FormSection>
 
                 <FormSection title="调度属性" surface="plain">
@@ -783,6 +869,34 @@
               </div>
 
               <div class="min-h-[26rem] p-4">
+                <label v-if="importMode !== 'backup_json'" class="mb-3 block text-xs">
+                  <span class="ui-field-label">导入到账号组</span>
+                  <GroupedSelectMenu
+                    v-model="importTargetGroup"
+                    :options="importTargetGroupOptions"
+                    placeholder="选择账号组"
+                    selected-indicator="none"
+                    aria-label="导入目标账号组"
+                    block
+                    :disabled="importModalBusy"
+                  />
+                </label>
+                <SurfaceBox
+                  v-if="importMode === 'access_token' || importMode === 'session_json' || importMode === 'cpa_json'"
+                  tag="label"
+                  density="compact"
+                  class="mb-3 flex items-start gap-2"
+                >
+                  <Checkbox
+                    :model-value="verifyOnImport"
+                    :disabled="importBusy"
+                    @update:model-value="verifyOnImport = Boolean($event)"
+                  />
+                  <span>
+                    入池前验证
+                    <span class="block text-xs text-muted-foreground">先用 refresh_token 换一次 token 并同步额度，验证不通过的账号不会留在号池。</span>
+                  </span>
+                </SurfaceBox>
                 <div v-if="importMode === 'oauth_login'" class="space-y-3">
                   <ImportModePanel
                     title="OAuth 登录已有账号（带自动刷新）"
@@ -888,9 +1002,34 @@
                   </StateBlock>
                 </div>
 
+                <div v-else-if="importMode === 'sub2api_json'" class="space-y-3">
+                  <ImportModePanel
+                    title="导入 Sub2API JSON 文件"
+                    description="支持一次多选多个本地 Sub2API 导出文件，兼容常见导出结构与嵌套凭据字段，保存账号后同步账号与额度。"
+                  />
+                  <StateBlock dashed compact>
+                    <Button size="sm" variant="outline" :disabled="importBusy" @click="openSub2apiFileDialog">
+                      选择 Sub2API JSON 文件
+                    </Button>
+                  </StateBlock>
+                </div>
+
+                <div v-else-if="importMode === 'backup_json'" class="space-y-3">
+                  <ImportModePanel
+                    title="导入完整备份文件"
+                    description="还原本系统「导出 → 完整备份」生成的 JSON：保留账号 ID、凭据、分组、代理和统计，不联网同步；已存在的账号会被备份内容覆盖。"
+                  />
+                  <StateBlock dashed compact>
+                    <Button size="sm" variant="outline" :disabled="importBusy" @click="openBackupFileDialog">
+                      选择备份文件
+                    </Button>
+                  </StateBlock>
+                </div>
+
                 <div v-else-if="importMode === 'remote_cpa'" class="space-y-3">
                   <RemoteAccountImportPanel
                     mode="cpa"
+                    :target-group-id="targetGroupParam()"
                     @busy-change="remoteImportBusy = $event"
                     @imported="handleRemoteImportDone"
                   />
@@ -899,6 +1038,7 @@
                 <div v-else-if="importMode === 'sub2api'" class="space-y-3">
                   <RemoteAccountImportPanel
                     mode="sub2api"
+                    :target-group-id="targetGroupParam()"
                     @busy-change="remoteImportBusy = $event"
                     @imported="handleRemoteImportDone"
                   />
@@ -907,41 +1047,110 @@
             </div>
     </ModalShell>
 
-    <ModalShell :open="activeAccountPlatform === 'gpt' && showRefreshProgress" max-width="34rem" :z-index="140">
-          <ModalHeader
-            :title="refreshProgressTitle || '刷新账号信息和额度'"
-            :close-disabled="batchBusy && !refreshProgress?.done"
-            compact
-            @close="closeRefreshProgress"
-          >
-            <template #actions>
-              <Button
-                v-if="canStopRefreshProgress"
-                size="xs"
-                variant="outline"
-                root-class="min-w-14 justify-center text-amber-600"
-                :disabled="bulkStopRequested"
-                @click="requestStopRefreshProgress"
-              >
-                {{ bulkStopRequested ? '停止中...' : '停止' }}
-              </Button>
-            </template>
-          </ModalHeader>
-          <div class="space-y-4 px-5 py-4">
-            <div class="flex items-center justify-between text-xs text-muted-foreground">
-              <span>{{ refreshProgress?.processed || 0 }} / {{ refreshProgress?.total || 0 }}</span>
-              <span>{{ refreshProgressPercent }}%</span>
-            </div>
-            <ProgressBar :value="refreshProgressPercent" aria-label="账号刷新进度" />
-            <MetricStrip :items="refreshProgressItems" columns-class="grid-cols-2" density="compact" />
-            <SurfaceBox v-if="refreshProgress?.error" tag="p" tone="danger" density="compact">
-              {{ refreshProgress.error }}
-            </SurfaceBox>
-          </div>
-    </ModalShell>
+    <OperationProgressDrawer
+      :open="activeAccountPlatform === 'gpt' && showRefreshProgress"
+      :title="refreshProgressTitle || '刷新账号信息和额度'"
+      :processed="refreshProgress?.processed || 0"
+      :total="refreshProgress?.total || 0"
+      :percent="refreshProgressPercent"
+      :status-text="refreshProgressStatusText"
+      :metrics="refreshProgressItems"
+      :events="refreshProgress?.events || []"
+      :error="refreshProgress?.error || ''"
+      :close-disabled="batchBusy && !refreshProgress?.done"
+      :can-stop="canStopRefreshProgress"
+      :stopping="bulkStopRequested"
+      @close="closeRefreshProgress"
+      @stop="requestStopRefreshProgress"
+    />
+
+    <AccountCredentialsModal
+      :open="credentials.opened.value"
+      :account-label="credentials.accountLabel.value"
+      :has-refresh-token="credentials.hasRefreshToken.value"
+      :values="credentials.values.value"
+      :loading="credentials.loading.value"
+      :errors="credentials.errors.value"
+      @close="credentials.close"
+      @reveal="credentials.reveal"
+      @copy="credentials.copy"
+    />
+
+    <AccountCodexBindModal
+      :open="codexBind.opened.value"
+      :busy="codexBind.busy.value"
+      :account-label="codexBind.accountLabel.value"
+      :email-hint="codexBind.emailHint.value"
+      :authorize-url="codexBind.authorizeUrl.value"
+      :redirect-prefix="codexBind.redirectPrefix.value"
+      :callback="codexBind.callback.value"
+      :session-id="codexBind.sessionId.value"
+      :bound="codexBind.bound.value"
+      @close="codexBind.close"
+      @start="codexBind.start"
+      @open-url="codexBind.openAuthorizeUrl"
+      @copy-url="codexBind.copyAuthorizeUrl"
+      @finish="codexBind.finish"
+      @update:email-hint="codexBind.emailHint.value = $event"
+      @update:callback="codexBind.callback.value = $event"
+    />
+
+    <AccountEgressSwitchModal
+      :open="egress.opened.value"
+      v-model="egress.target.value"
+      :options="egress.targetOptions.value"
+      :count="egress.count.value"
+      :account-label="egress.accountLabel.value"
+      :hours="egress.hours.value"
+      :loading="egress.loading.value"
+      :submitting="egress.submitting.value"
+      :error="egress.error.value"
+      @close="egress.closeSwitch"
+      @submit="egress.submitSwitch"
+    />
+
+    <AccountBatchTestModal
+      :open="batchTest.opened.value"
+      :rows="batchTest.rows.value"
+      :mode="batchTest.mode.value"
+      :model="batchTest.model.value"
+      :prompt="batchTest.prompt.value"
+      :detail-row="batchTest.detailRow.value"
+      :model-options="batchTest.modelOptions.value"
+      :model-catalog-loading="batchTest.modelCatalogLoading.value"
+      @update:mode="batchTest.setMode"
+      @update:model="batchTest.model.value = $event"
+      @update:prompt="batchTest.prompt.value = $event"
+      @select-row="batchTest.detailRowId.value = $event"
+      :running="batchTest.running.value"
+      :stop-requested="batchTest.stopRequested.value"
+      :finished="batchTest.finished.value"
+      :success-count="batchTest.successCount.value"
+      :failed-count="batchTest.failedCount.value"
+      @close="batchTest.close"
+      @run="batchTest.run"
+      @stop="batchTest.stop"
+    />
+
+    <AccountLoginImportModal
+      :open="loginImport.opened.value"
+      :text="loginImport.text.value"
+      :verify="loginImport.verify.value"
+      :job="loginImport.job.value"
+      :line-count="loginImport.lineCount.value"
+      :starting="loginImport.starting.value"
+      :stopping="loginImport.stopping.value"
+      @update:text="loginImport.text.value = $event"
+      @update:verify="loginImport.verify.value = $event"
+      @close="loginImport.close"
+      @start="loginImport.start"
+      @stop="loginImport.stop"
+    />
 
     <input ref="manualTokenFileInputRef" type="file" accept=".txt,text/plain" class="hidden" @change="handleManualTokenFileChange" />
     <input ref="cpaFileInputRef" type="file" accept=".json,application/json" multiple class="hidden" @change="handleCPAFileChange" />
+    <input ref="sub2apiFileInputRef" type="file" accept=".json,application/json" multiple class="hidden" @change="handleSub2apiFileChange" />
+    <input ref="backupFileInputRef" type="file" accept=".json,application/json" class="hidden" @change="handleBackupFileChange" />
   </div>
 </template>
 
@@ -958,11 +1167,13 @@ import FormSection from '@/components/ai/FormSection.vue'
 import ImportModePanel from '@/components/ai/ImportModePanel.vue'
 import InfoCard from '@/components/ai/InfoCard.vue'
 import ListPagination from '@/components/ai/ListPagination.vue'
+import { useListLayoutPreference } from '@/composables/useListLayoutPreference'
 import MetricStrip from '@/components/ai/MetricStrip.vue'
 import ModalBody from '@/components/ai/ModalBody.vue'
 import ModalFooter from '@/components/ai/ModalFooter.vue'
 import ModalHeader from '@/components/ai/ModalHeader.vue'
 import ModalShell from '@/components/ai/ModalShell.vue'
+import OperationProgressDrawer from '@/components/ai/OperationProgressDrawer.vue'
 import PageLoadingState from '@/components/ai/PageLoadingState.vue'
 import PagePanel from '@/components/ai/PagePanel.vue'
 import ProgressBar from '@/components/ai/ProgressBar.vue'
@@ -980,6 +1191,17 @@ import {
 } from '@/api/grokAccounts'
 import AccountGridCard from './accounts/AccountGridCard.vue'
 import AccountTableRow from './accounts/AccountTableRow.vue'
+import AccountScheduleSummary from './accounts/AccountScheduleSummary.vue'
+import AccountBatchTestModal from './accounts/AccountBatchTestModal.vue'
+import { useAccountBatchTestRuntime } from './accounts/accountBatchTestRuntime'
+import { useAccountCredentialsRuntime } from './accounts/accountCredentialsRuntime'
+import { useAccountEgressRuntime } from './accounts/accountEgressRuntime'
+import AccountEgressSwitchModal from './accounts/AccountEgressSwitchModal.vue'
+import { useAccountCodexBindRuntime } from './accounts/accountCodexBindRuntime'
+import AccountCredentialsModal from './accounts/AccountCredentialsModal.vue'
+import AccountCodexBindModal from './accounts/AccountCodexBindModal.vue'
+import AccountLoginImportModal from './accounts/AccountLoginImportModal.vue'
+import { useAccountLoginImportRuntime } from './accounts/accountLoginImportRuntime'
 import GrokAccountConversationTestModal from './accounts/GrokAccountConversationTestModal.vue'
 import GrokAccountGridCard from './accounts/GrokAccountGridCard.vue'
 import GrokAccountTableRow from './accounts/GrokAccountTableRow.vue'
@@ -1005,6 +1227,7 @@ defineOptions({ name: 'Accounts' })
 const RemoteAccountImportPanel = defineAsyncComponent(() => import('@/components/ai/RemoteAccountImportPanel.vue'))
 const confirmDialog = useConfirmDialog()
 const toast = useToast()
+const { listLayoutMode } = useListLayoutPreference()
 
 const {
   loading,
@@ -1013,12 +1236,20 @@ const {
   keyword,
   statusFilter,
   groupFilter,
+  healthFilter,
+  flagFilter,
+  flagFilterGroups,
+  availabilitySummary,
+  filtersActive,
+  resetFilters,
   statusFilterOptions,
   groupFilterOptions,
+  healthFilterOptions,
   editingId,
   accounts,
   accountListTotal,
   accountAllTotal,
+  selectedIds,
   selectedCount,
   allVisibleSelected,
   currentPage,
@@ -1027,8 +1258,8 @@ const {
   batchBusy,
   batchActionLabel,
   viewMode,
-  refreshingAccountId,
-  resettingAccountId,
+  refreshingAccountIds,
+  resettingAccountIds,
   importBusy,
   exportBusy,
   showImportModal,
@@ -1041,6 +1272,11 @@ const {
   oauthRedirectUriPrefix,
   manualTokenText,
   sessionJsonText,
+  verifyOnImport,
+  importTargetGroup,
+  targetGroupParam,
+  importBackupFile,
+  importSub2apiFiles,
   accountGroups,
   proxyGroups,
   accountGroupsLoading,
@@ -1108,9 +1344,14 @@ const {
   finishOAuthLogin,
   importLocalCPAFiles,
   refreshAllAccounts,
+  refreshSelectedAccessTokens,
+  refreshAccessTokensFor,
+  selectAllMatching,
+  selectingAllMatching,
+  crossPageSelected,
   requestStopRefreshProgress,
   closeRefreshProgress,
-  copyAccountToken,
+  copyAccountCredential,
   extractSelectedCheckout,
   copyFinalCheckoutLink,
   openFinalCheckoutLink,
@@ -1121,6 +1362,7 @@ const {
   toggleEnabled,
   refreshToken,
   resetAccountState,
+  clearAutoPause,
   removeAccount,
   runBulkAction,
   bindSelectedAccountsToGroup,
@@ -1488,6 +1730,38 @@ function accountStatusDetailText(item: Account) {
   return buildAccountStatusDetailText(item, accountGroupLabel, accountProxyText)
 }
 
+const batchTest = useAccountBatchTestRuntime({ accounts, selectedIds, loadData })
+const credentials = useAccountCredentialsRuntime()
+const egress = useAccountEgressRuntime({ selectedIds, loadData })
+const codexBind = useAccountCodexBindRuntime({ loadData })
+const editingAccount = computed(() => accounts.value.find((item) => item.id === editingId.value) || null)
+
+const importTargetGroupOptions = computed(() => [
+  { label: '保持账号原分组（不指定）', value: '__keep__' },
+  { label: '未分组', value: '__ungrouped__' },
+  ...accountGroups.value.map((group) => ({
+    label: `${group.enabled === false ? '停用 · ' : ''}${group.name || group.id}`,
+    value: group.id,
+  })),
+])
+
+watch(showImportModal, (opened) => {
+  if (opened) void loadAccountGroups({ silentErrorToast: true })
+})
+
+function handleAccountAction(
+  key: 'view-credentials' | 'test-account' | 'refresh-access-token' | 'bind-codex' | 'egress-switch' | 'egress-cancel',
+  item: Account,
+) {
+  if (key === 'view-credentials') credentials.open(item)
+  else if (key === 'bind-codex') codexBind.open(item)
+  else if (key === 'refresh-access-token') void refreshAccessTokensFor(item.id)
+  else if (key === 'test-account') batchTest.open([item.id])
+  else if (key === 'egress-switch') void egress.openSwitch(accounts.value, item)
+  else if (key === 'egress-cancel') void egress.cancelSwitch(accounts.value, item)
+}
+const loginImport = useAccountLoginImportRuntime({ accounts, selectedIds, loadData })
+
 const refreshProgressItems = computed(() => buildAccountProgressMetricItems(
   refreshProgressMetricLabel.value,
   refreshProgressMetricValue.value,
@@ -1514,8 +1788,15 @@ const {
   exportAccounts,
   refreshAllAccounts,
   extractSelectedCheckout,
+  refreshSelectedAccessTokens,
   runBulkAction,
   bindSelectedAccountsToGroup,
+  openBatchTest: () => batchTest.open(),
+  openLoginImport: () => { void loginImport.open() },
+  reactivateSelected: () => loginImport.reactivateSelected(),
+  switchEgressSelected: () => egress.openSwitch(accounts.value),
+  cancelEgressSelected: () => egress.cancelSwitch(accounts.value),
+  clearSelection,
 })
 
 function openManualTokenFile() {
@@ -1540,6 +1821,33 @@ function openCPAFileDialog() {
 async function handleCPAFileChange(event: Event) {
   const target = event.target as HTMLInputElement | null
   await importLocalCPAFiles(target?.files)
+  if (target) target.value = ''
+}
+
+const sub2apiFileInputRef = ref<HTMLInputElement | null>(null)
+const backupFileInputRef = ref<HTMLInputElement | null>(null)
+
+function openSub2apiFileDialog() {
+  if (!sub2apiFileInputRef.value || importBusy.value) return
+  sub2apiFileInputRef.value.value = ''
+  sub2apiFileInputRef.value.click()
+}
+
+async function handleSub2apiFileChange(event: Event) {
+  const target = event.target as HTMLInputElement | null
+  await importSub2apiFiles(target?.files)
+  if (target) target.value = ''
+}
+
+function openBackupFileDialog() {
+  if (!backupFileInputRef.value || importBusy.value) return
+  backupFileInputRef.value.value = ''
+  backupFileInputRef.value.click()
+}
+
+async function handleBackupFileChange(event: Event) {
+  const target = event.target as HTMLInputElement | null
+  await importBackupFile(target?.files?.[0])
   if (target) target.value = ''
 }
 

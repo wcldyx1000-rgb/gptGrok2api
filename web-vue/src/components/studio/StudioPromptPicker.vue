@@ -106,6 +106,8 @@
           </div>
         </article>
       </div>
+      <!-- 滚动到底自动追加下一页，避免一次渲染全部卡片 -->
+      <div v-if="hasMorePrompts" ref="loadMoreSentinel" class="prompt-picker-sentinel" aria-hidden="true"></div>
     </ModalBody>
 
     <ModalFooter align="between" compact>
@@ -123,7 +125,7 @@
 
 <script setup lang="ts">
 import { Icon } from '@iconify/vue'
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Button, EmptyState, Input } from 'nanocat-ui'
 import type { PromptLibraryItem } from '@/api/prompts'
 import FilterToolbar from '@/components/ai/FilterToolbar.vue'
@@ -200,6 +202,38 @@ function ensureLoaded() {
 
 onMounted(ensureLoaded)
 
+// 滚动分页：哨兵元素进入可视区时再追加一页。
+const loadMoreSentinel = ref<HTMLElement | null>(null)
+let sentinelObserver: IntersectionObserver | null = null
+
+function loadNextPromptPage() {
+  if (!hasMorePrompts.value) return
+  visibleLimit.value = Math.min(filteredPrompts.value.length, visibleLimit.value + PROMPT_PAGE_SIZE)
+}
+
+function observeSentinel() {
+  sentinelObserver?.disconnect()
+  sentinelObserver = null
+  const target = loadMoreSentinel.value
+  if (!target || typeof IntersectionObserver === 'undefined') return
+  sentinelObserver = new IntersectionObserver((entries) => {
+    if (entries.some((entry) => entry.isIntersecting)) {
+      loadNextPromptPage()
+    }
+  }, { rootMargin: '240px' })
+  sentinelObserver.observe(target)
+}
+
+// 每追加一页后重新观察：新页内容不够填满容器时哨兵仍在视口内，会继续加载。
+watch([loadMoreSentinel, visibleLimit, () => filteredPrompts.value.length], () => {
+  void nextTick(observeSentinel)
+}, { flush: 'post' })
+
+onBeforeUnmount(() => {
+  sentinelObserver?.disconnect()
+  sentinelObserver = null
+})
+
 watch(
   () => props.open,
   () => ensureLoaded(),
@@ -227,6 +261,11 @@ watch([keyword, sourceFilter, categoryFilter], () => {
   gap: 0.75rem;
   overflow-y: auto;
   background: hsl(var(--secondary) / 0.12);
+}
+
+.prompt-picker-sentinel {
+  flex: 0 0 auto;
+  height: 1px;
 }
 
 .prompt-picker-filter {

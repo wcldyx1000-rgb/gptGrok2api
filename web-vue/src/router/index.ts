@@ -1,5 +1,6 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { resolveLoginRedirect } from './redirect'
 
 const adminHome = { name: 'dashboard' }
 const userHome = { name: 'studio' }
@@ -106,12 +107,13 @@ router.beforeEach(async (to) => {
   const authStore = useAuthStore()
 
   if (to.name === 'login') {
+    const loginRedirect = resolveLoginRedirect(to.query.redirect)
     if (authStore.isLoggedIn) {
-      return authStore.isUser ? userHome : adminHome
+      return loginRedirect || (authStore.isUser ? userHome : adminHome)
     }
     const loggedIn = await authStore.checkAuth()
     if (loggedIn) {
-      return authStore.isUser ? userHome : adminHome
+      return loginRedirect || (authStore.isUser ? userHome : adminHome)
     }
     return true
   }

@@ -1,4 +1,5 @@
 import apiClient from './client'
+import type { RegisterEgressConfig } from './egress'
 
 export type OutlookMailboxParseStats = {
   raw_lines?: number
@@ -24,6 +25,55 @@ export type OutlookFailedMailbox = {
   updated_at?: string
 }
 
+export type OutlookPoolState =
+  | 'unused'
+  | 'leased'
+  | 'used'
+  | 'failed'
+  | 'family_used'
+  | 'login_required'
+  | 'token_invalid'
+
+/** 逐邮箱投影：邮箱已脱敏，只有 has_* 布尔，不含密码/令牌/client_id/租约令牌 */
+export type OutlookPoolEntry = {
+  id: string
+  email: string
+  alias_of: string
+  is_alias: boolean
+  state: OutlookPoolState | string
+  inherited: boolean
+  reason: string
+  updated_at: string
+  leased_at: string
+  lease_stale: boolean
+  cooling: boolean
+  use_count: number
+  has_password: boolean
+  has_client_id: boolean
+  has_refresh_token: boolean
+  resettable: boolean
+  deletable: boolean
+}
+
+export type OutlookPoolEntriesResponse = {
+  provider_id: string
+  items: OutlookPoolEntry[]
+  total: number
+  page: number
+  page_size: number
+  pages: number
+  state_counts: Record<string, number>
+  stats: Record<string, number>
+}
+
+export type OutlookPoolEntriesQuery = {
+  provider_id: string
+  q?: string
+  state?: string
+  page?: number
+  page_size?: number
+}
+
 export type RegisterProvider = {
   id?: string
   provider_id?: string
@@ -39,6 +89,13 @@ export type RegisterProvider = {
   cf_inbox_jwt?: string
   cf_api_base?: string
   cf_api_key?: string
+  /** 凭据只写不读：后端返回空值并附带 `<key>_set`，保存时留空表示沿用已存值 */
+  api_key_set?: boolean
+  admin_key_set?: boolean
+  admin_password_set?: boolean
+  ddg_token_set?: boolean
+  cf_inbox_jwt_set?: boolean
+  cf_api_key_set?: boolean
   cf_auth_mode?: string
   cf_create_path?: string
   cf_messages_path?: string
@@ -105,6 +162,7 @@ export type GrokRegisterConfig = {
   browser_flow_enabled: boolean
   provider: GrokTurnstileProvider | string
   api_key: string
+  api_key_set?: boolean
   api_base: string
   request_timeout: number
   captcha_timeout: number
@@ -113,6 +171,7 @@ export type GrokRegisterConfig = {
   create_path: string
   result_path: string
   max_mail_retries: number
+  turnstile_prefetch: boolean
   xai_cli_oauth_enabled: boolean
   xai_cli_oauth_flow: 'device' | 'pkce_reference'
   xai_cli_pkce_reference_dir: string
@@ -199,6 +258,8 @@ export type LegacyRegisterConfig = {
   agent_identity_archive: {
     enabled: boolean
   }
+  confirm_refresh_token: boolean
+  egress?: RegisterEgressConfig
   mail: {
     request_timeout?: number
     wait_timeout?: number
@@ -226,6 +287,9 @@ export type LegacyRegisterConfig = {
     success_rate?: number
     current_quota?: number
     current_available?: number
+    pool_ok?: number
+    pool_fail?: number
+    pool_usable_rate?: number
     [key: string]: unknown
   }
   logs?: Array<{
@@ -297,6 +361,21 @@ export const registerApi = {
     return apiClient.post<any, { register: LegacyRegisterConfig }>('/api/register/outlook-pool/retry-selected', {
       provider_id: providerId,
       mailbox_ids: mailboxIds,
+    })
+  },
+  listOutlookPoolEntries(params: OutlookPoolEntriesQuery) {
+    return apiClient.get<any, OutlookPoolEntriesResponse>('/api/register/outlook-pool/entries', { params })
+  },
+  resetOutlookMailbox(providerId: string, mailboxId: string) {
+    return apiClient.post<any, OutlookPoolEntriesResponse>('/api/register/outlook-pool/mailboxes/reset', {
+      provider_id: providerId,
+      mailbox_id: mailboxId,
+    })
+  },
+  deleteOutlookMailbox(providerId: string, mailboxId: string) {
+    return apiClient.post<any, OutlookPoolEntriesResponse>('/api/register/outlook-pool/mailboxes/delete', {
+      provider_id: providerId,
+      mailbox_id: mailboxId,
     })
   },
   getGptMailStatus(provider: RegisterProvider, force = true) {

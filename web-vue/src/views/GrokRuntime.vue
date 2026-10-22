@@ -174,6 +174,9 @@
         </template>
       </PanelHeader>
 
+      <p class="text-xs text-muted-foreground">
+        敏感字段（app_key、api_key、webui_key、cf_cookies、cf_clearance、带账号密码的代理 URL）不会回显，对应 has_* 标记表示已配置；保存时留空即保留原值，填写新值则覆盖，设置 "clear_字段名": true 可清除（如 "clear_api_key": true）。
+      </p>
       <textarea
         v-model="configText"
         rows="20"

@@ -26,6 +26,10 @@
         />
         <span v-if="file.expired" class="media-badge danger">已过期</span>
         <span v-else class="media-badge">{{ storageLabel }}</span>
+        <span v-if="genboxStatusLabel" class="media-badge genbox-badge" :title="genboxStatusLabel">
+          <Icon icon="lucide:cloud-check" class="h-3 w-3" />
+          {{ genboxStatusLabel }}
+        </span>
       </div>
 
       <div class="media-overlay">
@@ -34,6 +38,19 @@
         </button>
         <button class="overlay-btn" title="编辑标签" @click.stop="handleEditTags">
           <Icon icon="lucide:tag" />
+        </button>
+        <button
+          v-if="genboxPushEnabled"
+          class="overlay-btn"
+          :class="{ 'is-busy': genboxBusy }"
+          :disabled="genboxBusy"
+          :title="genboxBusy ? '正在推送 GenBox' : '推送到 GenBox'"
+          @click.stop="handleGenBoxPush"
+        >
+          <Icon
+            :icon="genboxBusy ? 'lucide:loader-circle' : 'lucide:cloud-upload'"
+            :class="{ 'animate-spin': genboxBusy }"
+          />
         </button>
         <button class="overlay-btn" title="下载" @click.stop="handleDownload">
           <Icon icon="lucide:download" />
@@ -51,7 +68,7 @@
         <span v-if="dimensions">{{ dimensions }}</span>
         <Tooltip
           v-if="file.expires_in_seconds !== null && !file.expired && timeRemaining"
-          :text="'将在 ' + timeRemaining + ' 后自动删除'"
+          :text="expiryTooltip"
         >
           <span class="file-countdown">{{ timeRemaining }}</span>
         </Tooltip>
@@ -72,6 +89,7 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
 import { Icon } from '@iconify/vue'
 import { Checkbox, Tooltip } from 'nanocat-ui'
 import type { GalleryFile } from '@/api/gallery'
@@ -87,7 +105,16 @@ const props = defineProps<{
   sizeLabel: string
   dimensions: string
   timeRemaining: string
+  genboxPushEnabled: boolean
+  genboxBusy: boolean
+  genboxStatusLabel: string
 }>()
+
+const expiryTooltip = computed(() => {
+  if (props.timeRemaining === '已过期') return '已到保留期限，等待自动清理'
+  const at = props.file.expires_at ? `（${props.file.expires_at}）` : ''
+  return `将在 ${props.timeRemaining} 后自动删除${at}`
+})
 
 const emit = defineEmits<{
   (e: 'preview', file: GalleryFile): void
@@ -97,6 +124,7 @@ const emit = defineEmits<{
   (e: 'edit-tags', file: GalleryFile): void
   (e: 'download', file: GalleryFile): void
   (e: 'delete', file: GalleryFile): void
+  (e: 'genbox-push', file: GalleryFile): void
   (e: 'tag-click', tag: string): void
 }>()
 
@@ -126,6 +154,10 @@ function handleDownload() {
 
 function handleDelete() {
   emit('delete', props.file)
+}
+
+function handleGenBoxPush() {
+  emit('genbox-push', props.file)
 }
 
 function handleTagClick(tag: string) {
@@ -230,6 +262,12 @@ function handleTagClick(tag: string) {
   font-weight: 600;
   box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12);
   backdrop-filter: blur(8px);
+}
+
+.genbox-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
 }
 
 .media-badge.danger {

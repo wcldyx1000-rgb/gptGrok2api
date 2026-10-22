@@ -96,6 +96,28 @@
               <span>提示词</span>
             </StudioToolbarSelectButton>
 
+            <StudioToolbarSelectButton
+              v-if="mode === 'image'"
+              class="chat-file-task-button"
+              :disabled="isSending"
+              title="用当前提示词和参考图提交 PPT / PSD 文件任务"
+              @click.stop="$emit('open-file-task')"
+            >
+              <Icon icon="lucide:file-stack" class="h-3.5 w-3.5" />
+              <span>文件</span>
+            </StudioToolbarSelectButton>
+
+            <StudioToolbarSelectButton
+              v-if="mode === 'search'"
+              class="chat-search-skill-button"
+              :disabled="isSending"
+              title="搜索 Skill"
+              @click.stop="handleOpenSearchSkill"
+            >
+              <Icon icon="lucide:package-plus" class="h-3.5 w-3.5" />
+              <span>Skill</span>
+            </StudioToolbarSelectButton>
+
             <template v-if="mode === 'chat'">
               <div class="chat-settings-anchor">
                 <FloatingActionMenu
@@ -296,6 +318,8 @@ const emit = defineEmits<{
   'clear-references': []
   'preview-reference': [reference: StudioReference]
   'open-prompts': []
+  'open-file-task': []
+  'open-search-skill': []
 }>()
 
 const composerShellRef = ref<HTMLElement | null>(null)
@@ -443,6 +467,11 @@ function toggleSettings() {
 
 function closeFloatingMenus() {
   settingsOpen.value = false
+}
+
+function handleOpenSearchSkill() {
+  closeFloatingMenus()
+  emit('open-search-skill')
 }
 
 function handleOpenPrompts() {
@@ -743,7 +772,8 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.chat-prompt-button {
+.chat-prompt-button,
+.chat-search-skill-button {
   flex: 0 0 auto;
 }
 

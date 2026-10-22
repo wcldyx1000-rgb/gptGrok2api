@@ -51,6 +51,16 @@
             size="sm"
             variant="outline"
             root-class="chat-header-action-button"
+            title="PPT / PSD 可编辑文件任务"
+            @click="openFileTaskModal()"
+          >
+            <Icon icon="lucide:file-stack" class="h-3.5 w-3.5" />
+            <span class="chat-header-action-label hidden sm:inline">文件任务</span>
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            root-class="chat-header-action-button"
             :disabled="!activeConversation?.messages.length"
             @click="clearCurrentConversation"
           >
@@ -71,6 +81,8 @@
         </div>
       </div>
 
+      <div ref="studioContentRef" class="studio-content-layout">
+      <div class="studio-conversation-column">
       <StudioMessageList
         ref="messageListRef"
         :conversation="activeConversation"
@@ -84,12 +96,14 @@
         @edit="editMessage"
         @resend="resendMessage"
         @retry-assistant="retryAssistantMessage"
+        @resume-image-task="resumeImageTask"
         @delete-message="deleteMessage"
         @copy-message="copyText"
         @preview="openPreview"
         @reference-image="referenceGeneratedImage"
         @inpaint-image="openInpaintModal"
         @compare-image="openImageCompare"
+        @open-search-sources="openSearchSourcePanel"
       />
 
       <StudioComposer
@@ -116,8 +130,49 @@
         @clear-references="referenceRuntime.clear"
         @preview-reference="referenceRuntime.open"
         @open-prompts="openPromptPicker"
+        @open-file-task="openFileTaskFromComposer"
+        @open-search-skill="isSearchSkillOpen = true"
       />
+      </div>
+
+      <Transition name="studio-search-sources">
+        <aside
+          v-if="activeSearchSourceMessage && isSearchSourceDocked"
+          class="studio-search-sources-dock"
+          aria-label="参考来源"
+        >
+          <div class="studio-search-sources-dock-inner">
+            <StudioSearchSourcesPanel
+              :message="activeSearchSourceMessage"
+              :highlighted-source-index="highlightedSearchSourceIndex"
+              :highlight-revision="searchSourceHighlightRevision"
+              @close="closeSearchSourcePanel"
+            />
+          </div>
+        </aside>
+      </Transition>
+      </div>
     </main>
+
+    <!-- 窄屏：参考来源复用右侧抽屉 -->
+    <ModalShell
+      :open="Boolean(activeSearchSourceMessage) && !isSearchSourceDocked"
+      max-width="22rem"
+      :z-index="220"
+      align="start"
+      placement="end"
+      panel-class="studio-search-sources-drawer-panel"
+      close-on-backdrop
+      @close="closeSearchSourcePanel"
+    >
+      <StudioSearchSourcesPanel
+        v-if="activeSearchSourceMessage"
+        :message="activeSearchSourceMessage"
+        :highlighted-source-index="highlightedSearchSourceIndex"
+        :highlight-revision="searchSourceHighlightRevision"
+        @close="closeSearchSourcePanel"
+      />
+    </ModalShell>
 
     <StudioMobileHistory
       :open="isMobileHistoryOpen"
@@ -129,6 +184,18 @@
       @delete="deleteConversation"
     />
 
+    <StudioRecentFileTasksModal
+      v-if="isRecentFileTasksOpen"
+      :open="isRecentFileTasksOpen"
+      :prefill="fileTaskPrefill"
+      @close="isRecentFileTasksOpen = false"
+    />
+    <StudioSearchSkillModal
+      v-if="isSearchSkillOpen"
+      :open="isSearchSkillOpen"
+      @close="isSearchSkillOpen = false"
+      @copy="copyText"
+    />
     <StudioLightbox
       :preview="referenceRuntime.preview.value"
       @close="referenceRuntime.closePreview"
@@ -156,7 +223,7 @@
 <script setup lang="ts">
 import { Icon } from '@iconify/vue'
 import { Button } from 'nanocat-ui'
-import { computed, defineAsyncComponent, onBeforeUnmount, ref } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
 import { useToast } from '@/composables/useToast'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
@@ -193,6 +260,8 @@ import { useStudioSendRuntime } from '@/views/studio/studioSendRuntime'
 import StudioComposer from '@/components/studio/StudioComposer.vue'
 import StudioHistoryPanel from '@/components/studio/StudioHistoryPanel.vue'
 import StudioMessageList from '@/components/studio/StudioMessageList.vue'
+import StudioSearchSourcesPanel from '@/components/studio/StudioSearchSourcesPanel.vue'
+import ModalShell from '@/components/ai/ModalShell.vue'
 import type {
   StudioConversation,
   StudioConversationBadgeState,
@@ -206,6 +275,8 @@ import type { PromptLibraryItem } from '@/api/prompts'
 
 defineOptions({ name: 'Studio' })
 
+const StudioSearchSkillModal = defineAsyncComponent(() => import('@/components/studio/StudioSearchSkillModal.vue'))
+const StudioRecentFileTasksModal = defineAsyncComponent(() => import('@/components/studio/StudioRecentFileTasksModal.vue'))
 const StudioLightbox = defineAsyncComponent(() => import('@/components/studio/StudioLightbox.vue'))
 const StudioMobileHistory = defineAsyncComponent(() => import('@/components/studio/StudioMobileHistory.vue'))
 const StudioInpaintModal = defineAsyncComponent(() => import('@/components/studio/StudioInpaintModal.vue'))
@@ -225,6 +296,9 @@ const composerText = composerRuntime.composerText
 const editingMessageId = composerRuntime.editingMessageId
 const isSending = composerRuntime.isSending
 const isPromptPickerOpen = ref(false)
+const isSearchSkillOpen = ref(false)
+const isRecentFileTasksOpen = ref(false)
+const fileTaskPrefill = ref<{ prompt: string; images: string[]; nonce: number } | null>(null)
 const comparePreview = ref<StudioImageComparePreview | null>(null)
 const inpaintTarget = ref<{
   asset: StudioImageAssetView
@@ -232,6 +306,15 @@ const inpaintTarget = ref<{
   source: StudioImageCompareSource
 } | null>(null)
 const messageListRef = ref<StudioMessageListScroller | null>(null)
+const studioContentRef = ref<HTMLElement | null>(null)
+const searchPanelMessageId = ref('')
+const highlightedSearchSourceIndex = ref<number | null>(null)
+const searchSourceHighlightRevision = ref(0)
+// 对话区宽度足够时参考来源停靠在右侧并挤压对话区，否则用抽屉。
+const isSearchSourceDocked = ref(false)
+const SEARCH_SOURCE_DOCK_MIN_WIDTH_PX = 860
+let searchSourceHighlightTimer: number | null = null
+let searchSourceLayoutObserver: ResizeObserver | null = null
 const scrollRuntime = useStudioScrollRuntime({
   pageRuntime,
   messageListRef,
@@ -265,6 +348,12 @@ const activeConversation = computed(() => {
   return conversationLookup.value.byId.get(activeConversationId.value)
     || conversations.value[0]
     || null
+})
+const activeSearchSourceMessage = computed(() => {
+  if (!searchPanelMessageId.value) return null
+  return activeConversation.value?.messages.find((message) => (
+    message.id === searchPanelMessageId.value && Boolean(message.searchSources?.length)
+  )) || null
 })
 const imageTaskRuntime = useStudioImageTaskRuntime({
   pageRuntime,
@@ -354,6 +443,11 @@ const retryMessage = sendRuntime.fillComposerFromMessage
 const editMessage = sendRuntime.editMessage
 const resendMessage = sendRuntime.resendMessage
 const retryAssistantMessage = sendRuntime.retryAssistantMessage
+
+async function resumeImageTask(message: StudioMessage) {
+  if (!message.taskId) return
+  await imageTaskRuntime.resumePoll(message.taskId)
+}
 const sendImageEditRequest = sendRuntime.sendImageEditRequest
 const sendMessage = sendRuntime.sendMessage
 const chatModelOptions = modelFormRuntime.chatModelOptions
@@ -585,6 +679,21 @@ async function submitInpaintEdit(payload: { prompt: string; markedImage: File })
   if (ok) closeInpaintModal()
 }
 
+// 轻量版「文件模式」：把输入区当前的提示词与参考图带进文件任务弹窗，再由弹窗提交 PPT / PSD 任务。
+function openFileTaskModal(prefill: { prompt: string; images: string[] } | null = null) {
+  fileTaskPrefill.value = prefill ? { ...prefill, nonce: Date.now() } : null
+  isRecentFileTasksOpen.value = true
+}
+
+function openFileTaskFromComposer() {
+  openFileTaskModal({
+    prompt: composerText.value,
+    images: referenceRuntime.references.value
+      .map((reference) => reference.dataUrl)
+      .filter((url): url is string => Boolean(url)),
+  })
+}
+
 function openPromptPicker() {
   isPromptPickerOpen.value = true
 }
@@ -660,6 +769,57 @@ function initializeStudio() {
   void imageTaskRuntime.refresh()
 }
 
+function clearSearchSourceHighlight() {
+  highlightedSearchSourceIndex.value = null
+  if (searchSourceHighlightTimer !== null) {
+    window.clearTimeout(searchSourceHighlightTimer)
+    searchSourceHighlightTimer = null
+  }
+}
+
+function closeSearchSourcePanel() {
+  searchPanelMessageId.value = ''
+  clearSearchSourceHighlight()
+}
+
+function openSearchSourcePanel(messageId: string, sourceIndex?: number) {
+  const message = activeConversation.value?.messages.find((candidate) => candidate.id === messageId)
+  const sourceCount = message?.searchSources?.length || 0
+  if (!message || !sourceCount) return
+
+  searchPanelMessageId.value = message.id
+  clearSearchSourceHighlight()
+  if (sourceIndex === undefined || sourceIndex < 0 || sourceIndex >= sourceCount) return
+
+  highlightedSearchSourceIndex.value = sourceIndex
+  searchSourceHighlightRevision.value += 1
+  searchSourceHighlightTimer = window.setTimeout(() => {
+    highlightedSearchSourceIndex.value = null
+    searchSourceHighlightTimer = null
+  }, 1600)
+}
+
+function bindSearchSourceLayoutObserver() {
+  searchSourceLayoutObserver?.disconnect()
+  searchSourceLayoutObserver = null
+  const element = studioContentRef.value
+  if (!element) return
+  isSearchSourceDocked.value = element.getBoundingClientRect().width >= SEARCH_SOURCE_DOCK_MIN_WIDTH_PX
+  if (typeof ResizeObserver === 'undefined') return
+  searchSourceLayoutObserver = new ResizeObserver(([entry]) => {
+    if (entry) isSearchSourceDocked.value = entry.contentRect.width >= SEARCH_SOURCE_DOCK_MIN_WIDTH_PX
+  })
+  searchSourceLayoutObserver.observe(element)
+}
+
+watch(studioContentRef, () => {
+  void nextTick(bindSearchSourceLayoutObserver)
+}, { flush: 'post' })
+watch(activeConversationId, closeSearchSourcePanel)
+watch(activeSearchSourceMessage, (message) => {
+  if (!message && searchPanelMessageId.value) closeSearchSourcePanel()
+})
+
 function activateStudio() {
   void imageTaskRuntime.refresh()
   imageTaskRuntime.schedulePoll()
@@ -703,11 +863,91 @@ pageRuntime.onShow(() => {
 })
 
 onBeforeUnmount(() => {
+  searchSourceLayoutObserver?.disconnect()
+  searchSourceLayoutObserver = null
+  clearSearchSourceHighlight()
   disposeStudio()
 })
 </script>
 
 <style scoped>
+.studio-content-layout {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.studio-conversation-column {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.studio-search-sources-dock {
+  display: flex;
+  width: 22rem;
+  min-width: 0;
+  min-height: 0;
+  flex: 0 0 22rem;
+  justify-content: flex-end;
+  overflow: hidden;
+  border-left: 1px solid hsl(var(--border));
+  background: hsl(var(--card));
+}
+
+.studio-search-sources-dock-inner {
+  width: 22rem;
+  min-width: 22rem;
+  height: 100%;
+  min-height: 0;
+  flex: 0 0 22rem;
+}
+
+.studio-search-sources-enter-active,
+.studio-search-sources-leave-active {
+  transition: flex-basis 220ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: flex-basis;
+}
+
+.studio-search-sources-enter-active .studio-search-sources-dock-inner,
+.studio-search-sources-leave-active .studio-search-sources-dock-inner {
+  transition: opacity 160ms ease, transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: opacity, transform;
+}
+
+.studio-search-sources-enter-from,
+.studio-search-sources-leave-to {
+  flex-basis: 0;
+}
+
+.studio-search-sources-enter-from .studio-search-sources-dock-inner,
+.studio-search-sources-leave-to .studio-search-sources-dock-inner {
+  opacity: 0;
+  transform: translateX(0.75rem);
+}
+
+:global(.studio-search-sources-drawer-panel) {
+  display: flex;
+  height: calc(100dvh - 2rem);
+  min-height: 0;
+  flex-direction: column;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .studio-search-sources-enter-active,
+  .studio-search-sources-leave-active,
+  .studio-search-sources-enter-active .studio-search-sources-dock-inner,
+  .studio-search-sources-leave-active .studio-search-sources-dock-inner {
+    transition: none;
+  }
+}
+
 .studio-workspace {
   --studio-content-width: min(100%, clamp(48rem, 68vw, 78rem));
   --ui-card-border: hsl(var(--border));

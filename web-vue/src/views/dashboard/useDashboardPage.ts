@@ -1,5 +1,7 @@
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
-import { statsApi } from '@/api/stats'
+import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
+import { statsApi, type DashboardSnapshot } from '@/api/stats'
+import { monitorApi } from '@/api/monitor'
+import { formatRequestDuration } from '@/lib/requestDuration'
 import { usePageQuery } from '@/composables/usePageQuery'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import {
@@ -11,8 +13,27 @@ import {
   getModelColor,
   filterValidModels,
 } from '@/lib/chartTheme'
+import { buildDashboardTrendSeries } from './dashboardTrendSeries'
 import { DEFAULT_DASHBOARD_TIME_RANGE, type DashboardTimeRange } from '@/lib/timeRanges'
+import {
+  readDashboardDefaultTimeRange,
+  readDashboardRefreshIntervalSeconds,
+} from './dashboardPreferences'
 
+const DASHBOARD_TOOLTIP_HTML_ESCAPE: Record<string, string> = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;',
+}
+
+// ECharts tooltip formatter 返回的字符串会被当作 HTML 渲染；模型名/系列名可能来自用户或上游，必须转义。
+function escapeDashboardTooltipText(value: unknown) {
+  return String(value ?? '').replace(/[&<>"']/g, (character) => (
+    DASHBOARD_TOOLTIP_HTML_ESCAPE[character]
+  ))
+}
 
 export function useDashboardPage() {
   type ChartInstance = {
@@ -28,12 +49,14 @@ export function useDashboardPage() {
     dispatchAction?: (payload: Record<string, unknown>) => void
   }
   type RenderMode = 'initial' | 'range' | 'refresh'
-  type ChartType = 'hourlyRequests' | 'trend' | 'successRate' | 'model' | 'modelRank' | 'responseTime'
+  type ChartType = 'hourlyRequests' | 'trend' | 'successRate' | 'model' | 'modelRank' | 'responseTime' | 'successDuration'
   type OverviewPayload = Record<string, any>
   const pageRuntime = usePageRuntime('dashboard')
   const DASHBOARD_DATA_REQUEST_KEY = 'dashboard:data'
   const CHART_BOOTSTRAP_TIMER_KEY = 'dashboard:chart-bootstrap'
+  const AUTO_REFRESH_TIMER_KEY = 'dashboard:auto-refresh'
   const chartRequestKey = (chartType: ChartType) => `dashboard:chart:${chartType}`
+  const ALL_CHART_TYPES: ChartType[] = ['hourlyRequests', 'trend', 'successRate', 'model', 'modelRank', 'responseTime', 'successDuration']
   const dashboardDataQuery = usePageQuery({
     runtime: pageRuntime,
     key: DASHBOARD_DATA_REQUEST_KEY,
@@ -41,12 +64,29 @@ export function useDashboardPage() {
   })
 
   // 每个图表独立的时间范围
-  const timeRangeHourlyRequests = ref<DashboardTimeRange>(DEFAULT_DASHBOARD_TIME_RANGE)
-  const timeRangeTrend = ref<DashboardTimeRange>(DEFAULT_DASHBOARD_TIME_RANGE)
-  const timeRangeSuccessRate = ref<DashboardTimeRange>(DEFAULT_DASHBOARD_TIME_RANGE)
-  const timeRangeModel = ref<DashboardTimeRange>(DEFAULT_DASHBOARD_TIME_RANGE)
-  const timeRangeModelRank = ref<DashboardTimeRange>(DEFAULT_DASHBOARD_TIME_RANGE)
-  const timeRangeResponseTime = ref<DashboardTimeRange>(DEFAULT_DASHBOARD_TIME_RANGE)
+  // 默认统计周期来自「设置 - 概览中心」偏好（localStorage），进入页面时重新读取。
+  const initialTimeRange = readDashboardDefaultTimeRange()
+  const timeRangeHourlyRequests = ref<DashboardTimeRange>(initialTimeRange)
+  const timeRangeTrend = ref<DashboardTimeRange>(initialTimeRange)
+  const timeRangeSuccessRate = ref<DashboardTimeRange>(initialTimeRange)
+  const timeRangeModel = ref<DashboardTimeRange>(initialTimeRange)
+  const timeRangeModelRank = ref<DashboardTimeRange>(initialTimeRange)
+  const timeRangeResponseTime = ref<DashboardTimeRange>(initialTimeRange)
+  const timeRangeSuccessDuration = ref<DashboardTimeRange>(initialTimeRange)
+  const timeRangeActivity = ref<DashboardTimeRange>(initialTimeRange)
+  const activityAnimationEpoch = ref(0)
+
+  function applyDashboardDefaultTimeRange() {
+    const next = readDashboardDefaultTimeRange()
+    timeRangeHourlyRequests.value = next
+    timeRangeTrend.value = next
+    timeRangeSuccessRate.value = next
+    timeRangeModel.value = next
+    timeRangeModelRank.value = next
+    timeRangeResponseTime.value = next
+    timeRangeSuccessDuration.value = next
+    timeRangeActivity.value = next
+  }
 
   // 创建图表监听器的工厂函数
   function createChartWatcher(chartType: ChartType, updateFn: (mode?: RenderMode) => void) {
@@ -65,6 +105,8 @@ export function useDashboardPage() {
   watch(timeRangeModel, createChartWatcher('model', updateModelChart))
   watch(timeRangeModelRank, createChartWatcher('modelRank', updateModelRankChart))
   watch(timeRangeResponseTime, createChartWatcher('responseTime', updateResponseTimeChart))
+  watch(timeRangeSuccessDuration, createChartWatcher('successDuration', updateSuccessDurationChart))
+  watch(timeRangeActivity, () => { activityAnimationEpoch.value += 1 })
 
   function createDefaultStats() {
     return [
@@ -121,6 +163,19 @@ export function useDashboardPage() {
 
   const stats = ref(createDefaultStats())
 
+  // 调用概览：近 24 小时口径，数据来自后端 dashboard_metrics（文本回复不计成败，部分成功算成功）。
+  function createDefaultCallStats() {
+    return [
+      { label: '当前并发', value: '--', meta: '正在处理的请求', icon: 'lucide:activity', iconBg: 'bg-violet-100', iconColor: 'text-violet-600' },
+      { label: '总调用量', value: '0', meta: '近 24 小时', icon: 'lucide:database', iconBg: 'bg-sky-100', iconColor: 'text-sky-600' },
+      { label: '成功率', value: '--', meta: '成功 /（成功 + 失败），文本不计', icon: 'lucide:check-circle', iconBg: 'bg-emerald-100', iconColor: 'text-emerald-600' },
+      { label: '平均成功耗时', value: '--', meta: '仅统计成功请求', icon: 'lucide:clock', iconBg: 'bg-amber-100', iconColor: 'text-amber-600' },
+      { label: '触发切号', value: '0', meta: '发生过账号切换的请求', icon: 'lucide:shuffle', iconBg: 'bg-rose-100', iconColor: 'text-rose-600' },
+      { label: '切换恢复率', value: '--', meta: '切号后最终成功的比例', icon: 'lucide:refresh-cw', iconBg: 'bg-cyan-100', iconColor: 'text-cyan-600' },
+    ]
+  }
+  const callStats = ref(createDefaultCallStats())
+
   // 每个图表独立的数据状态
   function createEmptyChartData() {
     return {
@@ -134,6 +189,7 @@ export function useDashboardPage() {
         failedRequests: [] as number[],
         rateLimitedRequests: [] as number[],
         successRequests: [] as number[],
+        switchCount: [] as number[],
       },
       successRate: {
         labels: [] as string[],
@@ -149,7 +205,12 @@ export function useDashboardPage() {
       responseTime: {
         labels: [] as string[],
         modelTtfbTimes: {} as Record<string, number[]>,
-        modelTotalTimes: {} as Record<string, number[]>,
+        // 各模型成功请求平均耗时（毫秒），无数据的时间桶为 null
+        modelTotalTimes: {} as Record<string, Array<number | null>>,
+      },
+      successDuration: {
+        labels: [] as string[],
+        avgMs: [] as Array<number | null>,
       },
     }
   }
@@ -157,7 +218,12 @@ export function useDashboardPage() {
   const chartData = ref(createEmptyChartData())
 
   const overviewCache = new Map<string, OverviewPayload>()
-  const overviewRequests = new Map<string, Promise<OverviewPayload>>()
+  // 单次快照：账号统计与三个统计周期同时更新；同一时刻只允许一个快照请求（串行刷新）。
+  let snapshotRequest: Promise<DashboardSnapshot> | null = null
+  let snapshotAbort: AbortController | null = null
+  const activitySnapshot = shallowRef<Record<string, OverviewPayload>>({})
+  const dashboardVersion = ref('')
+  const dashboardStaleWarning = ref('')
 
   const trendChartRef = ref<HTMLDivElement | null>(null)
   const modelChartRef = ref<HTMLDivElement | null>(null)
@@ -165,6 +231,7 @@ export function useDashboardPage() {
   const hourlyRequestsChartRef = ref<HTMLDivElement | null>(null)
   const modelRankChartRef = ref<HTMLDivElement | null>(null)
   const responseTimeChartRef = ref<HTMLDivElement | null>(null)
+  const successDurationChartRef = ref<HTMLDivElement | null>(null)
 
   const charts = {
     trend: null as ChartInstance | null,
@@ -173,6 +240,7 @@ export function useDashboardPage() {
     hourlyRequests: null as ChartInstance | null,
     modelRank: null as ChartInstance | null,
     responseTime: null as ChartInstance | null,
+    successDuration: null as ChartInstance | null,
   }
 
   type ChartKey = keyof typeof charts
@@ -193,6 +261,7 @@ export function useDashboardPage() {
     hourlyRequests: true,
     modelRank: true,
     responseTime: true,
+    successDuration: true,
   })
   const chartsBootstrapped = ref(false)
   const dashboardDataReady = ref(false)
@@ -200,13 +269,44 @@ export function useDashboardPage() {
   let dashboardEntrySeq = 0
   const modelLayoutIsMobile = ref<boolean | null>(null)
 
+  // 容器尺寸变化（例如折叠/展开侧栏）时窗口宽度不变，需要 ResizeObserver 触发图表重排。
+  let chartResizeObserver: ResizeObserver | null = null
+  let chartResizeFrame = 0
+
+  function scheduleChartResize() {
+    if (chartResizeFrame) return
+    chartResizeFrame = requestAnimationFrame(() => {
+      chartResizeFrame = 0
+      handleResize()
+    })
+  }
+
+  function observeChartContainers() {
+    chartResizeObserver?.disconnect()
+    if (typeof ResizeObserver === 'undefined') return
+    chartResizeObserver = new ResizeObserver(scheduleChartResize)
+    ;[
+      trendChartRef, modelChartRef, successRateChartRef, hourlyRequestsChartRef,
+      modelRankChartRef, responseTimeChartRef, successDurationChartRef,
+    ].forEach((target) => {
+      if (target.value) chartResizeObserver?.observe(target.value)
+    })
+  }
+
   function bindResizeListener() {
     window.removeEventListener('resize', handleResize)
     window.addEventListener('resize', handleResize)
+    if (chartsBootstrapped.value) observeChartContainers()
   }
 
   function unbindResizeListener() {
     window.removeEventListener('resize', handleResize)
+    chartResizeObserver?.disconnect()
+    chartResizeObserver = null
+    if (chartResizeFrame) {
+      cancelAnimationFrame(chartResizeFrame)
+      chartResizeFrame = 0
+    }
   }
 
   function applyAnimatedOption(key: ChartKey, option: Record<string, unknown>, mode: RenderMode = 'refresh') {
@@ -255,7 +355,9 @@ export function useDashboardPage() {
     initChart(hourlyRequestsChartRef.value, 'hourlyRequests', updateHourlyRequestsChart)
     initChart(modelRankChartRef.value, 'modelRank', updateModelRankChart)
     initChart(responseTimeChartRef.value, 'responseTime', updateResponseTimeChart)
+    initChart(successDurationChartRef.value, 'successDuration', updateSuccessDurationChart)
     chartsBootstrapped.value = true
+    observeChartContainers()
   }
 
   function resetChartFirstRenderState() {
@@ -266,6 +368,7 @@ export function useDashboardPage() {
       hourlyRequests: true,
       modelRank: true,
       responseTime: true,
+      successDuration: true,
     }
   }
 
@@ -284,11 +387,13 @@ export function useDashboardPage() {
 
   function cancelDashboardDataRequests(options: { clearRequests?: boolean } = {}) {
     dashboardDataQuery.invalidate()
-    ;(['hourlyRequests', 'trend', 'successRate', 'model', 'modelRank', 'responseTime'] as ChartType[]).forEach((chartType) => {
+    ALL_CHART_TYPES.forEach((chartType) => {
       pageRuntime.invalidateRequest(chartRequestKey(chartType))
     })
     if (options.clearRequests !== false) {
-      overviewRequests.clear()
+      snapshotAbort?.abort()
+      snapshotAbort = null
+      snapshotRequest = null
     }
   }
 
@@ -297,11 +402,66 @@ export function useDashboardPage() {
     dashboardDataReady.value = false
     dashboardLoadSettled.value = false
     stats.value = createDefaultStats()
+    callStats.value = createDefaultCallStats()
     chartData.value = createEmptyChartData()
     overviewCache.clear()
+    activitySnapshot.value = {}
+    dashboardStaleWarning.value = ''
+    stopAutoRefresh()
     disposeCharts()
     clearChartBootstrapTimer()
     modelLayoutIsMobile.value = null
+  }
+
+  // ---- 自动刷新：进入页面立即取一次，之后仅在页面可见时按偏好间隔串行刷新 ----
+  function stopAutoRefresh() {
+    pageRuntime.clearTimer(AUTO_REFRESH_TIMER_KEY)
+  }
+
+  function scheduleAutoRefresh() {
+    stopAutoRefresh()
+    if (!dashboardDataReady.value) return
+    const delayMs = readDashboardRefreshIntervalSeconds() * 1000
+    // setTimer 默认要求页面可见；隐藏时到点不会执行，也不会续约，回到可见后由 onShow 重新启动。
+    pageRuntime.setTimer(AUTO_REFRESH_TIMER_KEY, delayMs, () => {
+      void refreshInBackground()
+    })
+  }
+
+  function updateAllCharts(mode: RenderMode) {
+    updateHourlyRequestsChart(mode)
+    updateTrendChart(mode)
+    updateSuccessRateChart(mode)
+    updateModelChart(mode)
+    updateModelRankChart(mode)
+    updateResponseTimeChart(mode)
+    updateSuccessDurationChart(mode)
+  }
+
+  let backgroundRefreshing = false
+
+  async function refreshInBackground() {
+    // 串行：上一次刷新没结束就不会再发新的请求；失败时保留最近一次可用数据。
+    if (backgroundRefreshing || !pageRuntime.canRun.value || !dashboardDataReady.value) return
+    backgroundRefreshing = true
+    const entrySeq = dashboardEntrySeq
+    try {
+      const chartRanges = getDashboardChartRanges()
+      await fetchSnapshot()
+      if (entrySeq !== dashboardEntrySeq || !pageRuntime.canRun.value) return
+      applyDashboardOverview(chartRanges)
+      void refreshActiveRequests()
+      updateAllCharts('refresh')
+      dashboardStaleWarning.value = ''
+    } catch (error) {
+      if (entrySeq === dashboardEntrySeq && pageRuntime.canRun.value) {
+        console.error('Failed to refresh dashboard data:', error)
+        dashboardStaleWarning.value = '概览刷新失败，当前显示的是最近一次成功获取的数据。'
+      }
+    } finally {
+      backgroundRefreshing = false
+      if (entrySeq === dashboardEntrySeq) scheduleAutoRefresh()
+    }
   }
 
   function scheduleChartBootstrap(delayMs = 80) {
@@ -332,14 +492,22 @@ export function useDashboardPage() {
   })
 
   pageRuntime.onHide(() => {
+    // 页面隐藏：停止刷新并取消进行中的请求，但保留最近一次数据，回到可见后再静默刷新。
     unbindResizeListener()
-    dashboardEntrySeq += 1
-    resetDashboardViewState()
+    stopAutoRefresh()
+    snapshotAbort?.abort()
+    snapshotAbort = null
+    snapshotRequest = null
+    backgroundRefreshing = false
   })
 
   pageRuntime.onShow(() => {
     bindResizeListener()
-    void reloadDashboardOnEnter()
+    if (!dashboardDataReady.value) {
+      void reloadDashboardOnEnter()
+      return
+    }
+    void refreshInBackground()
   })
 
   onBeforeUnmount(() => {
@@ -360,20 +528,16 @@ export function useDashboardPage() {
         ...theme.xAxis,
         data: chartData.value.trend.labels,
       },
-      series: [
-        createLineSeries('成功', chartData.value.trend.successRequests, chartColors.primary, {
-          areaOpacity: 0.25,
-          zIndex: 1,
-        }),
-        createLineSeries('失败', chartData.value.trend.failedRequests, chartColors.danger, {
-          areaOpacity: 0.3,
-          zIndex: 2,
-        }),
-        createLineSeries('限流', chartData.value.trend.rateLimitedRequests, chartColors.warning, {
-          areaOpacity: 0.3,
-          zIndex: 2,
-        }),
-      ],
+      series: buildDashboardTrendSeries(
+        chartData.value.trend,
+        createLineSeries,
+        {
+          success: chartColors.primary,
+          failure: chartColors.danger,
+          rateLimited: chartColors.warning,
+          switchAccount: chartColors.purple,
+        },
+      ),
     }, mode)
   }
 
@@ -402,7 +566,7 @@ export function useDashboardPage() {
       tooltip: {
         ...theme.tooltip,
         formatter: (params: { name: string; value: number; percent: number }) =>
-          `${params.name}: ${params.value} 次 (${params.percent}%)`,
+          `${escapeDashboardTooltipText(params.name)}: ${escapeDashboardTooltipText(params.value)} 次 (${escapeDashboardTooltipText(params.percent)}%)`,
       },
       legend: {
         ...theme.legend,
@@ -449,7 +613,35 @@ export function useDashboardPage() {
         return timeRangeModelRank.value
       case 'responseTime':
         return timeRangeResponseTime.value
+      case 'successDuration':
+        return timeRangeSuccessDuration.value
     }
+  }
+
+  function fetchSnapshot(): Promise<DashboardSnapshot> {
+    if (snapshotRequest) return snapshotRequest
+    const controller = new AbortController()
+    snapshotAbort = controller
+    const request: Promise<DashboardSnapshot> = statsApi
+      .snapshot(controller.signal)
+      .then((snapshot) => {
+        if (snapshotRequest === request && !controller.signal.aborted) {
+          Object.entries(snapshot.overviews).forEach(([range, overview]) => {
+            overviewCache.set(range, overview as unknown as OverviewPayload)
+          })
+          activitySnapshot.value = { ...snapshot.overviews } as unknown as Record<string, OverviewPayload>
+          dashboardVersion.value = snapshot.version
+        }
+        return snapshot
+      })
+      .finally(() => {
+        if (snapshotRequest === request) {
+          snapshotRequest = null
+          snapshotAbort = null
+        }
+      })
+    snapshotRequest = request
+    return request
   }
 
   async function getOverview(timeRange: string, options: { force?: boolean } = {}) {
@@ -457,28 +649,29 @@ export function useDashboardPage() {
       const cached = overviewCache.get(timeRange)
       if (cached) return cached
     }
-
-    const inflight = overviewRequests.get(timeRange)
-    if (inflight && !options.force) return inflight
-
-    const request = statsApi
-      .overview(timeRange)
-      .then((overview) => {
-        const payload = overview as OverviewPayload
-        if (overviewRequests.get(timeRange) === request) {
-          overviewCache.set(timeRange, payload)
-        }
-        return payload
-      })
-      .finally(() => {
-        if (overviewRequests.get(timeRange) === request) {
-          overviewRequests.delete(timeRange)
-        }
-      })
-
-    overviewRequests.set(timeRange, request)
-    return request
+    await fetchSnapshot()
+    const overview = overviewCache.get(timeRange)
+    if (!overview) throw new Error('概览快照缺少统计周期 ' + timeRange)
+    return overview
   }
+
+  // 调用活跃度：每个统计时间桶一个格子，颜色按调用量分级；没有请求时展示空态。
+  const activityBuckets = computed(() => {
+    const trend = (activitySnapshot.value[timeRangeActivity.value] as OverviewPayload | undefined)?.trend
+    if (!trend) return [] as Array<{ label: string; total_calls: number; success_calls: number; failed_calls: number }>
+    const labels = normalizeLabels(trend.labels)
+    const total = normalizeNumberSeries(trend.total_requests, labels.length)
+    const success = normalizeNumberSeries(trend.success_requests, labels.length)
+    const failed = normalizeNumberSeries(trend.failed_requests, labels.length)
+    const limited = normalizeNumberSeries(trend.rate_limited_requests, labels.length)
+    return labels.map((label, index) => ({
+      label,
+      total_calls: total[index] || 0,
+      success_calls: success[index] || 0,
+      failed_calls: (failed[index] || 0) + (limited[index] || 0),
+    }))
+  })
+  const activityHasData = computed(() => activityBuckets.value.some((bucket) => bucket.total_calls > 0))
 
   function formatStatNumber(value: unknown) {
     const number = Number(value || 0)
@@ -500,6 +693,40 @@ export function useDashboardPage() {
     stats.value[0].meta = `GPT ${formatStatNumber(gpt.total)} · Grok ${formatStatNumber(grok.total)}`
     stats.value[1].meta = `GPT ${formatStatNumber(gpt.active)} · Grok ${formatStatNumber(grok.active)}`
     stats.value[5].meta = `GPT ${formatStatNumber(gpt.total_quota)} · Grok ${formatStatNumber(grok.total_quota)}`
+  }
+
+  function formatPercent(value: unknown) {
+    if (value === null || value === undefined || value === '') return '--'
+    const number = Number(value)
+    return Number.isFinite(number) ? `${number}%` : '--'
+  }
+
+  function applyCallStats(overview: OverviewPayload) {
+    const success = Number(overview.success_count || 0)
+    const failed = Number(overview.failed_count || 0)
+    const textReview = Number(overview.text_review_count || 0)
+    const switching = overview.switching || {}
+    const durationText = formatRequestDuration(overview.avg_success_duration_ms)
+    const items = callStats.value
+    items[1].value = formatStatNumber(overview.total_calls)
+    items[1].meta = `成功 ${formatStatNumber(success)} · 失败 ${formatStatNumber(failed)}${textReview > 0 ? ` · 文本 ${formatStatNumber(textReview)}` : ''}`
+    items[2].value = formatPercent(overview.success_rate)
+    items[3].value = durationText || '--'
+    items[4].value = formatStatNumber(switching.requests)
+    items[4].meta = `共切换 ${formatStatNumber(switching.count)} 次`
+    items[5].value = formatPercent(switching.recovery_rate)
+    items[5].meta = `${formatStatNumber(switching.recovered)} / ${formatStatNumber(switching.requests)} 个请求恢复`
+  }
+
+  // 当前并发取自实时监控；失败时保留上一次的值，不影响概览其它数据。
+  async function refreshActiveRequests() {
+    try {
+      const realtime = await monitorApi.realtime()
+      const active = Number(realtime?.summary?.active ?? realtime?.active?.length ?? 0)
+      callStats.value[0].value = formatStatNumber(active)
+    } catch {
+      /* 实时监控不可用时保持原值 */
+    }
   }
 
   function getTrendPayload(overview: OverviewPayload) {
@@ -529,6 +756,25 @@ export function useDashboardPage() {
     return Array.from({ length: pointCount }, (_, index) => normalized[index] ?? 0)
   }
 
+  function normalizeNullableSeries(raw: unknown, pointCount?: number): Array<number | null> {
+    const source = Array.isArray(raw) ? raw : []
+    const normalized = source.map((item) => {
+      if (item === null || item === undefined || item === '') return null
+      const value = Number(item)
+      return Number.isFinite(value) ? value : null
+    })
+    if (pointCount === undefined) return normalized
+    return Array.from({ length: pointCount }, (_, index) => normalized[index] ?? null)
+  }
+
+  function normalizeNullableModelSeries(raw: unknown, pointCount?: number): Record<string, Array<number | null>> {
+    const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+    const filtered = filterValidModels(source as Record<string, number[]>)
+    return Object.fromEntries(
+      Object.entries(filtered).map(([model, data]) => [model, normalizeNullableSeries(data, pointCount)]),
+    )
+  }
+
   function normalizeModelSeries(raw: unknown, pointCount?: number): Record<string, number[]> {
     const filtered = filterValidModels(raw as Record<string, number[]>)
     return Object.fromEntries(
@@ -548,8 +794,20 @@ export function useDashboardPage() {
     const limited = normalizeNumberSeries(trend.rate_limited_requests, pointCount)
     const success = normalizeNumberSeries(trend.success_requests, pointCount)
     const modelRequests = normalizeModelSeries(trend.model_requests, pointCount)
+    // 模型请求分布只统计成功请求；旧后端没有该字段时回退到全部请求。
+    const modelSuccessRequests = trend.model_success_requests
+      ? normalizeModelSeries(trend.model_success_requests, pointCount)
+      : modelRequests
     const modelTtfbTimes = normalizeModelSeries(trend.model_ttfb_times, pointCount)
-    const modelTotalTimes = normalizeModelSeries(trend.model_total_times, pointCount)
+    const modelTotalTimes = normalizeNullableModelSeries(
+      trend.model_avg_success_duration_ms ?? trend.model_total_times,
+      pointCount,
+    )
+    const successDurationMs = normalizeNullableSeries(trend.success_duration_ms, pointCount)
+    // 文本回复不计成败：成功率只按成功 + 失败（含限流）的请求计算。
+    const textReview = normalizeNumberSeries(trend.text_review_requests, pointCount)
+    const measuredSeries = totalSeries.map((total: number, idx: number) => Math.max(total - (textReview[idx] || 0), 0))
+    const switchSeries = normalizeNumberSeries(trend.switch_count, pointCount)
     const failureSeries = totalSeries.map((_: number, idx: number) => (failed[idx] || 0) + (limited[idx] || 0))
     const successSeries = totalSeries.map((total: number, idx: number) => {
       const explicitSuccess = Number(success[idx])
@@ -560,7 +818,7 @@ export function useDashboardPage() {
     switch (chartType) {
       case 'hourlyRequests':
         chartData.value.hourlyRequests.labels = labels
-        chartData.value.hourlyRequests.modelRequests = modelRequests
+        chartData.value.hourlyRequests.modelRequests = modelSuccessRequests
         break
       case 'trend':
         chartData.value.trend.labels = labels
@@ -568,10 +826,11 @@ export function useDashboardPage() {
         chartData.value.trend.failedRequests = failed
         chartData.value.trend.rateLimitedRequests = limited
         chartData.value.trend.successRequests = successSeries
+        chartData.value.trend.switchCount = switchSeries
         break
       case 'successRate':
         chartData.value.successRate.labels = labels
-        chartData.value.successRate.totalRequests = totalSeries
+        chartData.value.successRate.totalRequests = measuredSeries
         chartData.value.successRate.failedRequests = failureSeries
         break
       case 'model':
@@ -585,6 +844,10 @@ export function useDashboardPage() {
         chartData.value.responseTime.modelTtfbTimes = modelTtfbTimes
         chartData.value.responseTime.modelTotalTimes = modelTotalTimes
         break
+      case 'successDuration':
+        chartData.value.successDuration.labels = labels
+        chartData.value.successDuration.avgMs = successDurationMs
+        break
     }
   }
 
@@ -596,6 +859,7 @@ export function useDashboardPage() {
       model: timeRangeModel.value,
       modelRank: timeRangeModelRank.value,
       responseTime: timeRangeResponseTime.value,
+      successDuration: timeRangeSuccessDuration.value,
     }
   }
 
@@ -604,6 +868,7 @@ export function useDashboardPage() {
       new Set<string>([
         DEFAULT_DASHBOARD_TIME_RANGE,
         ...Object.values(chartRanges),
+        timeRangeActivity.value,
       ])
     )
   }
@@ -618,9 +883,10 @@ export function useDashboardPage() {
     const accountOverview = overviewCache.get(DEFAULT_DASHBOARD_TIME_RANGE)
     if (accountOverview) {
       applyAccountStats(accountOverview)
+      applyCallStats(accountOverview)
     }
 
-    ;(['hourlyRequests', 'trend', 'successRate', 'model', 'modelRank', 'responseTime'] as ChartType[]).forEach((chartType) => {
+    ALL_CHART_TYPES.forEach((chartType) => {
       if (chartRanges[chartType] !== getChartRange(chartType)) return
       const overview = overviewCache.get(chartRanges[chartType])
       if (overview) applyOverviewToChartData(chartType, overview)
@@ -636,7 +902,10 @@ export function useDashboardPage() {
         return true
       },
       {
-        apply: () => applyDashboardOverview(chartRanges),
+        apply: () => {
+          applyDashboardOverview(chartRanges)
+          void refreshActiveRequests()
+        },
         onError: (_message, error) => {
           console.error('Failed to refresh dashboard data:', error)
         },
@@ -648,6 +917,7 @@ export function useDashboardPage() {
   async function reloadDashboardOnEnter() {
     const entrySeq = ++dashboardEntrySeq
     resetDashboardViewState()
+    applyDashboardDefaultTimeRange()
     await nextTick()
     const refreshed = await refreshDashboardData(true)
     if (entrySeq !== dashboardEntrySeq) return
@@ -657,6 +927,7 @@ export function useDashboardPage() {
     await nextTick()
     if (entrySeq !== dashboardEntrySeq) return
     scheduleChartBootstrap(refreshed ? 0 : 80)
+    scheduleAutoRefresh()
   }
 
   function retryDashboard() {
@@ -697,10 +968,10 @@ export function useDashboardPage() {
         formatter: (params: any) => {
           if (!params || params.length === 0) return ''
           const param = params[0]
-          return `<div style="font-weight: 600; margin-bottom: 4px;">${param.axisValue}</div>
+          return `<div style="font-weight: 600; margin-bottom: 4px;">${escapeDashboardTooltipText(param.axisValue)}</div>
             <div style="display: flex; justify-content: space-between; gap: 16px; align-items: center;">
-              <span>${param.marker} ${param.seriesName}</span>
-              <span style="font-weight: 600;">${param.value}%</span>
+              <span>${param.marker} ${escapeDashboardTooltipText(param.seriesName)}</span>
+              <span style="font-weight: 600;">${escapeDashboardTooltipText(param.value)}%</span>
             </div>`
         },
       },
@@ -829,13 +1100,13 @@ export function useDashboardPage() {
         },
         formatter: (params: any) => {
           if (!params || params.length === 0) return ''
-          let result = `<div style="font-weight: 600; margin-bottom: 4px;">${params[0].axisValue}</div>`
+          let result = `<div style="font-weight: 600; margin-bottom: 4px;">${escapeDashboardTooltipText(params[0].axisValue)}</div>`
           let total = 0
           params.forEach((item: any) => {
             total += item.value || 0
             result += `<div style="display: flex; justify-content: space-between; gap: 16px; align-items: center;">
-              <span>${item.marker} ${item.seriesName}</span>
-              <span style="font-weight: 600;">${item.value || 0}</span>
+              <span>${item.marker} ${escapeDashboardTooltipText(item.seriesName)}</span>
+              <span style="font-weight: 600;">${escapeDashboardTooltipText(item.value || 0)}</span>
             </div>`
           })
           result += `<div style="margin-top: 6px; padding-top: 6px; border-top: 1px solid #e5e5e5; font-weight: 600;">
@@ -958,6 +1229,56 @@ export function useDashboardPage() {
     }, mode)
   }
 
+  function updateSuccessDurationChart(mode: RenderMode = 'refresh') {
+    if (!charts.successDuration) return
+
+    const theme = getLineChartTheme()
+    const seconds = chartData.value.successDuration.avgMs.map((ms) => (
+      ms === null || ms === undefined ? null : Number((Number(ms) / 1000).toFixed(2))
+    ))
+
+    applyAnimatedOption('successDuration', {
+      ...theme,
+      tooltip: {
+        ...theme.tooltip,
+        trigger: 'axis',
+        formatter: (params: any) => {
+          if (!params || params.length === 0) return ''
+          const param = params[0]
+          const value = param.value === null || param.value === undefined ? '--' : `${param.value}s`
+          return `<div style="font-weight: 600; margin-bottom: 4px;">${escapeDashboardTooltipText(param.axisValue)}</div>
+            <div style="display: flex; justify-content: space-between; gap: 16px; align-items: center;">
+              <span>${param.marker} ${escapeDashboardTooltipText(param.seriesName)}</span>
+              <span style="font-weight: 600;">${escapeDashboardTooltipText(value)}</span>
+            </div>`
+        },
+      },
+      grid: {
+        ...theme.grid,
+        top: 32,
+        bottom: 32,
+      },
+      xAxis: {
+        ...theme.xAxis,
+        data: chartData.value.successDuration.labels,
+      },
+      yAxis: {
+        ...theme.yAxis,
+        axisLabel: {
+          ...theme.yAxis.axisLabel,
+          formatter: '{value}s',
+        },
+      },
+      series: [
+        createLineSeries('平均成功耗时', seconds as number[], chartColors.primary, {
+          smooth: true,
+          areaOpacity: 0.2,
+          zIndex: 2,
+        }),
+      ],
+    }, mode)
+  }
+
   function updateResponseTimeChart(mode: RenderMode = 'refresh') {
     if (!charts.responseTime) return
 
@@ -992,8 +1313,10 @@ export function useDashboardPage() {
 
     const series = modelNames.map((modelName) => {
       const color = getModelColor(modelName)
-      const seconds = (responseSeriesByModel[modelName] || []).map((ms) => Number((Number(ms || 0) / 1000).toFixed(2)))
-      return createLineSeries(modelName, seconds, color, {
+      const seconds = (responseSeriesByModel[modelName] || []).map((ms) => (
+        ms === null || ms === undefined ? null : Number((Number(ms) / 1000).toFixed(2))
+      ))
+      return createLineSeries(modelName, seconds as number[], color, {
         smooth: true,
         areaOpacity: 0.15,
         zIndex: 2,
@@ -1008,11 +1331,11 @@ export function useDashboardPage() {
         trigger: 'axis',
         formatter: (params: any) => {
           if (!params || params.length === 0) return ''
-          let result = `<div style="font-weight: 600; margin-bottom: 4px;">${params[0].axisValue}</div>`
+          let result = `<div style="font-weight: 600; margin-bottom: 4px;">${escapeDashboardTooltipText(params[0].axisValue)}</div>`
           params.forEach((item: any) => {
             result += `<div style="display: flex; justify-content: space-between; gap: 16px; align-items: center;">
-              <span>${item.marker} ${item.seriesName}</span>
-              <span style="font-weight: 600;">${item.value || 0}s</span>
+              <span>${item.marker} ${escapeDashboardTooltipText(item.seriesName)}</span>
+              <span style="font-weight: 600;">${escapeDashboardTooltipText(item.value || 0)}s</span>
             </div>`
           })
           return result
@@ -1051,6 +1374,7 @@ export function useDashboardPage() {
 
   return {
     stats,
+    callStats,
     dashboardDataReady,
     dashboardLoading: computed(() => dashboardDataQuery.loading.value || !dashboardLoadSettled.value),
     dashboardLoadError: dashboardDataQuery.error,
@@ -1061,10 +1385,18 @@ export function useDashboardPage() {
     timeRangeModel,
     timeRangeModelRank,
     timeRangeResponseTime,
+    timeRangeSuccessDuration,
+    timeRangeActivity,
+    activityAnimationEpoch,
+    activityBuckets,
+    activityHasData,
+    dashboardStaleWarning,
+    dashboardVersion,
     hourlyRequestsChartRef,
     trendChartRef,
     successRateChartRef,
     responseTimeChartRef,
+    successDurationChartRef,
     modelChartRef,
     modelRankChartRef,
   }

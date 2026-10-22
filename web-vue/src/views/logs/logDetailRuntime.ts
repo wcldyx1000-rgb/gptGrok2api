@@ -1,6 +1,6 @@
 import { computed, ref, watch } from 'vue'
 import type { GalleryFile } from '@/api/gallery'
-import type { SystemLogRow } from '@/api/logs'
+import { logsApi, normalizeSystemLogRow, type SystemLogRow } from '@/api/logs'
 import {
   buildDiagnosticDetailFields,
   buildPrimaryDetailFields,
@@ -18,8 +18,23 @@ import {
 
 export type DetailPreviewImage = LogPreviewImage
 
-export function useLogDetailRuntime() {
+export type LogDetailLoader = (item: SystemLogRow) => Promise<SystemLogRow | null>
+
+export type LogDetailRuntimeOptions = {
+  /** 精简行（列表）按 id 拉取完整记录；默认走 GET /api/logs/{id} */
+  loadDetail?: LogDetailLoader
+  apiBaseUrl?: string
+}
+
+export function useLogDetailRuntime(options: LogDetailRuntimeOptions = {}) {
   const selectedLog = ref<SystemLogRow | null>(null)
+  const detailLoading = ref(false)
+  const detailError = ref('')
+  let detailRequestSeq = 0
+  const loadDetail: LogDetailLoader = options.loadDetail || (async (item) => {
+    const raw = await logsApi.detail(item.id)
+    return raw ? normalizeSystemLogRow(raw, 0, { apiBaseUrl: options.apiBaseUrl }) : null
+  })
   const selectedDetailPreview = ref<DetailPreviewImage | null>(null)
   const timelineDetailsExpanded = ref(false)
   const brokenPreviewUrls = ref<Set<string>>(new Set())
@@ -58,11 +73,34 @@ export function useLogDetailRuntime() {
     brokenPreviewUrls.value = new Set([...brokenPreviewUrls.value, url])
   }
 
-  function openDetail(item: SystemLogRow) {
+  async function openDetail(item: SystemLogRow) {
+    // 先用列表里的精简行立即打开抽屉，再按 id 拉取完整详情替换；旧数据/非精简行直接显示。
     selectedLog.value = item
+    detailError.value = ''
+    const seq = ++detailRequestSeq
+    if (!item.detailCompact) {
+      detailLoading.value = false
+      return
+    }
+    detailLoading.value = true
+    try {
+      const full = await loadDetail(item)
+      if (seq === detailRequestSeq && full && selectedLog.value?.id === item.id) {
+        selectedLog.value = full
+      }
+    } catch (error) {
+      if (seq === detailRequestSeq) {
+        detailError.value = error instanceof Error ? error.message : '详情加载失败，当前显示精简信息'
+      }
+    } finally {
+      if (seq === detailRequestSeq) detailLoading.value = false
+    }
   }
 
   function closeDetail() {
+    detailRequestSeq += 1
+    detailLoading.value = false
+    detailError.value = ''
     selectedLog.value = null
     selectedDetailPreview.value = null
   }
@@ -88,6 +126,8 @@ export function useLogDetailRuntime() {
 
   return {
     selectedLog,
+    detailLoading,
+    detailError,
     selectedDetailPreview,
     selectedDetailPreviewFile,
     selectedDetailImages,

@@ -347,25 +347,52 @@ export function slowRowReason(row: RealtimeMonitorRecord) {
     return `主要卡在重试等待，通常是轮询、TLS 或连接失败后的退避时间。`
   }
   if (top.key === 'handler_queue_ms' || top.key === 'stream_first_queue_ms') {
-    return `主要卡在等待入口，通常是后端同步线程容量不足；可通过环境变量 CHATGPT2API_THREAD_TOKENS 调整。`
+    return `主要卡在等待入口，通常是后端同步线程容量不足；可通过环境变量 GPTGROK2API_THREAD_TOKENS 调整。`
   }
   return `主要耗时：${top.label} ${top.value}。`
 }
 
-export function statusLabel(status: unknown) {
-  const value = String(status || '').toLowerCase()
-  if (value === 'success') return '成功'
-  if (value === 'failed' || value === 'error' || value === 'fail') return '失败'
-  if (value === 'running') return '运行中'
-  return value || '-'
+const OUTCOME_PRESENTATION: Record<string, { label: string; tone: BadgeTone }> = {
+  success: { label: '成功', tone: 'success' },
+  partial_success: { label: '部分成功', tone: 'warning' },
+  rate_limited: { label: '限流', tone: 'warning' },
+  text_review: { label: '文本', tone: 'warning' },
+  failed: { label: '失败', tone: 'danger' },
+  running: { label: '运行中', tone: 'info' },
 }
 
-export function statusTone(status: unknown): BadgeTone {
-  const value = String(status || '').toLowerCase()
-  if (value === 'success') return 'success'
-  if (value === 'failed' || value === 'error' || value === 'fail') return 'danger'
-  if (value === 'running') return 'info'
-  return 'muted'
+function recordOutcomeKey(row: Pick<RealtimeMonitorRecord, 'status' | 'outcome'> | string | undefined) {
+  if (typeof row === 'string' || row === undefined) {
+    const value = String(row || '').toLowerCase()
+    if (value === 'error' || value === 'fail') return 'failed'
+    return value
+  }
+  const status = String(row.status || '').toLowerCase()
+  if (status === 'running' || status === 'cancelling') return 'running'
+  const outcome = String(row.outcome || '').toLowerCase()
+  if (outcome in OUTCOME_PRESENTATION) return outcome
+  return status === 'error' || status === 'fail' ? 'failed' : status
+}
+
+/** 状态标签：传记录时优先按后端 outcome（部分成功/限流/文本），传字符串时按状态。 */
+export function statusLabel(row: Pick<RealtimeMonitorRecord, 'status' | 'outcome'> | string | undefined) {
+  const key = recordOutcomeKey(row)
+  if (key === 'cancelling') return '取消中'
+  return OUTCOME_PRESENTATION[key]?.label || key || '-'
+}
+
+export function statusTone(row: Pick<RealtimeMonitorRecord, 'status' | 'outcome'> | string | undefined): BadgeTone {
+  return OUTCOME_PRESENTATION[recordOutcomeKey(row)]?.tone || 'muted'
+}
+
+/** 单次请求的账号尝试摘要：第几次尝试、是否发生过切换。 */
+export function accountAttemptText(row: RealtimeMonitorRecord) {
+  const attempts = Number(row.attempt_count || 0)
+  const switches = Number(row.switch_count || 0)
+  const parts: string[] = []
+  if (attempts > 0) parts.push(`${attempts} 次尝试`)
+  if (attempts > 0 || switches > 0) parts.push(switches > 0 ? `已切换 ${switches} 次` : '未切换')
+  return parts.join(' · ')
 }
 
 export function eventMetricText(row: RealtimeMonitorEvent) {
@@ -414,6 +441,8 @@ export function recentRowSignature(row: RealtimeMonitorRecord) {
     row.ended_at,
     row.updated_at,
     row.status,
+    row.outcome,
+    row.switch_count,
     row.model,
     Math.round(Number(row.duration_ms || 0)),
     roundedMetricSignature(row, ['handler_queue_ms', 'account_wait_ms', 'egress_wait_ms']),
@@ -426,6 +455,7 @@ export function slowRowSignature(row: RealtimeMonitorRecord) {
     row.ended_at,
     row.updated_at,
     row.status,
+    row.outcome,
     row.model,
     row.endpoint,
     row.error,
@@ -474,12 +504,16 @@ export function buildDiagnosticGroups(
     {
       key: 'overview',
       title: '实时概览',
-      meta: '窗口、成功率、瓶颈',
+      meta: '窗口、结果、成功率、瓶颈',
       items: [
         { key: 'active', label: '当前并发', value: summary?.active ?? 0, meta: `线程容量 ${threadTokens}`, valueClass: 'text-foreground' },
         { key: 'completed', label: '完成窗口', value: summary?.completed ?? 0, meta: completedWindowText, valueClass: 'text-foreground' },
         { key: 'success', label: '成功率', value: `${summary?.success_rate ?? 0}%`, meta: `成功 ${summary?.success ?? 0}`, valueClass: 'text-emerald-600 dark:text-emerald-400' },
-        { key: 'failed', label: '失败数', value: summary?.failed ?? 0, meta: '窗口内失败', valueClass: Number(summary?.failed || 0) > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-foreground' },
+        { key: 'failed', label: '失败数', value: summary?.failed ?? 0, meta: '窗口内失败（不含限流/文本）', valueClass: Number(summary?.failed || 0) > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-foreground' },
+        { key: 'rate_limited', label: '限流数', value: summary?.rate_limited ?? 0, meta: '窗口内限流', valueClass: Number(summary?.rate_limited || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
+        { key: 'text_review', label: '文本数', value: summary?.text_review ?? 0, meta: '返回文本，不计失败', valueClass: Number(summary?.text_review || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
+        { key: 'partial_success', label: '部分成功', value: summary?.partial_success ?? 0, meta: '多图只出了一部分', valueClass: Number(summary?.partial_success || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
+        { key: 'slow_total', label: '慢请求', value: summary?.slow_counts?.total_over_120s ?? 0, meta: '总耗时超过 120 秒', valueClass: Number(summary?.slow_counts?.total_over_120s || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
         { key: 'average', label: '平均耗时', value: formatMs(summary?.avg_duration_ms), meta: '窗口均值', valueClass: 'text-sky-600 dark:text-sky-400' },
         { key: 'p95', label: 'P95 耗时', value: formatMs(summary?.p95_duration_ms), meta: '慢请求参考', valueClass: 'text-sky-600 dark:text-sky-400' },
         { key: 'bottleneck', label: '当前瓶颈', value: summary?.bottleneck?.label || '-', meta: 'P95 最大阶段', valueClass: 'text-foreground' },
@@ -499,6 +533,21 @@ export function buildDiagnosticGroups(
         { key: 'entry_account_total_ms', label: '入口账号合计', value: formatMs(entryAccountTotal), meta: '入口 + 首包 + 账号 + 出口', valueClass: 'text-sky-600 dark:text-sky-400' },
         { key: 'entry_p95', label: '入口排队 P95', value: currentEntryQueueText, meta: `线程容量 ${threadTokens} · 慢 ${summary?.slow_counts?.handler_queue ?? 0}`, valueClass: 'text-sky-600 dark:text-sky-400' },
         { key: 'local_busy', label: '本地拒绝/繁忙', value: `${localBusy}`, meta: '无号 / 并发 / 策略', valueClass: 'text-foreground' },
+      ],
+    },
+    {
+      key: 'account_switch',
+      title: '账号切换',
+      meta: '切换动作与恢复结果',
+      items: [
+        { key: 'account_switch_requests', label: '切号请求', value: summary?.account_switch_requests ?? 0, meta: '发生过账号切换', valueClass: Number(summary?.account_switch_requests || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
+        { key: 'account_switches', label: '切换次数', value: summary?.account_switches ?? 0, meta: '窗口内实际切换', valueClass: Number(summary?.account_switches || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
+        { key: 'account_switch_success', label: '切号后成功', value: summary?.account_switch_success ?? 0, meta: Number(summary?.account_switch_requests || 0) > 0 ? '已恢复请求' : '暂无切号请求', valueClass: Number(summary?.account_switch_success || 0) > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-foreground' },
+        { key: 'account_switch_recovery_rate', label: '切号恢复率', value: `${summary?.account_switch_recovery_rate ?? 0}%`, meta: '切号后成功 / 切号请求', valueClass: Number(summary?.account_switch_success || 0) > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-foreground' },
+        { key: 'switch_unrecovered', label: '切号未恢复', value: summary?.switch_unrecovered ?? 0, meta: '切号后仍失败', valueClass: Number(summary?.switch_unrecovered || 0) > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-foreground' },
+        { key: 'switch_average', label: '平均切换', value: summary?.switch_average ?? 0, meta: '每个切号请求', valueClass: 'text-foreground' },
+        { key: 'stream_error_requests', label: '断流请求', value: summary?.stream_error_requests ?? 0, meta: '窗口内发生断流', valueClass: Number(summary?.stream_error_requests || 0) > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-foreground' },
+        { key: 'account_wait_slow', label: '账号等待慢请求', value: summary?.slow_counts?.account_wait ?? 0, meta: '等待超过 5 秒', valueClass: Number(summary?.slow_counts?.account_wait || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground' },
       ],
     },
     {

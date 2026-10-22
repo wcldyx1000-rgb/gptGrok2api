@@ -157,6 +157,8 @@
 
     <LogsDetailDrawer
       :log="selectedLog"
+      :loading="detailLoading"
+      :load-error="detailError"
       :primary-fields="selectedPrimaryDetailFields"
       :diagnostic-fields="selectedDiagnosticDetailFields"
       :timeline-segments="selectedTimelineSegments"
@@ -335,9 +337,11 @@ const logPreviewActions = useGalleryFileActions({
   copyErrorMessage: '复制图片链接失败。',
   downloadErrorMessage: (error) => `下载失败：${errorMessage(error, '图片源不可读取')}`,
 })
-const logDetailRuntime = useLogDetailRuntime()
+const logDetailRuntime = useLogDetailRuntime({ apiBaseUrl })
 const copiedLogPreviewKey = logPreviewActions.copiedFileKey
 const selectedLog = logDetailRuntime.selectedLog
+const detailLoading = logDetailRuntime.detailLoading
+const detailError = logDetailRuntime.detailError
 const selectedDetailPreview = logDetailRuntime.selectedDetailPreview
 const selectedDetailPreviewFile = logDetailRuntime.selectedDetailPreviewFile
 const selectedDetailImages = logDetailRuntime.selectedDetailImages
@@ -415,7 +419,7 @@ const systemLogsQuery = usePagedQuery({
     const targetId = routeTargetLogId.value
     if (targetId) {
       const targetLog = logs.value.find((item) => item.id === targetId)
-      if (targetLog) selectedLog.value = targetLog
+      if (targetLog) void openDetail(targetLog)
     }
     logMeta.total = response.total
     logMeta.limit = response.limit

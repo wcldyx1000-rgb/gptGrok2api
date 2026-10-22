@@ -171,6 +171,23 @@ function diagnosticStageValue(item: SystemLogRow): string {
   return stage
 }
 
+function boolText(value: string): boolean | null {
+  const text = cleanString(value).toLowerCase()
+  if (['true', '是', '1', 'yes'].includes(text)) return true
+  if (['false', '否', '0', 'no'].includes(text)) return false
+  return null
+}
+
+/** 上游阻断：blocked 为真。 */
+function isBlocked(item: SystemLogRow): boolean {
+  return boolText(item.blocked) === true
+}
+
+/** 上游没有调用图片工具：tool_invoked 明确为假。 */
+function isToolSkipped(item: SystemLogRow): boolean {
+  return boolText(item.toolInvoked) === false
+}
+
 function hasDiagnosticSignal(item: SystemLogRow): boolean {
   return Boolean(
     isFailed(item)
@@ -181,8 +198,8 @@ function hasDiagnosticSignal(item: SystemLogRow): boolean {
       || item.reason
       || item.upstreamErrorType
       || item.upstreamRequestId
-      || item.blocked === '是'
-      || item.toolInvoked === '是'
+      || isBlocked(item)
+      || isToolSkipped(item)
       || diagnosticStageValue(item),
   )
 }
@@ -312,7 +329,7 @@ function proxySourceLabel(value: unknown): string {
   if (source.includes('default')) return '默认'
   if (source.includes('global')) return '默认'
   if (source.includes('runtime_resource')) return '资源代理'
-  if (source.includes('runtime')) return 'Runtime'
+  if (source.includes('runtime')) return '代理会话'
   if (source.includes('explicit')) return '指定'
   if (source.includes('direct')) return '直连'
   return source
@@ -450,6 +467,18 @@ export function buildPrimaryDetailFields(item: SystemLogRow | null): DetailField
     { label: '请求 ID', value: rawDetailValue(item, 'call_id') || item.id, copyable: true },
     { label: '接口', value: item.endpoint, copyable: true },
     { label: '模型', value: item.model, copyable: true },
+    { label: '请求尺寸', value: item.requestSize },
+    { label: '实际分辨率', value: item.resolution },
+    { label: '请求质量', value: item.requestQuality },
+    { label: '返回格式', value: item.requestResponseFormat },
+    { label: '请求张数', value: item.requestCount },
+    { label: '出图张数', value: item.resultImageCount > 0 ? String(item.resultImageCount) : '' },
+    {
+      label: '生成尝试',
+      value: item.imageAttemptCount > 0
+        ? `${item.imageAttemptCount} 次尝试${item.switchCount > 0 ? ` · 切换 ${item.switchCount} 次` : ''}`
+        : '',
+    },
     { label: '账号', value: item.accountEmail, copyable: true },
     { label: 'OAuth 账号 ID', value: item.accountId, copyable: true },
     { label: '密钥', value: maskKeyLabel([item.keyName, item.keyId].filter(Boolean).join(' / ')) },
@@ -463,6 +492,7 @@ export function buildDiagnosticDetailFields(item: SystemLogRow | null): DetailFi
   if (!item) return []
   if (!hasDiagnosticSignal(item)) return []
   const shouldShowBooleans = isFailed(item) || isLimited(item) || Boolean(item.errorCode || item.error || item.reason)
+    || isBlocked(item) || isToolSkipped(item)
   return compactDetailFields([
     { label: '状态码', value: item.statusCode },
     { label: '错误码', value: item.errorCode, copyable: true },

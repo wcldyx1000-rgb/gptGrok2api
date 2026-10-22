@@ -36,6 +36,8 @@ export type GalleryFileCardSignatureInput = {
   sizeLabel: string
   dimensions: string
   timeRemaining: string
+  genboxPushEnabled: boolean
+  genboxBusy: boolean
 }
 
 function signatureValue(value: unknown): string {
@@ -79,6 +81,10 @@ export function storageLabel(file: GalleryFile): string {
   return '本地'
 }
 
+export function genboxStatusLabel(file: GalleryFile): string {
+  return file.genbox_push?.label || ''
+}
+
 export function galleryFileCardSignature(file: GalleryFile, input: GalleryFileCardSignatureInput): string {
   return [
     file.path,
@@ -92,6 +98,9 @@ export function galleryFileCardSignature(file: GalleryFile, input: GalleryFileCa
     input.sizeLabel,
     input.dimensions,
     input.timeRemaining,
+    input.genboxPushEnabled ? 1 : 0,
+    input.genboxBusy ? 1 : 0,
+    file.genbox_push ? `${file.genbox_push.status}:${file.genbox_push.updated_at}` : '',
     file.tags.map((tag) => boundedSignatureText(tag, 64)).join(','),
   ].map(signatureValue).join('|')
 }

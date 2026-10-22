@@ -28,9 +28,19 @@
             <div class="log-detail-summary__duration">
               <span>总耗时</span>
               <strong>{{ formatTimelineMs(log.durationMs) }}</strong>
+              <small v-if="durationBreakdown">{{ durationBreakdown }}</small>
             </div>
           </div>
         </section>
+
+        <div v-if="$slots.actions" class="flex flex-wrap justify-end gap-2">
+          <slot name="actions" />
+        </div>
+
+        <p v-if="loading" class="log-detail-status" role="status">正在加载完整详情...</p>
+        <p v-else-if="loadError" class="log-detail-status log-detail-status--error" role="alert">
+          {{ loadError }}
+        </p>
 
         <div class="detail-field-stack">
           <section class="detail-field-section">
@@ -68,6 +78,12 @@
             </div>
           </section>
         </div>
+
+        <LogsImageAttemptTimeline
+          v-if="log.imageAttempts.length"
+          :key="log.id"
+          :attempts="log.imageAttempts"
+        />
 
         <LogsDetailTimeline
           v-if="hasTimeline"
@@ -128,6 +144,7 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
 import DetailFieldCard from '@/components/ai/DetailFieldCard.vue'
 import DetailImagePreview from '@/components/ai/DetailImagePreview.vue'
 import DetailTextBlock from '@/components/ai/DetailTextBlock.vue'
@@ -144,11 +161,15 @@ import {
   type DetailTimelineStep,
 } from '@/views/logs/logDetailView'
 import type { DetailPreviewImage } from '@/views/logs/logDetailRuntime'
+import { attemptDurationBreakdown } from '@/views/logs/logAttemptView'
 import { statusLabel, statusTone, summaryText } from '@/views/logs/logsView'
 import LogsDetailTimeline from '@/views/logs/LogsDetailTimeline.vue'
+import LogsImageAttemptTimeline from '@/views/logs/LogsImageAttemptTimeline.vue'
 
-defineProps<{
+const props = defineProps<{
   log: SystemLogRow | null
+  loading?: boolean
+  loadError?: string
   primaryFields: DetailField[]
   diagnosticFields: DetailField[]
   timelineSegments: DetailTimelineSegment[]
@@ -161,6 +182,8 @@ defineProps<{
   timelineDetailsVisible: boolean
   images: DetailPreviewImage[]
 }>()
+
+const durationBreakdown = computed(() => (props.log ? attemptDurationBreakdown(props.log.imageAttempts) : ''))
 
 const emit = defineEmits<{
   (e: 'close'): void
@@ -228,6 +251,23 @@ const emit = defineEmits<{
   font-size: 20px;
   font-weight: 650;
   color: hsl(var(--foreground));
+}
+
+.log-detail-summary__duration small {
+  max-width: 24rem;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  line-height: 1.4;
+  color: hsl(var(--muted-foreground) / 0.78);
+}
+
+.log-detail-status {
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
+
+.log-detail-status--error {
+  color: hsl(0 72% 45%);
 }
 
 .detail-field-stack {

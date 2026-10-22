@@ -41,7 +41,7 @@ export type LogMetricItem = {
   class: string
 }
 
-export type LogStatusTone = 'success' | 'danger' | 'warning' | 'muted'
+export type LogStatusTone = 'success' | 'danger' | 'warning' | 'info' | 'muted'
 
 type RuntimeFilterKey = 'level' | 'source'
 
@@ -99,6 +99,8 @@ export const statusOptions = [
   { label: '成功', value: 'success' },
   { label: '失败', value: 'failed' },
   { label: '限流/受限', value: 'limited' },
+  { label: '部分成功', value: 'partial' },
+  { label: '文本回复', value: 'text' },
 ]
 
 export const systemQuickFilterOptions: LogGroupedSelectOption[] = [
@@ -235,18 +237,167 @@ export function summaryText(item: SystemLogRow): string {
   return item.summary || item.error || item.reason || item.preview
 }
 
+export type LogOutcome = 'success' | 'partial_success' | 'text_review' | 'rate_limited' | 'failed' | 'running' | 'unknown'
+
+/** 调用结果：优先用后端写入的 outcome，旧日志按状态/错误推导。 */
+export function logOutcome(item: SystemLogRow): LogOutcome {
+  const status = item.status.toLowerCase()
+  if (status === 'running' || status === 'cancelling') return 'running'
+  if (['success', 'partial_success', 'text_review', 'rate_limited', 'failed'].includes(item.outcome)) {
+    return item.outcome as LogOutcome
+  }
+  if (isSuccess(item)) return 'success'
+  if (isFailed(item)) return isLimited(item) ? 'rate_limited' : 'failed'
+  if (isLimited(item)) return 'rate_limited'
+  return 'unknown'
+}
+
+const outcomePresentation: Record<LogOutcome, { label: string; tone: LogStatusTone }> = {
+  success: { label: '成功', tone: 'success' },
+  partial_success: { label: '部分成功', tone: 'warning' },
+  text_review: { label: '文本', tone: 'warning' },
+  rate_limited: { label: '限流', tone: 'warning' },
+  failed: { label: '失败', tone: 'danger' },
+  running: { label: '运行中', tone: 'info' },
+  unknown: { label: '记录', tone: 'muted' },
+}
+
 export function statusLabel(item: SystemLogRow): string {
-  if (isSuccess(item)) return '成功'
-  if (isFailed(item)) return '失败'
-  if (isLimited(item)) return '受限'
-  return item.status || '记录'
+  const status = item.status.toLowerCase()
+  if (status === 'cancelling') return '取消中'
+  const outcome = logOutcome(item)
+  if (outcome === 'unknown') return item.status || outcomePresentation.unknown.label
+  return outcomePresentation[outcome].label
 }
 
 export function statusTone(item: SystemLogRow): LogStatusTone {
-  if (isSuccess(item)) return 'success'
-  if (isFailed(item)) return 'danger'
-  if (isLimited(item)) return 'warning'
-  return 'muted'
+  return outcomePresentation[logOutcome(item)].tone
+}
+
+export type LogBusinessKind =
+  | 'account' | 'image_generation' | 'image_edit' | 'image_chat'
+  | 'chat' | 'responses' | 'messages' | 'search' | 'file' | 'other'
+
+const businessLabels: Partial<Record<LogBusinessKind, string>> = {
+  account: '账号操作',
+  image_generation: '文生图',
+  image_edit: '图生图',
+  image_chat: '对话生图',
+  chat: '对话',
+  responses: '响应',
+  messages: '消息',
+  search: '搜索',
+  file: '文件',
+}
+
+export function logBusinessKind(item: SystemLogRow): LogBusinessKind {
+  const endpoint = item.endpoint.toLowerCase().replace(/\/+$/, '')
+  const model = item.model.toLowerCase()
+  if (item.type === 'account') return 'account'
+  if (endpoint.endsWith('/images/generations')) return 'image_generation'
+  if (endpoint.endsWith('/images/edits')) return 'image_edit'
+  if (endpoint.endsWith('/chat/completions')) return model.includes('image') ? 'image_chat' : 'chat'
+  if (endpoint.endsWith('/responses')) return model.includes('image') ? 'image_chat' : 'responses'
+  if (endpoint.endsWith('/messages')) return 'messages'
+  if (endpoint.includes('search')) return 'search'
+  if (endpoint.includes('file')) return 'file'
+  return 'other'
+}
+
+const imageFailureLabels: Record<string, string> = {
+  upstream_error: '上游请求失败',
+  internal_error: '内部处理异常',
+  upstream_unavailable: '上游服务暂不可用',
+  upstream_connection_failed: '无法连接上游',
+  upstream_connection_timeout: '上游连接超时',
+  upstream_rate_limited: '上游服务限流',
+  image_poll_timeout: '等待图片结果超时',
+  image_stream_timeout: '上游图片流超时',
+  image_stream_interrupted: '上游图片流中断',
+  image_tool_error: '图片工具异常',
+  image_quota_exhausted: '图片额度已用尽',
+  file_upload_throttled: '参考图上传受限',
+  auth_invalid: '账号登录态失效',
+  content_policy_violation: '内容安全策略拒绝',
+  invalid_image_input: '图片输入无效',
+  upstream_text_reply: '上游仅返回文本',
+  no_image_generated: '未生成图片',
+  unsupported_model: '模型不支持生图',
+  image_download_failed: '图片下载失败',
+  task_interrupted: '图片任务被中断',
+  no_available_account: '暂无可用账号',
+  insufficient_quota: '图片额度不足',
+}
+
+export function imageFailureLabel(code: string): string {
+  return imageFailureLabels[cleanLogString(code).toLowerCase()] || ''
+}
+
+export type LogRowPresentation = {
+  requestKind: string
+  requestPrimary: string
+  requestSecondary: string
+  requestParameters: string
+  executionPrimary: string
+  executionSecondary: string
+  resultText: string
+  diagnostics: string
+  durationTone: LogStatusTone
+}
+
+const IMAGE_BUSINESS: LogBusinessKind[] = ['image_generation', 'image_edit', 'image_chat']
+
+function logResultText(item: SystemLogRow, outcome: LogOutcome, business: LogBusinessKind): string {
+  const requested = item.imageRequestedCount
+  const succeeded = item.imageSucceededCount || item.resultImageCount
+  if (outcome === 'partial_success') return `生成 ${succeeded}/${Math.max(requested, succeeded)} 张图片`
+  if (outcome === 'text_review') return '上游返回文本'
+  if (outcome === 'failed' || outcome === 'rate_limited') {
+    return item.error || imageFailureLabel(item.errorCode) || item.summary || '调用失败'
+  }
+  if (succeeded > 0 && IMAGE_BUSINESS.includes(business)) {
+    return requested > 1 ? `生成 ${succeeded}/${requested} 张图片` : `生成 ${succeeded} 张图片`
+  }
+  if (outcome === 'success') {
+    if (IMAGE_BUSINESS.includes(business)) return '图片生成完成'
+    if (business === 'search') return '搜索完成'
+    if (['chat', 'responses', 'messages'].includes(business)) return '文本响应完成'
+    if (business === 'account') return item.summary || '账号操作完成'
+    return '调用完成'
+  }
+  return item.summary || item.error || '调用完成'
+}
+
+export function logRowPresentation(item: SystemLogRow): LogRowPresentation {
+  const outcome = logOutcome(item)
+  const business = logBusinessKind(item)
+  const parameters = [
+    item.requestSize ? `请求 ${item.requestSize}` : '',
+    item.requestQuality ? `质量 ${item.requestQuality}` : '',
+    item.requestResponseFormat ? `返回 ${item.requestResponseFormat}` : '',
+  ].filter(Boolean).join(' · ')
+  const caller = item.keyName || item.keyId
+  const account = item.accountEmail || item.accountId
+  const executionParts = [
+    item.imageRequestedCount > 0 ? `${item.imageRequestedCount} 个任务` : '',
+    item.imageAttemptCount > 0 ? `${item.imageAttemptCount} 次尝试` : '',
+  ].filter(Boolean)
+  const showFailure = outcome === 'failed' || outcome === 'rate_limited'
+  const durationMs = Number(item.durationMs) || 0
+  return {
+    requestKind: business === 'account' ? '' : (businessLabels[business] || typeLabel(item.type)),
+    requestPrimary: item.model || typeLabel(item.type),
+    requestSecondary: item.endpoint,
+    requestParameters: parameters,
+    executionPrimary: account || caller || '-',
+    executionSecondary: [executionParts.join(' · '), account ? caller : '']
+      .filter(Boolean).join(' · '),
+    resultText: logResultText(item, outcome, business),
+    diagnostics: showFailure
+      ? [Number(item.statusCode) > 0 ? `HTTP ${item.statusCode}` : '', item.errorCode].filter(Boolean).join(' · ')
+      : '',
+    durationTone: outcome === 'failed' ? 'danger' : durationMs >= 60_000 ? 'warning' : 'success',
+  }
 }
 
 export function systemLogRowSignature(item: SystemLogRow, input: SystemLogRowSignatureInput): string {
@@ -258,6 +409,7 @@ export function systemLogRowSignature(item: SystemLogRow, input: SystemLogRowSig
     boundedSignatureText(typeLabel(item.type), 64),
     boundedSignatureText(tokenLabel(item), 96),
     boundedSignatureText(item.durationMs, 64),
+    boundedSignatureText(item.resolution, 64),
     boundedSignatureText(statusLabel(item), 64),
     statusTone(item),
     boundedSignatureText(summaryText(item)),
@@ -265,6 +417,12 @@ export function systemLogRowSignature(item: SystemLogRow, input: SystemLogRowSig
     item.imageUrls.slice(0, 4).map((url) => boundedSignatureText(url, 96)).join(','),
     boundedSignatureText(item.preview),
     isFailed(item) ? 1 : 0,
+    item.outcome,
+    item.imageRequestedCount,
+    item.imageAttemptCount,
+    item.switchCount,
+    boundedSignatureText(item.model, 64),
+    boundedSignatureText(item.accountEmail, 96),
   ].map(signatureValue).join('|')
 }
 
@@ -356,6 +514,8 @@ export function systemMetricItems(logMeta: Pick<SystemLogsResponse, 'stats' | 's
     { label: pageScope ? '本页成功' : '成功', value: stats.success, class: 'text-emerald-600' },
     { label: pageScope ? '本页失败' : '失败', value: stats.failed, class: 'text-rose-600' },
     { label: pageScope ? '本页限流' : '限流', value: stats.limited, class: 'text-amber-600' },
+    { label: pageScope ? '本页部分成功' : '部分成功', value: stats.partial_success ?? 0, class: 'text-orange-600' },
+    { label: pageScope ? '本页文本' : '文本回复', value: stats.text_review ?? 0, class: 'text-violet-600' },
     { label: pageScope ? '本页图片' : '图片接口', value: stats.image, class: 'text-cyan-600' },
   ]
 }

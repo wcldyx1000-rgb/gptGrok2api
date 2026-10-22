@@ -31,8 +31,22 @@
         </FormField>
 
         <FormField label="密码">
-          <Input v-model="imageStorage.webdav_password" type="password" block />
+          <Input
+            v-model="imageStorage.webdav_password"
+            type="password"
+            block
+            autocomplete="new-password"
+            :placeholder="imageStorage.has_webdav_password ? '已配置，留空不修改' : '请输入 WebDAV 密码'"
+          />
         </FormField>
+      </div>
+
+      <div v-if="imageStorage.has_webdav_password" class="settings-check-grid settings-check-grid--single">
+        <div class="settings-check-item">
+          <div class="settings-check-control">
+            <Checkbox v-model="imageStorage.clear_webdav_password">保存时清除已配置的 WebDAV 密码</Checkbox>
+          </div>
+        </div>
       </div>
 
       <FormField label="根路径">
@@ -61,6 +75,55 @@
       </div>
     </FormSection>
 
+    <FormSection title="GenBox 图片推送" class="settings-storage-main">
+      <div class="settings-check-grid settings-check-grid--single">
+        <div class="settings-check-item">
+          <div class="settings-check-control">
+            <Checkbox v-model="genboxPush.enabled">启用 GenBox 推送（默认关闭）</Checkbox>
+          </div>
+        </div>
+        <div class="settings-check-item">
+          <div class="settings-check-control">
+            <Checkbox v-model="genboxPush.auto_push_after_studio" :disabled="!genboxPush.enabled">
+              Studio 生成完成后自动推送
+            </Checkbox>
+          </div>
+        </div>
+      </div>
+
+      <FormField label="GenBox 地址">
+        <Input v-model.trim="genboxPush.base_url" block placeholder="https://genbox.example.com" />
+      </FormField>
+
+      <div class="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+        <FormField label="来源 ID">
+          <Input v-model.trim="genboxPush.source_id" block placeholder="gptgrok2api" />
+        </FormField>
+
+        <FormField label="请求超时（秒）">
+          <Input v-model.number="genboxPush.timeout_secs" type="number" block placeholder="20" />
+        </FormField>
+      </div>
+
+      <FormField label="Push Key">
+        <Input
+          v-model="genboxPush.push_key"
+          type="password"
+          block
+          autocomplete="new-password"
+          :placeholder="genboxPush.has_push_key ? '已配置，留空不修改' : '请输入 GenBox Push Key'"
+        />
+      </FormField>
+
+      <div v-if="genboxPush.has_push_key" class="settings-check-grid settings-check-grid--single">
+        <div class="settings-check-item">
+          <div class="settings-check-control">
+            <Checkbox v-model="genboxPush.clear_push_key">保存时清除已配置的 Push Key</Checkbox>
+          </div>
+        </div>
+      </div>
+    </FormSection>
+
     <FormSection title="AI 审核" class="settings-storage-side">
       <div class="settings-check-grid settings-check-grid--single">
         <div class="settings-check-item">
@@ -75,8 +138,22 @@
       </FormField>
 
       <FormField label="API Key">
-        <Input v-model="settings.ai_review.api_key" type="password" block placeholder="sk-..." />
+        <Input
+          v-model="settings.ai_review.api_key"
+          type="password"
+          block
+          autocomplete="new-password"
+          :placeholder="settings.ai_review.has_api_key ? '已配置，留空不修改' : 'sk-...'"
+        />
       </FormField>
+
+      <div v-if="settings.ai_review.has_api_key" class="settings-check-grid settings-check-grid--single">
+        <div class="settings-check-item">
+          <div class="settings-check-control">
+            <Checkbox v-model="settings.ai_review.clear_api_key">保存时清除已配置的 API Key</Checkbox>
+          </div>
+        </div>
+      </div>
 
       <FormField label="Model">
         <Input v-model.trim="settings.ai_review.model" block placeholder="填写审核服务支持的模型 ID" />
@@ -114,6 +191,7 @@ defineEmits<{
 }>()
 
 const imageStorage = computed(() => props.settings.image_storage as NonNullable<Settings['image_storage']>)
+const genboxPush = computed(() => props.settings.genbox_push as NonNullable<Settings['genbox_push']>)
 </script>
 
 <style scoped>

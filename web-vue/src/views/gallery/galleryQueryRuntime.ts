@@ -38,6 +38,7 @@ export function useGalleryQueryRuntime(options: GalleryQueryRuntimeOptions) {
   const pageSize = ref(getNumberPreference(preferenceKeys.galleryPageSize, 24, { allowed: galleryPageSizeOptions }))
   const counts = ref({ all: 0, image: 0, video: 0, music: 0 })
   const allTags = ref<string[]>([])
+  const genboxPushEnabled = ref(false)
 
   const tagOptions = computed(() => buildTagOptions(allTags.value))
 
@@ -67,6 +68,7 @@ export function useGalleryQueryRuntime(options: GalleryQueryRuntimeOptions) {
       files.value = data.files
       totalSize.value = data.total_size
       counts.value = data.counts
+      genboxPushEnabled.value = data.genbox_push_enabled
       allTags.value = tags || []
       options.onApplied?.()
     },
@@ -145,6 +147,7 @@ export function useGalleryQueryRuntime(options: GalleryQueryRuntimeOptions) {
     pageSize,
     counts,
     allTags,
+    genboxPushEnabled,
     tagOptions,
     currentPage,
     pageCount,

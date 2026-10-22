@@ -21,7 +21,7 @@
           @action="handleMessageAction"
           @toggle-expanded="toggleMessageExpanded"
           @open-search-sources="openSearchSourcePanel"
-          @citation-click="scrollToCitationSource"
+          @citation-click="openCitationSource"
           @preview="forwardPreview"
           @reference-image="forwardReferenceImage"
           @inpaint-image="forwardInpaintImage"
@@ -41,52 +41,6 @@
       <Icon icon="lucide:arrow-down" class="h-5 w-5" />
     </button>
 
-    <Transition name="studio-search-drawer-fade">
-      <div
-        v-if="activeSearchSourceMessage"
-        class="studio-search-drawer-backdrop"
-        @click="closeSearchSourcePanel"
-      ></div>
-    </Transition>
-
-    <Transition name="studio-search-drawer-slide">
-      <aside
-        v-if="activeSearchSourceMessage"
-        class="studio-search-drawer"
-        role="dialog"
-        aria-label="参考来源"
-      >
-        <header class="studio-search-drawer-header">
-          <div>
-            <strong>参考来源</strong>
-            <small>{{ activeSearchSourceMessage.searchSources?.length || 0 }} 条网页结果</small>
-          </div>
-          <ModalCloseButton label="关闭参考来源" @click="closeSearchSourcePanel" />
-        </header>
-
-        <div class="studio-search-drawer-body custom-scrollbar">
-          <a
-            v-for="(source, sourceIndex) in activeSearchSourceMessage.searchSources"
-            :key="`${activeSearchSourceMessage.id}-panel-source-${sourceIndex}`"
-            :id="searchSourceDomId(activeSearchSourceMessage.id, sourceIndex)"
-            class="studio-search-source-card"
-            :class="{ 'is-static': !source.url, 'is-highlighted': highlightedSearchSourceId === searchSourceDomId(activeSearchSourceMessage.id, sourceIndex) }"
-            :href="source.url || undefined"
-            :target="source.url ? '_blank' : undefined"
-            :rel="source.url ? 'noreferrer' : undefined"
-            @click="!source.url && $event.preventDefault()"
-          >
-            <span class="studio-search-source-index">{{ sourceIndex + 1 }}</span>
-            <span class="studio-search-source-body">
-              <strong>{{ sourceTitle(source, sourceIndex) }}</strong>
-              <small v-if="sourceHost(source.url)">{{ sourceHost(source.url) }}</small>
-              <em v-if="source.snippet">{{ source.snippet }}</em>
-            </span>
-            <Icon v-if="source.url" icon="lucide:external-link" class="studio-search-source-open h-3.5 w-3.5" />
-          </a>
-        </div>
-      </aside>
-    </Transition>
   </section>
 </template>
 
@@ -95,14 +49,15 @@ import { Icon } from '@iconify/vue'
 import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, shallowRef, watch, type CSSProperties } from 'vue'
 import {
   imageAssetUrl,
+  imageTaskElapsedText,
   imageTaskProgressLabel,
+  partialImageNote,
   parseImageSize,
   taskPrimaryMessage,
   type ImageTask,
   type ImageTaskAsset,
 } from '@/api/imageTasks'
 import { splitStudioSearchCalls } from '@/lib/studioToolCalls'
-import ModalCloseButton from '@/components/ai/ModalCloseButton.vue'
 import StudioMessageItem, {
   type StudioMessageActionKey,
   type StudioMessageView,
@@ -132,12 +87,14 @@ const emit = defineEmits<{
   edit: [message: StudioMessage]
   resend: [message: StudioMessage]
   'retry-assistant': [message: StudioMessage]
+  'resume-image-task': [message: StudioMessage]
   'delete-message': [messageId: string]
   'copy-message': [content: string]
   preview: [src: string, name: string, localPath?: string]
   'reference-image': [asset: StudioImageAssetView, name: string, message: StudioMessage]
   'inpaint-image': [asset: StudioImageAssetView, name: string, message: StudioMessage]
   'compare-image': [source: StudioImageCompareSource, asset: StudioImageAssetView, name: string]
+  'open-search-sources': [messageId: string, sourceIndex?: number]
 }>()
 
 type MessageViewSignatureValue = string | number | boolean | null | undefined
@@ -158,13 +115,10 @@ const showScrollLatest = ref(false)
 const visibleMessageLimit = ref(INITIAL_MESSAGE_LIMIT)
 const expandedMessageIds = ref<Set<string>>(new Set())
 const collapsedMessageIds = ref<Set<string>>(new Set())
-const highlightedSearchSourceId = ref('')
-const searchPanelMessageId = ref('')
 const displayedConversation = shallowRef<StudioConversation | null>(props.conversation)
 const messageViewCache = new Map<string, { signature: MessageViewSignature; revision: number; view: StudioMessageView }>()
 let scrollLatestFrameId: number | null = null
 let scrollLatestToken = 0
-let searchSourceHighlightTimer: number | null = null
 let turnsResizeObserver: ResizeObserver | null = null
 let stickToBottom = true
 
@@ -178,10 +132,6 @@ const visibleMessages = computed(() => {
 const hiddenMessageCount = computed(() => Math.max(0, allMessages.value.length - visibleMessages.value.length))
 const messageViews = computed(() => {
   return visibleMessages.value.map((message) => buildMessageView(message))
-})
-const activeSearchSourceMessage = computed(() => {
-  if (!searchPanelMessageId.value) return null
-  return allMessages.value.find((message) => message.id === searchPanelMessageId.value && message.searchSources?.length) || null
 })
 
 function buildMessageView(message: StudioMessage): StudioMessageView {
@@ -216,6 +166,9 @@ function buildMessageView(message: StudioMessage): StudioMessageView {
     imageSlotCount,
     pendingSlots: Array.from({ length: imageSlotCount }, (_, index) => index),
     imagePendingStageText: imageTaskProgressLabel(task),
+    imagePendingElapsedText: imageTaskElapsedText(task),
+    missingImageCount: missingImageCount(task, assets.length),
+    partialImageNote: partialImageNote(task, assets.length),
     primaryMessage: taskPrimaryMessage(task),
     imagePreviewStyle: isImageMessage ? buildImagePreviewStyle(message, task, imageSlotCount, assets) : undefined,
     isCollapsible,
@@ -270,6 +223,7 @@ function messageViewSignature(
     task?.quality,
     task?.stage,
     task?.progress,
+    task?.elapsed_secs === undefined ? '' : Math.floor(task.elapsed_secs),
     task?.upstream_request_id,
     task?.blocked,
     task?.tool_invoked,
@@ -381,7 +335,6 @@ watch(() => props.conversation, (conversation, previousConversation) => {
 watch(() => displayedConversation.value?.id, () => {
   visibleMessageLimit.value = INITIAL_MESSAGE_LIMIT
   showScrollLatest.value = false
-  closeSearchSourcePanel()
   settleScrollToLatest()
 })
 
@@ -442,6 +395,12 @@ function isLiveMessage(message: StudioMessage) {
   return Boolean(task && task.status !== 'success' && task.status !== 'error')
 }
 
+function missingImageCount(task: ImageTask | undefined, producedCount: number) {
+  if (!task || task.status !== 'success' || producedCount <= 0) return 0
+  const requested = Math.min(4, Math.max(1, Math.trunc(Number(task.n) || 1)))
+  return Math.max(0, requested - producedCount)
+}
+
 function computeImageSlotCount(message: StudioMessage, task: ImageTask | undefined, assetCount: number) {
   const taskCount = Number(task?.n)
   const messageCount = Number(message.imageCount)
@@ -482,67 +441,17 @@ function imageMessageWidth(aspect: { width: number; height: number }, imageSlotC
   return `clamp(${SINGLE_IMAGE_MIN_WIDTH_REM}rem, calc(${SINGLE_IMAGE_MAX_WIDTH_REM}rem * ${aspect.width} / ${aspect.height}), ${SINGLE_IMAGE_MAX_WIDTH_REM}rem)`
 }
 
-function sourceTitle(source: StudioSearchSource, index: number) {
-  return source.title?.trim() || source.url?.trim() || `来源 ${index + 1}`
+function openSearchSourcePanel(message: StudioMessage) {
+  emit('open-search-sources', message.id)
 }
 
-function sourceHost(url: string | undefined) {
-  const value = String(url || '').trim()
-  if (!value) return ''
-  try {
-    return new URL(value).host.replace(/^www\./, '')
-  } catch {
-    return ''
-  }
-}
-
-function searchSourceDomId(messageId: string, sourceIndex: number) {
-  return `studio-search-source-${messageId.replace(/[^a-zA-Z0-9_-]/g, '-')}-${sourceIndex + 1}`
-}
-
-function openSearchSourcePanel(message: StudioMessage, sourceIndex?: number) {
-  openSearchSourcePanelById(message.id, sourceIndex)
-}
-
-function closeSearchSourcePanel() {
-  searchPanelMessageId.value = ''
-  highlightedSearchSourceId.value = ''
-  if (searchSourceHighlightTimer !== null) {
-    window.clearTimeout(searchSourceHighlightTimer)
-    searchSourceHighlightTimer = null
-  }
-}
-
-function openSearchSourcePanelById(messageId: string, sourceIndex?: number) {
-  searchPanelMessageId.value = messageId
-  if (sourceIndex === undefined) {
-    highlightedSearchSourceId.value = ''
-    return
-  }
-  highlightSearchSource(messageId, sourceIndex)
-}
-
-function scrollToCitationSource(href: string) {
+function openCitationSource(href: string) {
   const match = String(href || '').match(/^studio-citation:([^:]+):(\d+)$/)
   if (!match) return
   const messageId = decodeURIComponent(match[1] || '')
   const sourceIndex = Number(match[2]) - 1
   if (!messageId || !Number.isInteger(sourceIndex) || sourceIndex < 0) return
-  openSearchSourcePanelById(messageId, sourceIndex)
-}
-
-function highlightSearchSource(messageId: string, sourceIndex: number) {
-  const targetId = searchSourceDomId(messageId, sourceIndex)
-  highlightedSearchSourceId.value = targetId
-  void nextTick(() => {
-    const target = document.getElementById(targetId)
-    target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-  })
-  if (searchSourceHighlightTimer !== null) window.clearTimeout(searchSourceHighlightTimer)
-  searchSourceHighlightTimer = window.setTimeout(() => {
-    if (highlightedSearchSourceId.value === targetId) highlightedSearchSourceId.value = ''
-    searchSourceHighlightTimer = null
-  }, 1600)
+  emit('open-search-sources', messageId, sourceIndex)
 }
 
 function trimStringKeyCache<T>(cache: Map<string, T>, maxSize: number) {
@@ -598,10 +507,6 @@ onActivated(() => {
 
 onBeforeUnmount(() => {
   cancelScheduledScrollToLatest()
-  if (searchSourceHighlightTimer !== null) {
-    window.clearTimeout(searchSourceHighlightTimer)
-    searchSourceHighlightTimer = null
-  }
   turnsResizeObserver?.disconnect()
   turnsResizeObserver = null
 })
@@ -661,6 +566,7 @@ function handleMessageAction(action: StudioMessageActionKey, message: StudioMess
   else if (action === 'edit') emit('edit', message)
   else if (action === 'resend') emit('resend', message)
   else if (action === 'fill') emit('retry', message)
+  else if (action === 'resume-poll') emit('resume-image-task', message)
   else if (action === 'retry') emit('retry-assistant', message)
   else if (action === 'delete') emit('delete-message', message.id)
 }
@@ -799,200 +705,6 @@ defineExpose({
   border-color: var(--ui-control-hover-border, hsl(var(--foreground) / 0.18));
   background: var(--ui-control-hover-bg, hsl(var(--secondary)));
   color: var(--ui-fg-strong, hsl(var(--foreground)));
-}
-
-.studio-search-drawer-backdrop {
-  position: absolute;
-  inset: 0;
-  z-index: 30;
-  background: hsl(var(--background) / 0.42);
-  backdrop-filter: blur(1px);
-}
-
-.studio-search-drawer {
-  position: absolute;
-  top: 0.75rem;
-  right: 0.75rem;
-  bottom: 0.75rem;
-  z-index: 31;
-  display: flex;
-  width: min(25rem, calc(100% - 1.5rem));
-  min-width: 0;
-  flex-direction: column;
-  overflow: hidden;
-  border: 1px solid hsl(var(--border) / 0.82);
-  border-radius: 1.1rem;
-  background: hsl(var(--card));
-  box-shadow: 0 24px 70px hsl(var(--foreground) / 0.18);
-}
-
-.studio-search-drawer-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 1rem;
-  border-bottom: 1px solid hsl(var(--border) / 0.72);
-  padding: 0.9rem 0.95rem 0.75rem;
-}
-
-.studio-search-drawer-header div {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 0.2rem;
-}
-
-.studio-search-drawer-header strong {
-  color: hsl(var(--foreground));
-  font-size: 0.95rem;
-  font-weight: 800;
-}
-
-.studio-search-drawer-header small {
-  color: hsl(var(--muted-foreground));
-  font-size: 0.72rem;
-  font-weight: 650;
-}
-
-.studio-search-drawer-body {
-  display: grid;
-  min-height: 0;
-  flex: 1;
-  align-content: start;
-  gap: 0.55rem;
-  overflow-y: auto;
-  padding: 0.75rem;
-}
-
-.studio-search-source-card {
-  display: grid;
-  min-width: 0;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: start;
-  gap: 0.45rem;
-  border: 1px solid hsl(var(--border) / 0.62);
-  border-radius: 0.78rem;
-  background: hsl(var(--background) / 0.72);
-  padding: 0.5rem 0.6rem;
-  color: hsl(var(--foreground));
-  text-decoration: none;
-  transition: border-color 0.15s, background 0.15s, transform 0.15s;
-}
-
-.studio-search-source-card:hover,
-.studio-search-source-card:focus-visible {
-  border-color: hsl(var(--foreground) / 0.2);
-  background: hsl(var(--background));
-  transform: translateY(-1px);
-}
-
-.studio-search-source-card.is-static {
-  cursor: default;
-}
-
-.studio-search-source-card.is-highlighted {
-  border-color: var(--ui-accent-border, hsl(var(--primary) / 0.35));
-  background: var(--ui-accent-soft, hsl(var(--primary) / 0.08));
-  box-shadow: 0 0 0 3px hsl(var(--primary) / 0.08);
-}
-
-.studio-search-source-index {
-  display: inline-flex;
-  width: 1.35rem;
-  height: 1.35rem;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  border-radius: 999px;
-  background: hsl(var(--secondary));
-  color: hsl(var(--muted-foreground));
-  font-size: 0.72rem;
-  font-weight: 800;
-  line-height: 1;
-}
-
-.studio-search-source-body {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 0.14rem;
-}
-
-.studio-search-source-body strong,
-.studio-search-source-body small,
-.studio-search-source-body em {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.studio-search-source-body strong {
-  font-size: 0.78rem;
-  font-style: normal;
-  font-weight: 750;
-  line-height: 1.25;
-}
-
-.studio-search-source-body small {
-  color: hsl(var(--muted-foreground));
-  font-size: 0.68rem;
-  font-weight: 650;
-}
-
-.studio-search-source-body em {
-  color: hsl(var(--muted-foreground));
-  font-size: 0.7rem;
-  font-style: normal;
-  line-height: 1.25;
-}
-
-.studio-search-drawer .studio-search-source-body strong,
-.studio-search-drawer .studio-search-source-body em {
-  white-space: normal;
-}
-
-.studio-search-drawer .studio-search-source-body strong {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}
-
-.studio-search-drawer .studio-search-source-body em {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-}
-
-.studio-search-source-open {
-  margin-top: 0.1rem;
-  color: hsl(var(--muted-foreground));
-}
-
-.studio-search-drawer-fade-enter-active,
-.studio-search-drawer-fade-leave-active,
-.studio-search-drawer-slide-enter-active,
-.studio-search-drawer-slide-leave-active {
-  transition: opacity 0.18s ease, transform 0.18s ease;
-}
-
-.studio-search-drawer-fade-enter-from,
-.studio-search-drawer-fade-leave-to {
-  opacity: 0;
-}
-
-.studio-search-drawer-slide-enter-from,
-.studio-search-drawer-slide-leave-to {
-  opacity: 0;
-  transform: translateX(1rem);
-}
-
-@media (max-width: 720px) {
-  .studio-search-drawer {
-    right: 0.5rem;
-    left: 0.5rem;
-    width: auto;
-  }
 }
 
 .studio-scroll-latest {

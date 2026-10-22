@@ -218,6 +218,7 @@ import PagePanel from '@/components/ai/PagePanel.vue'
 import PanelHeader from '@/components/ai/PanelHeader.vue'
 import StateBadge from '@/components/ai/StateBadge.vue'
 import StateBlock from '@/components/ai/StateBlock.vue'
+import { createSerialPoller } from '@/composables/useSerialPoller'
 
 defineOptions({ name: 'ICloudPrivacyMail' })
 
@@ -251,7 +252,8 @@ const syncFailures = ref<ICloudMailboxSyncResult[]>([])
 const scheduler = ref<ICloudScheduler | null>(null)
 const messagesByMailbox = reactive<Record<string, ICloudMessage[]>>({})
 const codeByMailbox = reactive<Record<string, string>>({})
-let schedulerTimer: number | undefined
+// 调度状态轮询：串行执行，页面隐藏时暂停。
+const schedulerPoller = createSerialPoller(() => loadScheduler(), 10_000)
 
 const bridgeTone = computed(() => bridge.value?.reachable ? 'success' : bridge.value ? 'danger' : 'muted')
 const bridgeLabel = computed(() => bridge.value?.reachable ? '模块在线' : bridge.value ? '模块离线' : '检查中')
@@ -667,11 +669,11 @@ async function toggleMessages(mailbox: ICloudMailbox, force = false) {
 
 onMounted(async () => {
   await refreshAll()
-  schedulerTimer = window.setInterval(loadScheduler, 10_000)
+  schedulerPoller.start()
 })
 
 onBeforeUnmount(() => {
-  if (schedulerTimer) window.clearInterval(schedulerTimer)
+  schedulerPoller.stop()
 })
 </script>
 

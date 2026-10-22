@@ -28,10 +28,19 @@ export function setUnauthorizedHandler(handler: UnauthorizedHandler | null) {
   unauthorizedHandler = handler
 }
 
+export const DEFAULT_CONSOLE_REQUEST_TIMEOUT_SECS = 600
+
 export const apiClient: AxiosInstance = axios.create({
   baseURL: import.meta.env.VITE_API_URL || '',
-  timeout: 60000,
+  timeout: DEFAULT_CONSOLE_REQUEST_TIMEOUT_SECS * 1000,
 })
+
+// 管理台请求等待上限读取自设置 console_request_timeout_secs（登录状态检查固定 8 秒，不受影响）。
+export function setConsoleRequestTimeoutSecs(value: unknown) {
+  const seconds = Number(value)
+  const next = Number.isFinite(seconds) && seconds > 0 ? seconds : DEFAULT_CONSOLE_REQUEST_TIMEOUT_SECS
+  apiClient.defaults.timeout = Math.round(next * 1000)
+}
 
 let isRedirectingToLogin = false
 
