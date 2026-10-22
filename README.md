@@ -28,8 +28,11 @@ GPTGrok2API 是一个自托管的 GPT 与 Grok 统一网关，将已接入的订
 | Checkout 提链 | 注册 Checkout 仅保留 UPI 最终支付链接提取；IN Checkout、Provider、Approve 共享同一 sticky 出口，VN Promotion 使用独立代理持续轮换重试。 |
 | 代理与稳定出口 | 支持全局代理、账号代理、代理配置、代理组、节点并发限制、故障反馈、备用出口、WARP、Privoxy、FlareSolverr 和 Clearance 刷新。 |
 | 外部系统接入 | 支持从 Sub2API、远程 CPA、本地 CPA 和 Access Token 导入账号；Grok 注册成功后立即进入 2-worker OAuth 优先级队列，并按配置投递 NovaApi 与 CPA；服务器部署提供 `gptgrok2api` Docker 网络别名。 |
+| 账号调度与稳健性 | 加权公平调度、自动暂停、失败冷却、新号冷静期与放量期、文字号并发槽位、待核验队列、Token 刷新按凭据单飞；账号具备稳定管理 ID，支持凭据查看/编辑（管理员、写审计）、真实对话/画图测试、仅刷新 AT、Sub2API 文件导入、txt/完整备份导出与还原。 |
+| GPT 图片链路 | 官网对话流程、SSE 继续读取与断流恢复、自适应轮询、预热池、请求级总截止、下载重试、结构化失败分类；`n` 上限 4，账号图片并发默认 1（范围 1-3），支持 gpt-image-2.5 系列模型名；图片保留期按小时清理，可选 sharp 放大引擎与 GenBox 推送。 |
+| 在线更新 | 控制台一键更新（SHA-256 校验、失败回退），仅在受管运行时（`GPTGROK2API_MANAGED_RUNTIME=1`）可用，见 [部署文档](docs/deployment.md)。 |
 | 管理控制台 | 提供概览、GPT/Grok 账号与运行池管理、iCloud 邮箱、注册任务、Checkout 任务、代理管理、日志、实时监控、图片管理、调试中心和系统设置。 |
-| 存储与备份 | 账号数据支持 JSON、SQLite、PostgreSQL 和 Git 后端；图片支持本地与 WebDAV；备份支持本地归档和 R2。 |
+| 存储与备份 | 账号数据支持 JSON、SQLite（WAL）、PostgreSQL 和 Git 后端，提供 `docker-compose.postgres.yml` 与 `install.sh --database`；图片支持本地与 WebDAV（删除采用墓碑，远端失败可重试）；备份支持本地归档和 R2，SQLite / PostgreSQL 后端会附带数据库一致性快照，并提供 `scripts/restore_backup.py` 校验与恢复。 |
 | 运维与发布 | 支持 Docker Compose、WARP 编排、内置 sidecar、Nginx HTTPS、运行日志、指标趋势、健康检查和 GitHub Releases 更新源。 |
 
 ## iCloud Privacy Mail 模块
@@ -53,6 +56,8 @@ docker compose -f docker-compose.warp.yml --profile local-icloud up -d
 ## OpenAI 注册归档与存活追踪
 
 Outlook Token 邮箱池使用 `data/outlook_token_used.db` 原子预占邮箱，支持多进程注册；旧版 `data/outlook_token_used.json` 会在首次访问时自动迁移。每次领取都有独立 lease，超时 worker 不会覆盖邮箱后来产生的新状态。
+
+Outlook 读信（令牌刷新、Graph、IMAP）始终直连，不受 `mail.api_use_register_proxy` 影响；该开关只对 GPTMail、DuckMail 等 HTTP 邮箱 API 生效（公开 SOCKS 代理会让微软连接被直接断开）。注册失败按错误类别处理：网络抖动、Cloudflare、429/5xx、invalid_state 等瞬时错误会把邮箱放回池里（每次至少冷却 10 秒，连续放回超过 3 次才标记 failed）；账号被锁、凭据无效、登录流异常等确定性错误才会标记 failed / token_invalid / login_required。启用 `+别名` 展开时，同一原邮箱的别名视为同一个人：任一别名注册过（或提示已注册）后，原邮箱记为 `family_used`，其余别名不再领用，同一家族的别名也不会并发领用。
 
 OpenAI 注册默认把 Agent Identity 独立加密归档到 `data/openai_agent_identities.db`，密钥保存在权限为 `0600` 的 `data/openai_agent_identities.key`，私钥不会写入普通账号列表。账号页可以导出单账号 `auth.json` 或多账号 ZIP；列表元数据接口为 `GET /api/accounts/agent-identities`。
 
@@ -144,6 +149,7 @@ curl http://127.0.0.1:8000/v1/images/edits \
 | [macOS 从零搭建](docs/BEGINNER_LOCAL_SETUP.md) | Mac 本地混合部署、launchd、本地 solver 与日常维护 |
 | [Ubuntu/Linux 从零搭建](docs/BEGINNER_UBUNTU_SETUP.md) | Ubuntu 22.04/24.04、systemd、Xvfb、Nginx 与防火墙 |
 | [NovaApi（Sub2API）与 CPA 自动上传](docs/AUTO_UPLOAD_SUB2API_CPA.md) | OpenAI/Grok 注册成功后的远程账号投递 |
+| [部署、升级、备份与恢复](docs/deployment.md) | 升级前备份、PostgreSQL `pg_dump`、`scripts/restore_backup.py` 恢复、回滚警示 |
 | [日志错误示例与排查](docs/TROUBLESHOOTING_LOG_EXAMPLES.md) | Node、邮箱、Turnstile、solver、NovaApi、CPA 常见错误日志 |
 | [内置 Captcha Solver 说明](captcha-solver/README.md) | Solver API、环境变量、支持类型和底层运行方式 |
 
@@ -222,6 +228,26 @@ docker compose -f docker-compose.warp.yml ps
 docker logs -f chatgpt2api-warp
 ```
 
+### 本地 PostgreSQL 容器
+
+默认仍使用 JSON 文件存储。需要把账号、日志等业务数据放进 PostgreSQL 时，在 `.env` 设置 `POSTGRES_PASSWORD`（仅限字母、数字和 `. _ ~ -`），再叠加 `docker-compose.postgres.yml`：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --build
+# 与 WARP 一起使用
+docker compose -f docker-compose.warp.yml -f docker-compose.postgres.yml up -d --build
+```
+
+该文件会启动 `postgres:18-alpine`（数据卷 `chatgpt2api-postgres-data`），并把 `app` 的 `STORAGE_BACKEND=postgres`、`DATABASE_URL` 指向容器内数据库；图片文件仍保存在 `./data`。使用 `deploy/install.sh` 时可直接选择数据库模式：
+
+```bash
+bash deploy/install.sh --mode docker --database sqlite
+bash deploy/install.sh --mode docker --database postgres-local      # 自动生成 POSTGRES_PASSWORD 并写入 .env
+bash deploy/install.sh --mode docker --database postgres-url --database-url postgresql://user:pass@host:5432/db
+```
+
+`--database` 是 `--storage-backend` 的便捷封装；`postgres-local` 仅支持 Docker 模式，重复安装会沿用 `.env` 中已有的数据库密码。
+
 ## 服务器部署
 
 仓库提供服务器覆盖配置：
@@ -289,7 +315,14 @@ curl https://pro.muyuai.top/v1/models \
 | `CHATGPT2API_AUTH_KEY` | 无 | 控制台和 API 认证密钥 |
 | `CHATGPT2API_PORT` | `3000` | 宿主机监听端口 |
 | `CHATGPT2API_BASE_URL` | 自动识别 | 生成公开资源 URL 的基础地址 |
-| `CHATGPT2API_THREAD_TOKENS` | `80` | 后端同步线程池容量 |
+| `GPTGROK2API_THREAD_TOKENS` | `120` | 后端同步线程池容量（anyio 默认线程限制）；同时兼容旧名 `CHATGPT2API_THREAD_TOKENS`，新名优先 |
+| `GPTGROK2API_IMAGE_THREAD_TOKENS` | `80` | 生图请求专用线程池容量；兼容旧名 `CHATGPT2API_IMAGE_THREAD_TOKENS`，新名优先 |
+| `CHATGPT2API_LOGIN_MAX_FAILURES` | `10` | 登录失败节流：窗口内允许的最大失败次数 |
+| `CHATGPT2API_LOGIN_FAILURE_WINDOW_SECONDS` | `300` | 登录失败节流：统计窗口秒数 |
+| `CHATGPT2API_TRUST_PROXY_HEADERS` | 关闭 | 设为 `1` 才读取 `X-Forwarded-For` 的首个地址；部署在反向代理后必须开启，否则所有请求共享同一来源的失败计数 |
+| `GPTGROK2API_MANAGED_RUNTIME` | `0` | 设为 `1` 启用受管运行目录（需把 `/app` 挂为持久卷），后台“一键更新”才可用 |
+| `SQLITE_BUSY_TIMEOUT_SECONDS` | `30` | SQLite 写锁冲突等待秒数 |
+| `DATABASE_POOL_SIZE` / `DATABASE_MAX_OVERFLOW` / `DATABASE_POOL_TIMEOUT_SECONDS` | `10` / `20` / `30` | PostgreSQL 连接池大小、溢出上限与等待秒数（SQLite 固定单连接） |
 | `CHATGPT2API_IMAGE` | 自有 GHCR 镜像 | Docker 镜像名称 |
 | `STORAGE_BACKEND` | `json` | `json`、`sqlite`、`postgres` 或 `git` |
 | `DATABASE_URL` | 无 | SQLite 或 PostgreSQL 连接地址 |
@@ -298,6 +331,21 @@ curl https://pro.muyuai.top/v1/models \
 | `FLARESOLVERR_PORT` | `8191` | FlareSolverr 宿主机端口 |
 
 完整配置示例见 `.env.example` 和 `config.defaults.toml`。
+
+### 升级须知（摘要）
+
+完整清单见 [CHANGELOG.md](CHANGELOG.md) 的 `Unreleased` 区块，备份与升级警示见 [部署文档](docs/deployment.md)。主要不兼容变化：
+
+- 账号接口响应不再含 `password` / `2fa` / `totp`；设置接口敏感字段返回空串并附带 `has_*`，代理 URL 密码打码。
+- `/v1` 校验错误由 422 改为 400；图片任务队列满由 429 改为 503（`image_task_queue_full`）；用户密钥创建接口返回 `items` 需 `?include_items=1`；`/health` 无鉴权，仅返回状态与版本。
+- 日志与图片保留期按小时清理（默认 720 小时）；SQLite 启用 WAL，手动复制库必须带 `-wal` / `-shm`。
+- 代理组引用无法解析时返回 `proxy_unavailable`，不再回落直连；账号图片并发默认 1，`n` 上限 4。
+
+### 已知限制
+
+- 多数联网链路仅有模拟测试，未用真实账号端到端验证；Codex OAuth 绑定尚未端到端验证。
+- 域名邮箱仅有后端实现、无测试，不建议启用；排队任务的参考图未落盘 spool。
+- PostgreSQL / MySQL 路径仅 SQLite 做过实测。
 
 ## 数据与密钥
 
@@ -314,7 +362,7 @@ curl https://pro.muyuai.top/v1/models \
 - 使用随机高强度认证密钥。
 - 限制 `.env`、`config.json` 和账号文件权限。
 - 不在日志、截图、Issue 或提交记录中暴露账号 Token、Cookie 和代理密码。
-- 定期备份 `data/`，并验证备份恢复流程。
+- 定期备份并验证恢复流程：SQLite / PostgreSQL 后端不能只打包 `data/`（PostgreSQL 必须 `pg_dump`；SQLite 需带上 `-wal`/`-shm`），推荐使用后台 R2 备份（自动含数据库快照）和 `scripts/restore_backup.py`。升级前先备份并确认成功，不要用 `docker compose down -v` 做普通升级，详见 [部署文档](docs/deployment.md)。
 - Nginx 只反向代理本机监听端口，不直接暴露容器管理端口。
 
 ## 版本更新
@@ -383,9 +431,9 @@ uv run --with pytest --with pytest-asyncio python -m pytest -q
 
 ## 许可证
 
-项目中的自有修改与继承代码分别受仓库内许可证文件约束：
+本项目按 **AGPL-3.0-only** 发布（见 `LICENSE`）。通过网络提供修改版服务时，须同样向用户开放对应源码。继承代码的来源与原许可证见：
 
-- `LICENSE`
+- `NOTICE`
 - `GROK2API_LICENSE`
 
 许可证和来源声明必须随分发内容保留。运行时、版本检查、安装地址和容器发布均使用 GPTGrok2API 自有仓库与服务。

@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
++ [升级须知] 升级前先备份并确认成功（后台 R2 备份或 `scripts/restore_backup.py` 可恢复的归档）；不要用 `docker compose down -v` 做普通升级。详见 `docs/deployment.md`。
++ [升级须知] 账号接口响应不再包含 `password`、`2fa`、`totp`；账号错误信息与导入错误均已脱敏，依赖这些字段的外部脚本需要改为在管理员凭据查看/编辑接口中获取。
++ [升级须知] 设置接口中的敏感字段（注册、代理、备份、Grok 后台等）改为返回空串并附带 `has_*` 标记，保存时留空表示沿用原值，需要清除时传 `clear_*`；代理 URL 中的密码在响应里打码。
++ [升级须知] `/v1` 请求校验错误由 422 改为 400；后台图片任务队列已满由 429 改为 503（`code: image_task_queue_full`），客户端的重试和报警规则需要同步调整。
++ [升级须知] 用户密钥创建接口默认不再返回 `items`，需要时加 `?include_items=1`；`/health` 无鉴权，仅返回状态与版本。
++ [升级须知] 日志与图片保留期统一按小时清理，默认 720 小时（旧 `*_days` 配置自动换算）；图片删除采用墓碑机制，WebDAV 远端删除失败会保留记录并周期性重试。
++ [升级须知] SQLite 主库启用 WAL；手动复制数据库文件时必须一并复制 `-wal` 与 `-shm`，或使用在线备份，只复制主库文件会丢失最近写入。
++ [升级须知] 代理组引用无法解析时不再静默回落直连，而是返回 `proxy_unavailable`；请检查依赖已删除代理组的账号或任务。
++ [升级须知] 图片账号并发默认改为 1（范围 1-3）；图片 `n` 上限为 4（Grok 图片模型仍为 1..10）；`gpt-image-2` 走 auto 模型路径。
++ [升级须知] 后端同步线程池环境变量 `GPTGROK2API_THREAD_TOKENS` 默认 120（兼容旧名 `CHATGPT2API_THREAD_TOKENS`）；新增生图专用线程池 `GPTGROK2API_IMAGE_THREAD_TOKENS`（默认 80，兼容 `CHATGPT2API_IMAGE_THREAD_TOKENS`）。
++ [升级须知] 新增环境变量 `SQLITE_BUSY_TIMEOUT_SECONDS`、`DATABASE_POOL_SIZE`、`DATABASE_MAX_OVERFLOW`、`DATABASE_POOL_TIMEOUT_SECONDS`、`CHATGPT2API_LOGIN_MAX_FAILURES`、`CHATGPT2API_LOGIN_FAILURE_WINDOW_SECONDS`、`CHATGPT2API_TRUST_PROXY_HEADERS`。部署在反向代理后必须设置 `CHATGPT2API_TRUST_PROXY_HEADERS=1`，否则所有请求共享同一来源的登录失败计数。
++ [升级须知] 项目许可证改为 AGPL-3.0-only，通过网络提供修改版服务时须向用户开放对应源码，来源与原许可证见 `NOTICE`。
++ [新增] 账号稳定管理 ID（`acct_…`）、管理员凭据查看与编辑（响应 no-store 并写审计）、跨页全选、真实对话/画图账号测试、仅刷新 Access Token、批量换出口、账号详情接口。
++ [新增] 账号导入导出：Sub2API 文件导入、txt 与完整备份导出及还原、导入目标账号组、远程导入全局单任务并支持进度恢复、Codex OAuth 绑定（未经端到端验证）。
++ [新增] 账号页增加 AT/RT 凭据芯片、救回方式、额度、出口、调度、健康列，更多筛选条件和调度汇总条。
++ [新增] 加权公平调度、自动暂停、失败冷却、新号冷静期与放量期、文字号并发槽位、待核验队列、限流账号乐观放回、出图后休息抖动，设备 ID 持久化。
++ [优化] Token 刷新按凭据代单飞并采用结构化终态判定，刷新请求的 Client Hints 与 UA 保持一致；文本类结果不再计入账号失败。
++ [新增] 官网对话流程（prepare、sentinel、conversation）、思考开关（system_hints）、临时对话开关；模型列表改为读取上游并后台刷新，`/v1/models` 不再同步访问上游。
++ [优化] 图片链路：SSE 继续读取、自适应轮询、预热池、断流恢复、请求级总截止、下载重试、结构化失败分类，串行多图支持部分失败容错。
++ [新增] 增加 gpt-image-2.5 系列模型名，增加图片输入张数与体积上限；流式 `response_format=url` 同时返回 `b64_json` 与 `url` 并修复空流。
++ [优化] 搜索支持换号与结果抽取；错误响应不再回传账号邮箱。
++ [新增] 备份包含数据库一致性快照（SQLite online backup / `pg_dump`），提供 `scripts/restore_backup.py` 校验与恢复；WebDAV I/O 不再占用全局锁。
++ [新增] GenBox 推送、sharp 放大引擎（默认仍为 Pillow）、PostgreSQL 部署脚手架（`docker-compose.postgres.yml`、`deploy/install.sh --database`）。
++ [优化] 注册：OTP 限速与重发、错误分类重试；Outlook 邮箱瞬时失败放回、强制直连、别名家族去重，新增邮箱池管理页；FlareSolverr 会话复用与提前刷新。
++ [新增] 出口检查、配额、槽位与免费代理调度，指纹池与 Client Hints，Sentinel 对齐，登录导入（邮箱|密码|2FA），出口槽位地区环境，代理节点批量导入。
++ [新增] 域名邮箱（仅后端实现，无测试，不建议启用）；删除代理组前检查引用。
++ [新增] 控制台：日志结果分类（部分成功/文本/限流）、分辨率列、生图尝试时间线、请求详情抽屉、实时监控详情与取消、概览偏好、活跃度热力图、调用概览卡与运行环境卡。
++ [新增] 在线一键更新（SHA-256 校验、失败回退），仅在受管运行时（`GPTGROK2API_MANAGED_RUNTIME=1`）可用。
++ [优化] 设置保存版本冲突返回 409，数值输入内联校验，登录回跳，离线图标，列表布局偏好。
++ [优化] 安全加固：管理员密钥不再放入 URL 且访问日志打码，提示词来源抓取禁止访问内网，密钥常量时间比较，登录失败节流，图表提示框转义，暗色状态色，Grok 后台配置脱敏。
++ [已知限制] 多数联网链路仅有模拟测试，未用真实账号端到端验证；`.vue` 模板没有类型检查。
++ [已知限制] 域名邮箱仅有后端且无测试；排队中任务的参考图未落盘 spool。
++ [已知限制] 账号页行内调度状态在前后端各计算一份，修改需同步维护。
++ [已知限制] PostgreSQL / MySQL 路径仅 SQLite 做过实测。
+
 ## 1.2.1 - 2026-07-27
 
 + [新增] Grok OAuth 定时巡查接入自动恢复队列；检测到 `xAI CLI OAuth account needs reauthorization` 时直接使用账号现有身份重新授权，并在恢复成功后继续模型探测与外部投递。

@@ -8,19 +8,30 @@
 
 auth-key: chatgpt2api
 refresh_account_interval_minute: 5
+# 保留期权威配置是 image_retention_hours / log_retention_hours（默认 720 小时）；
+# 下面两项是旧版 *_days，仍可读取并自动换算为小时。
 image_retention_days: 15
 log_retention_days: 30
 image_poll_timeout_secs: 120
 image_stream_timeout_secs: 300
-image_poll_interval_secs: 10
-image_poll_initial_wait_secs: 10
-image_account_concurrency: 3
+image_poll_interval_secs: 2
+image_poll_initial_wait_secs: 1
+# 单账号图片并发（1-3，默认 1；超出范围按边界钳制）
+image_account_concurrency: 1
+# 对话/搜索：单账号并发数
+text_account_concurrency: 3
+# 上游连续失败 3 次后的短时冷却（秒，0 关闭）；与长时的 account_auto_pause_* 互补
+account_failure_cooldown_secs: 300
+# 注册流程新入池账号：冷静期（小时）、放量期（天）、放量期每日生图上限；老账号不受影响
+new_account_cooldown_hours: 12
+new_account_ramp_days: 3
+new_account_ramp_daily_images: 5
 image_parallel_generation: true
 image_remove_conversation_after_result: false
 image_min_free_mb: 500
 image_settle_enabled: false
 image_check_before_hit_enabled: false
-image_settle_secs: 2
+image_settle_secs: 1.5
 image_timeout_retry_secs: 30
 
 auto_remove_rate_limited_accounts: false
