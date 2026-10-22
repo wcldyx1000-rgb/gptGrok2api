@@ -114,14 +114,16 @@ class RootGrokCompatibilityRoutesTest(unittest.TestCase):
         self.assertNotIn("proxy-password", serialized_detail)
 
     def test_grok_image_generation_rejects_more_than_ten(self) -> None:
-        response = self.client.post(
-            "/v1/images/generations",
-            headers=self.headers,
-            json={"model": "grok-imagine-image", "prompt": "a test image", "n": 11},
-        )
+        with patch("api.ai.require_identity", return_value={"id": "user"}):
+            response = self.client.post(
+                "/v1/images/generations",
+                headers=self.headers,
+                json={"model": "grok-imagine-image", "prompt": "a test image", "n": 11},
+            )
 
-        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
+        self.assertEqual(response.json()["error"]["code"], "n_too_large")
 
     def test_root_image_edit_rejects_non_grok_edit_model_before_reading_files(self) -> None:
         with (

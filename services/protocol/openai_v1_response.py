@@ -267,11 +267,18 @@ def response_completed(
     return response
 
 
-def _with_log_metadata(payload: dict[str, Any], account_email: str = "", conversation_id: str = "") -> dict[str, Any]:
+def _with_log_metadata(
+    payload: dict[str, Any],
+    account_email: str = "",
+    conversation_id: str = "",
+    image_attempts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     if account_email:
         payload["_account_email"] = account_email
     if conversation_id:
         payload["_conversation_id"] = conversation_id
+    if image_attempts:
+        payload["_image_attempts"] = list(image_attempts)
     return payload
 
 
@@ -370,7 +377,9 @@ def stream_image_response(
     response_id = f"resp_{uuid.uuid4().hex}"
     created = int(time.time())
     yield response_created(response_id, model, created)
+    attempts: list[dict[str, Any]] = []
     for output in image_outputs:
+        attempts.extend(item for item in output.image_attempts if item not in attempts)
         if output.kind == "message":
             text = output.text
             item = text_output_item(text)
@@ -395,8 +404,8 @@ def stream_image_response(
                 output.conversation_id,
             )
             completed = response_completed(response_id, model, created, [item], usage)
-            _with_log_metadata(completed, output.account_email, output.conversation_id)
-            _with_log_metadata(completed["response"], output.account_email, output.conversation_id)
+            _with_log_metadata(completed, output.account_email, output.conversation_id, attempts)
+            _with_log_metadata(completed["response"], output.account_email, output.conversation_id, attempts)
             yield completed
             return
         if output.kind != "result":
@@ -415,11 +424,13 @@ def stream_image_response(
                     output.conversation_id,
                 )
             completed = response_completed(response_id, model, created, items, usage)
-            _with_log_metadata(completed, output.account_email, output.conversation_id)
-            _with_log_metadata(completed["response"], output.account_email, output.conversation_id)
+            _with_log_metadata(completed, output.account_email, output.conversation_id, attempts)
+            _with_log_metadata(completed["response"], output.account_email, output.conversation_id, attempts)
             yield completed
             return
-    raise RuntimeError("image generation failed")
+    failure = RuntimeError("image generation failed")
+    failure.image_attempts = list(attempts)  # type: ignore[attr-defined]
+    raise failure
 
 
 def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -464,6 +475,7 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         quality=str(tool.get("quality") or "auto"),
         response_format="b64_json",
         images=images,
+        message_as_error=True,
         call_id=str(body.get("_call_id") or ""),
         trace_image_perf=bool(body.get("_trace_image_perf")),
     ))

@@ -30,7 +30,8 @@ from services.protocol.web_search_tool import (
     search_query_from_messages,
     text_with_url_citations,
 )
-from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request, parse_image_count
+from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request
+from services.image_count import parse_image_count
 from utils.image_tokens import (
     chat_usage_from_image_usage,
     count_image_inputs_tokens,
@@ -97,11 +98,18 @@ def completion_response(
     }
 
 
-def _with_log_metadata(payload: dict[str, Any], account_email: str = "", conversation_id: str = "") -> dict[str, Any]:
+def _with_log_metadata(
+    payload: dict[str, Any],
+    account_email: str = "",
+    conversation_id: str = "",
+    image_attempts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     if account_email:
         payload["_account_email"] = account_email
     if conversation_id:
         payload["_conversation_id"] = conversation_id
+    if image_attempts:
+        payload["_image_attempts"] = list(image_attempts)
     return payload
 
 
@@ -239,6 +247,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         response_format="b64_json",
         images=encode_images(images) or None,
         base_url=base_url,
+        message_as_error=True,
         call_id=str(body.get("_call_id") or ""),
         trace_image_perf=bool(body.get("_trace_image_perf")),
     )))
@@ -253,6 +262,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         response,
         str(result.get("_account_email") or ""),
         str(result.get("_conversation_id") or ""),
+        result.get("_image_attempts") or None,
     )
     return response
 
@@ -266,6 +276,7 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         response_format="b64_json",
         images=encode_images(images) or None,
         base_url=base_url,
+        message_as_error=True,
         call_id=str(body.get("_call_id") or ""),
         trace_image_perf=bool(body.get("_trace_image_perf")),
     ))
@@ -277,7 +288,10 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
     created = int(time.time())
     sent_role = False
     sent_text = ""
+    attempts: list[dict[str, Any]] = []
     for output in image_outputs:
+        # 图片模型走 chat 链路时也把换号/重试的尝试记录带给日志层。
+        attempts.extend(item for item in output.image_attempts if item not in attempts)
         content = ""
         if output.kind == "progress":
             content = output.text
@@ -303,7 +317,7 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
             )
     if not sent_role:
         yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
-    yield completion_chunk(model, {}, "stop", completion_id, created)
+    yield _with_log_metadata(completion_chunk(model, {}, "stop", completion_id, created), image_attempts=attempts)
 
 
 def text_completion_response(model: str, messages: list[dict[str, Any]], thinking_effort: str) -> dict[str, Any]:

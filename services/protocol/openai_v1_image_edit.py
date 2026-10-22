@@ -13,6 +13,7 @@ from services.protocol.conversation import (
     encode_images,
     stream_image_chunks,
     stream_image_outputs_with_pool,
+    stream_response_format,
 )
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
 
@@ -62,14 +63,20 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     progress_callback = body.get("progress_callback")
     encoded_images = encode_images(images)
     if not encoded_images:
-        raise ImageGenerationError("image is required")
+        raise ImageGenerationError(
+            "image is required",
+            status_code=400,
+            error_type="invalid_request_error",
+            code="invalid_image_input",
+            param="image",
+        )
     outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
         size=size,
         quality=quality,
-        response_format=response_format,
+        response_format=stream_response_format(response_format) if body.get("stream") else response_format,
         base_url=base_url,
         images=encoded_images,
         message_as_error=True,

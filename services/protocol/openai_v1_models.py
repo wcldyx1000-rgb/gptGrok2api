@@ -4,8 +4,7 @@ from typing import Any
 
 from services.account_service import account_service
 from services.model_catalog_service import get_model_catalog
-from services.openai_backend_api import OpenAIBackendAPI
-from utils.helper import CODEX_IMAGE_MODEL
+from utils.helper import CODEX_IMAGE_MODEL, WEB_IMAGE_MODELS
 
 
 def _model_item(model: str) -> dict[str, Any]:
@@ -35,21 +34,6 @@ def _append_models(data: list[Any], seen: set[str], models: object) -> None:
         _append_model(data, seen, model)
 
 
-def _append_upstream_models(data: list[Any], seen: set[str]) -> None:
-    try:
-        with OpenAIBackendAPI() as backend:
-            result = backend.list_models()
-    except Exception:
-        return
-    upstream_data = result.get("data")
-    if not isinstance(upstream_data, list):
-        return
-    for item in upstream_data:
-        if not isinstance(item, dict):
-            continue
-        _append_model(data, seen, item.get("id"))
-
-
 def _dynamic_image_models() -> list[str]:
     models: list[str] = []
     accounts = account_service.list_accounts()
@@ -69,7 +53,7 @@ def _dynamic_image_models() -> list[str]:
     }
 
     if web_image_accounts:
-        models.append("gpt-image-2")
+        models.extend(WEB_IMAGE_MODELS)
     if codex_types & {"Plus", "Team", "Pro"}:
         models.append(CODEX_IMAGE_MODEL)
     for plan_type in ("Plus", "Team", "Pro"):
@@ -95,7 +79,6 @@ def list_models() -> dict[str, Any]:
         data.append(dict(item))
 
     _append_models(data, seen, catalog.get("chat_models"))
-    _append_upstream_models(data, seen)
     _append_models(data, seen, catalog.get("image_models"))
     _append_models(data, seen, _dynamic_image_models())
 

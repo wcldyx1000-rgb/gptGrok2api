@@ -12,6 +12,7 @@ from typing import Any
 from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol.conversation import count_message_tokens, count_text_tokens, normalize_messages, text_backend
 from services.protocol.openai_v1_chat_complete import collect_chat_content, stream_text_chat_completion
+from services.protocol.reasoning import thinking_effort_from_body
 
 XML_TOOL_RULE = """Tool output adapter: when calling tools, output ONLY this XML and no prose/markdown:
 <tool_calls><tool_call><tool_name>TOOL_NAME</tool_name><parameters><PARAM><![CDATA[value]]></PARAM></parameters></tool_call></tool_calls>"""
@@ -23,6 +24,7 @@ class MessageRequest:
     messages: list[dict[str, Any]]
     model: str
     tools: Any = None
+    thinking_effort: str = ""
 
 
 def _tool_meta(tool: dict[str, object]) -> tuple[str, str, object]:
@@ -113,6 +115,7 @@ def message_request(body: dict[str, Any]) -> MessageRequest:
         messages=normalize_messages(payload.get("messages"), payload.get("system")),
         model=str(payload.get("model") or "auto").strip() or "auto",
         tools=payload.get("tools"),
+        thinking_effort=thinking_effort_from_body(payload),
     )
 
 
@@ -308,13 +311,13 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     request = message_request(body)
     if body.get("stream"):
         return stream_events(
-            stream_text_chat_completion(request.backend, request.messages, request.model),
+            stream_text_chat_completion(request.backend, request.messages, request.model, request.thinking_effort),
             request.model,
             count_message_tokens(request.messages, request.model),
             lambda text: count_text_tokens(text, request.model),
             request.tools,
         )
-    text = collect_chat_content(stream_text_chat_completion(request.backend, request.messages, request.model))
+    text = collect_chat_content(stream_text_chat_completion(request.backend, request.messages, request.model, request.thinking_effort))
     response = message_response(
         request.model,
         text,

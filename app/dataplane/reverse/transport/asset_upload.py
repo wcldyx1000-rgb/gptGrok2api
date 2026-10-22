@@ -8,9 +8,10 @@ import asyncio
 import base64
 import mimetypes
 import re
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import orjson
+from fastapi import HTTPException
 
 from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
@@ -22,6 +23,7 @@ from app.dataplane.proxy.adapters.session import ResettableSession, build_sessio
 from app.dataplane.reverse.protocol.xai_assets import resolve_asset_reference
 from app.control.proxy.feedback import build_feedback
 from app.control.proxy.models import ProxyFeedback, ProxyFeedbackKind
+from utils.remote_image import validate_public_image_url
 
 _UPLOAD_URL = "https://grok.com/rest/app-chat/upload-file"
 _X_USER_ID_RE = re.compile(r"(?:^|;\s*)x-userid=([^;]+)")
@@ -48,6 +50,43 @@ def _is_url(value: str) -> bool:
         return bool(p.scheme in {"http", "https"} and p.netloc)
     except Exception:
         return False
+
+
+_FIRST_PARTY_HOST_SUFFIXES = ("grok.com", "x.ai")
+_MAX_INPUT_REDIRECTS = 3
+
+
+def _is_first_party_url(value: str) -> bool:
+    """grok.com / x.ai 自家资源需要带 SSO 才能下载，其余 URL 一律按第三方处理。"""
+    host = (urlparse(value).hostname or "").rstrip(".").lower()
+    return any(host == suffix or host.endswith("." + suffix) for suffix in _FIRST_PARTY_HOST_SUFFIXES)
+
+
+def _validate_third_party_url(value: str) -> None:
+    """第三方 URL 只允许解析到公网地址，防止 SSRF。"""
+    try:
+        validate_public_image_url(value)
+    except HTTPException as exc:
+        detail = exc.detail.get("error") if isinstance(exc.detail, dict) else str(exc.detail)
+        raise ValidationError(str(detail), param="content") from exc
+
+
+async def _fetch_input_url(session: ResettableSession, file_input: str, headers: dict):
+    """下载输入 URL：第三方链接不带 SSO 凭据，并逐跳校验重定向目标。"""
+    if _is_first_party_url(file_input):
+        return await session.get(file_input, headers=headers, timeout=30.0)
+    current = file_input
+    plain_headers = {"Accept": "*/*", "User-Agent": str(headers.get("User-Agent") or "Mozilla/5.0")}
+    for redirect_count in range(_MAX_INPUT_REDIRECTS + 1):
+        await asyncio.to_thread(_validate_third_party_url, current)
+        resp = await session.get(current, headers=plain_headers, timeout=30.0, allow_redirects=False)
+        if not 300 <= resp.status_code < 400:
+            return resp
+        location = str(resp.headers.get("location") or "").strip()
+        if not location or redirect_count >= _MAX_INPUT_REDIRECTS:
+            raise ValidationError("Input URL redirect is invalid or exceeds the limit", param="content")
+        current = urljoin(current, location)
+    raise ValidationError("Input URL redirect is invalid or exceeds the limit", param="content")
 
 
 def _mime_from_name(filename: str, fallback: str = "application/octet-stream") -> str:
@@ -189,7 +228,7 @@ async def upload_from_input(token: str, file_input: str) -> tuple[str, str]:
             headers = build_http_headers(token, lease=lease)
             kwargs  = build_session_kwargs(lease=lease)
             async with ResettableSession(**kwargs) as session:
-                resp = await session.get(file_input, headers=headers, timeout=30.0)
+                resp = await _fetch_input_url(session, file_input, headers)
             raw  = resp.content
             if resp.status_code != 200:
                 await proxy.feedback(
@@ -208,7 +247,7 @@ async def upload_from_input(token: str, file_input: str) -> tuple[str, str]:
                         or "application/octet-stream")
             filename = file_input.split("/")[-1].split("?")[0] or "download"
             b64      = base64.b64encode(raw).decode()
-        except UpstreamError:
+        except (UpstreamError, ValidationError):
             raise
         except Exception as exc:
             await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR))

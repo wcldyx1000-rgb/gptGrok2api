@@ -5,26 +5,62 @@ import hashlib
 import json
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, wait
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Iterator
 
 import tiktoken
+from curl_cffi.requests import exceptions as curl_exceptions
 
 from services.account_service import ImageAccountSelectionError, account_service
-from services.config import config
+from services.config import config, mask_proxy_credentials
+from services.image_failure import (
+    ImageFailure,
+    classify_image_error_text,
+    classify_image_exception,
+    classify_conversation_failure,
+    classify_image_message_text,
+    classify_message_facts,
+    extract_message_facts,
+    friendly_message_key,
+    image_failure,
+    image_failure_priority,
+    is_terminal_message_status,
+    is_connection_timeout_error,
+    is_content_policy_image_message as _is_content_policy_image_message,
+    is_model_text_reply_instead_of_image,
+    is_stream_transport_error,
+    is_tls_connection_error,
+    is_token_invalid_error,
+    is_upstream_error_reply_text,
+    merge_failures,
+    merge_message_failure,
+    should_refresh_image_account,
+    TEXT_REVIEW_FAILURE_CODES,
+    terminal_assistant_text,
+    text_says_image_quota_exhausted,
+    upstream_error_reply_failure,
+)
 from services.image_storage_service import image_storage_service
-from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, ImageTextReplyError, OpenAIBackendAPI
-from services.proxy_service import proxy_settings
+from services.openai_backend_api import (
+    ImageContentPolicyError,
+    ImageDownloadError,
+    ImagePollTimeoutError,
+    ImageTextReplyError,
+    OpenAIBackendAPI,
+)
+from services.proxy_service import ImageEgressDeadlineError, ProxyReferenceUnavailableError, proxy_settings
 from services.realtime_monitor_service import realtime_monitor_service
 from services.request_cancel_service import RequestCancelledError, request_cancel_service
 from utils.helper import (
     IMAGE_MODELS,
+    UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
     split_image_model,
 )
+from services.image_upscale_service import upscale_image_if_needed
 from utils.image_tokens import count_image_content_tokens, image_size_from_bytes
 from utils.log import logger
 from utils.diagnostics import diagnostic_excerpt
@@ -43,6 +79,7 @@ class ImageGenerationError(Exception):
         raw_error: str = "",
         upstream_error: str = "",
         raw_upstream_message: str = "",
+        failure: ImageFailure | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -54,9 +91,20 @@ class ImageGenerationError(Exception):
         self.raw_error = raw_error
         self.upstream_error = upstream_error
         self.raw_upstream_message = raw_upstream_message
+        self.image_attempts: list[dict[str, Any]] = []
+        self.failure: ImageFailure | None = None
+        if failure is not None:
+            self.reclassify(failure)
+
+    def reclassify(self, failure: ImageFailure) -> None:
+        self.failure = failure
+        self.status_code = failure.status_code
+        self.error_type = failure.error_type
+        self.code = failure.code
 
     def to_openai_error(self) -> dict[str, Any]:
-        error_dict = {
+        # 不回传 account_email：上游账号邮箱只留在日志里，不能暴露给 API 调用方（HTTP 与 SSE 都一样）。
+        return {
             "error": {
                 "message": public_image_error_message(str(self), code=self.code),
                 "type": self.error_type,
@@ -64,42 +112,22 @@ class ImageGenerationError(Exception):
                 "code": self.code,
             }
         }
-        if self.account_email:
-            error_dict["error"]["account_email"] = self.account_email
-        return error_dict
 
 
 def public_image_error_message(message: str, code: str | None = None) -> str:
     text = str(message or "").strip()
-    lower = text.lower()
     if not config.image_error_friendly_enabled:
         return _legacy_public_image_error_message(text)
-    if code in {"upstream_text_reply", "no_image_generated"}:
+    key = friendly_message_key(classify_image_error_text(text, code=code))
+    if key == "text_reply":
         return _public_text_reply_message(text)
+    if key:
+        return _friendly_image_error_message(key)
     if not text:
         return _friendly_image_error_message("fallback")
-    selection_key = _image_account_selection_error_key(lower)
-    if selection_key:
-        return _friendly_image_error_message(selection_key)
-    if _is_image_quota_error(lower):
-        return _friendly_image_error_message("quota")
-    if _is_local_image_busy_error(lower):
-        return _friendly_image_error_message("local_busy")
-    if "unsupported image model" in lower:
-        return _friendly_image_error_message("unsupported_model")
-    if _is_image_poll_timeout_error(lower):
-        return _friendly_image_error_message("poll_timeout")
-    if is_stream_transport_error(text):
-        return _friendly_image_error_message("stream_interrupted")
-    if is_connection_timeout_error(text):
-        return _friendly_image_error_message("connection_timeout")
-    if is_tls_connection_error(text):
-        return _friendly_image_error_message("connection_failed")
-    if _is_upstream_text_reply_error(text):
-        return _public_text_reply_message(text)
-    if any(item in lower for item in ("backend-api/", "status=", "body=", "chatgpt.com", "upstreamhttperror")):
+    if any(item in text.lower() for item in ("backend-api/", "status=", "body=", "chatgpt.com", "upstreamhttperror")):
         return _friendly_image_error_message("fallback")
-    return text or _friendly_image_error_message("fallback")
+    return text
 
 
 def _legacy_public_image_error_message(message: str) -> str:
@@ -139,83 +167,6 @@ def _public_text_reply_message(message: str) -> str:
     return _friendly_image_error_message("text_reply", excerpt) if excerpt else _friendly_image_error_message("text_reply")
 
 
-def _is_image_quota_error(lower: str) -> bool:
-    return (
-        "image_account_selection:quota_exhausted" in lower
-        or "insufficient_quota" in lower
-    )
-
-
-def _image_account_selection_error_key(lower: str) -> str:
-    if "image_account_selection:quota_exhausted" in lower:
-        return "quota"
-    if "image_account_selection:unavailable" in lower:
-        return "no_account"
-    return ""
-
-
-def _is_local_image_busy_error(lower: str) -> bool:
-    return (
-        "no account in the pool" in lower
-        or "no available image quota" in lower
-        or "account concurrency" in lower
-        or "server busy" in lower
-        or "local busy" in lower
-        or "rate-limit status" in lower
-    )
-
-
-def _is_image_poll_timeout_error(lower: str) -> bool:
-    return (
-        "生图超时" in lower
-        or "imagepolltimeouterror" in lower
-        or "image_poll_timeout" in lower
-        or "poll timeout" in lower
-        or "image_poll_timeout_secs" in lower
-    )
-
-
-def _is_upstream_text_reply_error(message: str) -> bool:
-    lower = str(message or "").lower()
-    return (
-        is_model_text_reply_instead_of_image(message)
-        or "upstream completed without generating images" in lower
-        or "no image result found" in lower
-        or "returned a text description" in lower
-        or "content_policy_violation" in lower
-        or "防护限制" in message
-        or "违反" in message
-        or "裸露" in message
-        or "色情" in message
-        or "情色" in message
-    )
-
-
-def _is_content_policy_image_message(message: str) -> bool:
-    text = str(message or "")
-    lower = text.lower()
-    return (
-        "content policy" in lower
-        or "policy violation" in lower
-        or "content_policy_violation" in lower
-        or "safety" in lower and "policy" in lower
-        or "防护限制" in text
-        or "可能违反" in text
-        or "违反" in text
-        or "裸露" in text
-        or "色情" in text
-        or "情色" in text
-    )
-
-
-def _image_message_error_metadata(message: str) -> tuple[int, str, str]:
-    if _is_content_policy_image_message(message):
-        return 400, "invalid_request_error", "content_policy_violation"
-    if is_model_text_reply_instead_of_image(message):
-        return 400, "invalid_request_error", "upstream_text_reply"
-    return 400, "invalid_request_error", "no_image_generated"
-
-
 def _monitor_image_stage(request: "ConversationRequest", event: str, **data: Any) -> None:
     if request.trace_image_perf and request.call_id:
         realtime_monitor_service.stage(request.call_id, event, model=request.model, **data)
@@ -243,8 +194,9 @@ def _backend_egress_data(backend: OpenAIBackendAPI) -> dict[str, Any]:
     return {
         "proxy_source": str(getattr(profile, "proxy_source", "") or "direct"),
         "proxy_hash": _proxy_hash(proxy_url),
-        "egress_key": str(getattr(profile, "egress_key", "") or "direct"),
-        "egress_label": str(getattr(profile, "egress_label", "") or ""),
+        # 进入日志 / 监控的出口标识不含代理密码（内部限流仍用 profile.egress_key 原值）
+        "egress_key": mask_proxy_credentials(str(getattr(profile, "egress_key", "") or "direct")),
+        "egress_label": mask_proxy_credentials(str(getattr(profile, "egress_label", "") or "")),
         "proxy_group_id": str(getattr(profile, "proxy_group_id", "") or ""),
         "proxy_node_id": str(getattr(profile, "proxy_node_id", "") or ""),
         "proxy_node_name": str(getattr(profile, "proxy_node_name", "") or ""),
@@ -481,84 +433,6 @@ def _retry_sleep_with_monitor(
         time.sleep(wait_secs)
 
 
-def is_token_invalid_error(message: str) -> bool:
-    text = str(message or "").lower()
-    return (
-        "token_invalidated" in text
-        or "token_revoked" in text
-        or "authentication token has been invalidated" in text
-        or "invalidated oauth token" in text
-    )
-
-
-def should_refresh_image_account(message: object) -> bool:
-    text = str(message or "")
-    lower = text.lower()
-    return (
-        is_token_invalid_error(text)
-        or _is_image_quota_error(lower)
-        or any(
-            marker in lower
-            for marker in (
-                "status=429",
-                "status_code=429",
-                "http 429",
-                "rate limit exceeded",
-                "rate_limit_exceeded",
-                "rate_limited",
-                "quota exceeded",
-                "quota_exceeded",
-                "image quota",
-                "too many requests",
-            )
-        )
-    )
-
-
-def is_tls_connection_error(message: str) -> bool:
-    """检测 TLS/SSL 连接错误，这类错误通常可以通过重试解决。"""
-    text = str(message or "").lower()
-    return (
-        "curl: (35)" in text
-        or "tls connect error" in text
-        or "openssl_internal" in text
-        or "ssl: wrong_version_number" in text
-        or "ssl: certificate_verify_failed" in text
-        or "connection aborted" in text
-        or "remote disconnected" in text
-        or "connection reset by peer" in text
-        or "upstream image connection failed" in text
-    )
-
-
-def is_connection_timeout_error(message: str) -> bool:
-    """检测连接超时错误（如 curl 28），这类错误可通过同账号短等待重试解决。"""
-    text = str(message or "").lower()
-    return (
-        "curl: (28)" in text
-        or "operation timed out" in text
-        or "connection timed out" in text
-        or "read timed out" in text
-        or "connect timeout" in text
-        or "upstream connection timed out" in text
-    )
-
-
-def is_stream_transport_error(message: str) -> bool:
-    """检测上游流式响应传输错误，这类错误通常来自 HTTP/2/SSE/代理长连接。"""
-    text = str(message or "").lower()
-    return (
-        "curl: (92)" in text
-        or "http/2 stream" in text
-        or "internal_error" in text
-        or "stream was not closed cleanly" in text
-        or "stream reset" in text
-        or "response ended prematurely" in text
-        or "sse stream exceeded" in text
-        or "upstream image stream interrupted" in text
-    )
-
-
 def image_stream_error_message(message: str) -> str:
     text = str(message or "")
     if not config.image_error_friendly_enabled:
@@ -587,41 +461,36 @@ def _legacy_image_stream_error_message(message: str) -> str:
     return text or "image generation failed"
 
 
-REFERENCED_IMAGE_IDS_RE = re.compile(r'"referenced_image_ids"\s*:\s*\[([^\]]+)\]')
-# 检测模型返回的部分工具调用 JSON（如 {"size":"1920x1088","n":1}）
-# 这些 JSON 包含图片生成工具的参数，但没有实际生成图片
-TOOL_PARAMS_JSON_RE = re.compile(
-    r'\{\s*"size"\s*:\s*"\d+x\d+"\s*,\s*"n"\s*:\s*\d+\s*\}'
-)
-
-
-def is_model_text_reply_instead_of_image(message: str) -> bool:
-    """检测模型是否返回了文本回复（包含工具调用 JSON）而非实际生成图片。
-
-    当上游 ChatGPT 未能触发图片生成工具时，会返回一段描述性文本，
-    其中可能包含 JSON 参数（如 prompt、referenced_image_ids、size/n 等）。
-    这种情况应被视为「上游未生成图片」而非「内容策略违规」。
-
-    检测两种模式：
-    1. 完整的工具调用 JSON（含 referenced_image_ids）
-    2. 部分的工具参数 JSON（如 {"size":"1920x1088","n":1}）
-    """
-    if not message:
-        return False
-    if REFERENCED_IMAGE_IDS_RE.search(message):
-        return True
-    # 检测部分工具参数 JSON（模型返回了工具参数但未触发工具）
-    if TOOL_PARAMS_JSON_RE.search(message):
-        return True
-    return False
-
-
 def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
     return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
 
 
-def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
-    return image_storage_service.save(image_data, base_url).url
+def save_image_bytes(
+        image_data: bytes,
+        base_url: str | None = None,
+        *,
+        deadline_monotonic: float | None = None,
+) -> str:
+    """落盘结果图：失败重试 1 次（请求已过截止时间则不再重试），仍失败抛带 failure 的 ImageDownloadError。
+
+    Ported from yukkcat/chatgpt2api (AGPL-3.0-only).
+    """
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            return image_storage_service.save(image_data, base_url).url
+        except Exception as exc:
+            last_error = exc
+        logger.warning({
+            "event": "image_result_storage_retry" if attempt == 0 else "image_result_storage_failed",
+            "attempt": attempt + 1,
+            "error": diagnostic_excerpt(repr(last_error), 500),
+        })
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            break
+    raise ImageDownloadError(
+        f"image result storage failed: {diagnostic_excerpt(last_error, 500)}"
+    ) from last_error
 
 
 def message_text(content: Any) -> str:
@@ -734,6 +603,14 @@ def count_text_tokens(text: str, model: str) -> int:
     return len(encoding_for_model(model).encode(text))
 
 
+STREAM_URL_RESPONSE_FORMAT = "b64_json+url"
+
+
+def stream_response_format(response_format: str) -> str:
+    """流式图片事件必须携带图片数据；请求 url 时额外带上 url。"""
+    return STREAM_URL_RESPONSE_FORMAT if response_format == "url" else response_format
+
+
 def format_image_result(
     items: list[dict[str, Any]],
     prompt: str,
@@ -741,6 +618,8 @@ def format_image_result(
     base_url: str | None = None,
     created: int | None = None,
     message: str = "",
+    requested_size: str | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     for item in items:
@@ -749,11 +628,19 @@ def format_image_result(
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         image_bytes = base64.b64decode(b64_json)
-        stored_url = save_image_bytes(image_bytes, base_url)
-        asset: dict[str, Any] = {"revised_prompt": revised_prompt}
-        if response_format == "b64_json":
-            asset["b64_json"] = b64_json
+        upscaled = upscale_image_if_needed(image_bytes, requested_size)
+        if upscaled is not image_bytes:
+            image_bytes = upscaled
+            b64_json = base64.b64encode(image_bytes).decode("ascii")
+        if deadline_monotonic is None:
+            stored_url = save_image_bytes(image_bytes, base_url)
         else:
+            stored_url = save_image_bytes(image_bytes, base_url, deadline_monotonic=deadline_monotonic)
+        asset: dict[str, Any] = {"revised_prompt": revised_prompt}
+        # STREAM_URL_RESPONSE_FORMAT：流式 + url 时两者都带，客户端读哪个字段都能拿到图。
+        if response_format in {"b64_json", STREAM_URL_RESPONSE_FORMAT}:
+            asset["b64_json"] = b64_json
+        if response_format != "b64_json":
             asset["url"] = stored_url
         dimensions = image_size_from_bytes(image_bytes)
         if dimensions:
@@ -781,6 +668,8 @@ class ConversationRequest:
     progress_callback: Any = None  # Callable[[str], None] | None
     call_id: str = ""
     trace_image_perf: bool = False
+    # 请求级总截止时间（time.monotonic 口径，<=0 表示不限）：排队等号、等出口并发、断流恢复轮询都受它约束。
+    deadline_monotonic: float = 0.0
 
 
 @dataclass
@@ -793,6 +682,14 @@ class ConversationState:
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
+    async_task_type: str = ""
+    message_type: str = ""
+    # 当前助手/工具消息的结构化事实（role/content_type/status/end_turn/is_error/codes），
+    # 以及据此得到的失败分类；没有图片产物时才有意义。
+    message_facts: dict[str, Any] = field(default_factory=dict)
+    failure: ImageFailure | None = None
+    # 终态 code 消息里只回显了生图指令（没有图）：按 image_tool_error 处理，而不是文本回复。
+    terminal_tool_arguments: dict[str, Any] | None = None
 
 
 @dataclass
@@ -807,6 +704,8 @@ class ImageOutput:
     data: list[dict[str, Any]] = field(default_factory=list)
     account_email: str = ""
     conversation_id: str = ""
+    # Failed attempts on other accounts before this output (diagnostics only).
+    image_attempts: list[dict[str, Any]] = field(default_factory=list)
 
     def to_chunk(self) -> dict[str, Any]:
         chunk: dict[str, Any] = {
@@ -823,6 +722,8 @@ class ImageOutput:
             chunk["_account_email"] = self.account_email
         if self.conversation_id:
             chunk["_conversation_id"] = self.conversation_id
+        if self.image_attempts:
+            chunk["_image_attempts"] = list(self.image_attempts)
         if self.kind == "message":
             chunk.update({
                 "object": "image.generation.message",
@@ -1032,6 +933,108 @@ def _is_user_message_event(event: dict[str, Any]) -> bool:
     return False
 
 
+_IMAGE_TOOL_ARGUMENT_KEYS = frozenset({
+    "prompt",
+    "instructions",
+    "size",
+    "n",
+    "transparent_background",
+    "is_style_transfer",
+    "referenced_image_ids",
+})
+
+
+def is_image_generation_arguments(text: str, *, role: str = "", content_type: str = "") -> bool:
+    """助手的 code 消息里是否只是生图工具的参数回显（Ported from yukkcat/chatgpt2api, AGPL-3.0-only）。"""
+    if str(role or "").strip().lower() != "assistant" or str(content_type or "").strip().lower() != "code":
+        return False
+    try:
+        arguments = json.loads(str(text or "").strip())
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(arguments, dict) or not arguments:
+        return False
+    has_prompt = any(
+        isinstance(arguments.get(key), str) and bool(arguments[key].strip())
+        for key in ("prompt", "instructions")
+    )
+    return has_prompt and set(arguments) <= _IMAGE_TOOL_ARGUMENT_KEYS
+
+
+def _merge_message_facts(state: ConversationState, facts: dict[str, Any]) -> None:
+    if facts.get("blocked") is True:
+        state.blocked = True
+    if facts.get("turn_use_case"):
+        state.turn_use_case = str(facts["turn_use_case"])
+    if facts.get("async_task_type"):
+        state.async_task_type = str(facts["async_task_type"])
+    if facts.get("message_type"):
+        state.message_type = str(facts["message_type"])
+    role = str(facts.get("role") or "").strip().lower()
+    current_role = str(state.message_facts.get("role") or "").strip().lower()
+    message_id = str(facts.get("message_id") or "").strip()
+    current_message_id = str(state.message_facts.get("message_id") or "").strip()
+    should_update = False
+    if role in {"assistant", "tool"}:
+        if (current_role and current_role != role) or (
+            message_id and current_message_id and message_id != current_message_id
+        ):
+            state.message_facts = {}
+        should_update = True
+    elif not role and current_role in {"assistant", "tool"}:
+        should_update = True
+    if should_update:
+        accumulated_codes = set(state.message_facts.get("codes") or ())
+        state.message_facts.update(facts)
+        incoming_codes = set(facts.get("codes") or ())
+        if accumulated_codes or incoming_codes:
+            state.message_facts["codes"] = accumulated_codes.union(incoming_codes)
+
+
+def refresh_state_failure(state: ConversationState, message_text: str = "") -> None:
+    """按当前消息事实更新 state.failure / terminal_tool_arguments（只在还没有图片产物时有意义）。"""
+    if state.file_ids or state.sediment_ids:
+        state.failure = None
+        state.terminal_tool_arguments = None
+        return
+    facts = state.message_facts
+    role = str(facts.get("role") or "")
+    content_type = str(facts.get("content_type") or "")
+    status = str(facts.get("status") or "")
+    end_turn = facts.get("end_turn")
+    is_terminal = end_turn is True or (end_turn is None and is_terminal_message_status(status))
+    text = str(message_text or state.raw_text or "")
+    if is_terminal and is_image_generation_arguments(text, role=role, content_type=content_type):
+        if state.tool_invoked is not True:
+            state.terminal_tool_arguments = {
+                "text": text.strip(),
+                "content_type": content_type.strip().lower(),
+                "status": status.strip().lower(),
+                "end_turn": end_turn is True,
+            }
+    candidate = classify_message_facts(
+        role=role,
+        content_type=content_type,
+        status=status,
+        end_turn=bool(end_turn),
+        is_error=bool(facts.get("is_error")),
+        blocked=state.blocked,
+        has_image_output=False,
+        has_text=bool(facts.get("has_text")),
+        turn_use_case=str(facts.get("turn_use_case") or state.turn_use_case),
+        async_task_type=str(facts.get("async_task_type") or ""),
+        message_type=str(facts.get("message_type") or ""),
+        codes=facts.get("codes") or (),
+        raw_detail=text,
+    )
+    if state.terminal_tool_arguments is not None and candidate is not None and candidate.code == "upstream_text_reply":
+        # 指令回显不是给用户看的文字回复。
+        candidate = None
+    if candidate is not None:
+        # 显式错误码优先于终态文本；终态文本只替换同一轮里的笼统工具错误。
+        state.failure = merge_message_failure(state.failure, candidate)
+
+
 def update_conversation_state(state: ConversationState, payload: str, event: dict[str, Any] | None = None) -> None:
     conversation_id, file_ids, sediment_ids = extract_conversation_ids(payload)
     if conversation_id and not state.conversation_id:
@@ -1068,7 +1071,12 @@ def update_conversation_state(state: ConversationState, payload: str, event: dic
         if isinstance(metadata, dict):
             if isinstance(metadata.get("tool_invoked"), bool):
                 state.tool_invoked = metadata["tool_invoked"]
+                if state.tool_invoked is True:
+                    state.terminal_tool_arguments = None
             state.turn_use_case = str(metadata.get("turn_use_case") or state.turn_use_case)
+    _merge_message_facts(state, extract_message_facts(event))
+    if image_context:
+        state.terminal_tool_arguments = None
 
 
 def conversation_base_event(event_type: str, state: ConversationState, **extra: Any) -> dict[str, Any]:
@@ -1081,6 +1089,12 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
         "blocked": state.blocked,
         "tool_invoked": state.tool_invoked,
         "turn_use_case": state.turn_use_case,
+        "async_task_type": state.async_task_type,
+        "message_type": state.message_type,
+        "message_role": str(state.message_facts.get("role") or ""),
+        "content_type": str(state.message_facts.get("content_type") or ""),
+        "_image_failure": state.failure,
+        "_terminal_tool_arguments": state.terminal_tool_arguments,
         **extra,
     }
 
@@ -1115,6 +1129,7 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
         next_text = sanitize_output_text(next_raw_text)
         state.raw_text = next_raw_text
+        refresh_state_failure(state, next_text)
         if next_text != state.text:
             delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
             state.text = next_text
@@ -1169,52 +1184,120 @@ def text_backend() -> OpenAIBackendAPI:
     return backend
 
 
+TEXT_MAX_ACCOUNT_ATTEMPTS = 3
+# 所有账号的对话并发槽位都占满时，换号重试最多排队等待的秒数。
+TEXT_SLOT_WAIT_SECS = 120.0
+
+
+def _is_text_switchable_failure(exc: Exception) -> bool:
+    """上游或账号侧的失败（连接、超时、5xx、风控）才计入账号的连续失败并换号；请求本身的问题不计。"""
+    try:
+        failure = classify_image_exception(exc)
+    except Exception:
+        return False
+    if failure.code == "upstream_error" and not isinstance(exc, UpstreamHTTPError):
+        return False  # 本地/未知异常不是账号或上游的问题
+    return failure.scope in {"transient", "account"} and failure.code != "upstream_error_reply"
+
+
+def _is_text_auth_failure(exc: Exception) -> bool:
+    if is_token_invalid_error(str(exc)):
+        return True
+    if isinstance(exc, UpstreamHTTPError) and getattr(exc, "credential_scope", "account") == "account":
+        return int(exc.status_code) == 401
+    return False
+
+
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
+    """流式文本；整段（含换号重试）占用一个账号并发槽位，结束/异常/流被中断（GeneratorExit）都会归还。
+
+    在还没向调用方输出任何内容前，遇到可换号的失败（鉴权、连接、超时、5xx、风控）会换下一个账号，
+    最多 TEXT_MAX_ACCOUNT_ATTEMPTS 个。Ported from yukkcat/chatgpt2api (AGPL-3.0-only).
+    """
     attempted_tokens: set[str] = set()
-    token = getattr(backend, "access_token", "")
+    hint_token = getattr(backend, "access_token", "")
+    token = account_service.acquire_text_access_token(preferred_token=hint_token) if hint_token else ""
+    if hint_token and not token:
+        raise RuntimeError("no available text account")
     emitted = False
-    while True:
-        if token and token in attempted_tokens:
-            raise RuntimeError("no available text account")
+    try:
+        while True:
+            if token and token in attempted_tokens:
+                raise RuntimeError("no available text account")
+            if token:
+                attempted_tokens.add(token)
+            active_backend: OpenAIBackendAPI | None = None
+            try:
+                _remember_text_account(backend, token)
+                active_backend = OpenAIBackendAPI(access_token=token)
+                _remember_text_account(active_backend, token)
+                for event in conversation_events(
+                    active_backend,
+                    messages=request.messages,
+                    model=request.model,
+                    prompt=request.prompt,
+                    thinking_effort=request.thinking_effort,
+                ):
+                    if event.get("type") != "conversation.delta":
+                        continue
+                    delta = str(event.get("delta") or "")
+                    if delta:
+                        emitted = True
+                        yield delta
+                account_service.mark_text_used(token)
+                return
+            except Exception as exc:
+                failed_token = token
+                if token and not emitted and _is_text_auth_failure(exc):
+                    refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
+                    if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
+                        account_service.rebind_text_slot(token, refreshed_token)
+                        token = refreshed_token
+                    else:
+                        # 401 先入待核验队列（核验通过恢复，失败再走失效/重新登录流程），本次请求换号继续。
+                        try:
+                            account_service.schedule_auth_verification(token, "text_stream")
+                        except Exception as schedule_error:  # noqa: BLE001 - 调度失败不能盖掉原始错误
+                            logger.warning({
+                                "event": "auth_verification_schedule_failed",
+                                "source": "text_stream",
+                                "error": diagnostic_excerpt(schedule_error, 300),
+                            })
+                        released, token = token, ""
+                        account_service.release_text_slot(released)
+                        token = account_service.acquire_text_access_token(
+                            excluded_tokens=attempted_tokens,
+                            timeout_secs=TEXT_SLOT_WAIT_SECS,
+                        )
+                    if token:
+                        continue
+                elif token and not emitted and _is_text_switchable_failure(exc):
+                    account_service.record_upstream_failure(token)
+                    if len(attempted_tokens) < TEXT_MAX_ACCOUNT_ATTEMPTS:
+                        released, token = token, ""
+                        account_service.release_text_slot(released)
+                        token = account_service.acquire_text_access_token(
+                            excluded_tokens=attempted_tokens,
+                            timeout_secs=TEXT_SLOT_WAIT_SECS,
+                        )
+                        if token:
+                            logger.warning({
+                                "event": "text_cross_account_retry",
+                                "account_email": _text_account_email(failed_token),
+                                "next_account_email": _text_account_email(token),
+                                "attempted_account_count": len(attempted_tokens),
+                                "error": diagnostic_excerpt(exc, 300),
+                            })
+                            continue
+                if failed_token and not getattr(exc, "account_email", ""):
+                    setattr(exc, "account_email", _text_account_email(failed_token))
+                raise
+            finally:
+                if active_backend is not None:
+                    active_backend.close()
+    finally:
         if token:
-            attempted_tokens.add(token)
-        active_backend: OpenAIBackendAPI | None = None
-        try:
-            _remember_text_account(backend, token)
-            active_backend = OpenAIBackendAPI(access_token=token)
-            _remember_text_account(active_backend, token)
-            for event in conversation_events(
-                active_backend,
-                messages=request.messages,
-                model=request.model,
-                prompt=request.prompt,
-                thinking_effort=request.thinking_effort,
-            ):
-                if event.get("type") != "conversation.delta":
-                    continue
-                delta = str(event.get("delta") or "")
-                if delta:
-                    emitted = True
-                    yield delta
-            account_service.mark_text_used(token)
-            return
-        except Exception as exc:
-            error_message = str(exc)
-            if token and not emitted and is_token_invalid_error(error_message):
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
-                if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
-                    token = refreshed_token
-                else:
-                    account_service.handle_invalid_token(token, "text_stream", error=error_message)
-                    token = account_service.get_text_access_token(attempted_tokens)
-                if token:
-                    continue
-            if token and not getattr(exc, "account_email", ""):
-                setattr(exc, "account_email", _text_account_email(token))
-            raise
-        finally:
-            if active_backend is not None:
-                active_backend.close()
+            account_service.release_text_slot(token)
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
@@ -1346,18 +1429,20 @@ def _image_stream_timeout_error(
         raw_upstream_message: str,
         followup: dict[str, Any],
         conversation_snapshot: dict[str, Any] | None = None,
+        failure_code: str = "image_stream_timeout",
 ) -> ImageGenerationError:
     exc = ImageGenerationError(
         image_stream_error_message(raw_error),
         status_code=502,
         error_type="server_error",
-        code="image_stream_timeout",
+        code=failure_code,
         conversation_id=conversation_id,
         raw_error=raw_error,
         upstream_error=diagnostic_excerpt(upstream_error or raw_error, 4000),
         raw_upstream_message=diagnostic_excerpt(raw_upstream_message, 4000),
     )
-    setattr(exc, "stream_timeout_secs", config.image_stream_timeout_secs)
+    if failure_code == "image_stream_timeout":
+        setattr(exc, "stream_timeout_secs", config.image_stream_timeout_secs)
     setattr(exc, "stream_timeout_followup", followup)
     if followup.get("task_error"):
         setattr(exc, "last_task_error", followup["task_error"])
@@ -1376,8 +1461,16 @@ def _recover_after_image_stream_timeout(
         index: int,
         total: int,
         stream_started_at: float,
+        *,
+        failure_code: str = "image_stream_timeout",
 ) -> ImageOutput:
-    raw_error = str(timeout_error) or f"SSE stream exceeded {config.image_stream_timeout_secs}s"
+    """SSE 超时/中途断开后凭 conversation_id 继续读会话；上游多半还在画并已扣额度，不能直接报错。"""
+    is_timeout = failure_code == "image_stream_timeout"
+    recovery_reason = "stream_timeout" if is_timeout else "stream_interrupted"
+    recovery_path = f"{recovery_reason}_followup"
+    raw_error = str(timeout_error) or (
+        f"SSE stream exceeded {config.image_stream_timeout_secs}s" if is_timeout else "SSE stream interrupted"
+    )
     conversation_id = str(last.get("conversation_id") or "")
     file_ids = [str(item) for item in last.get("file_ids") or []]
     sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
@@ -1387,13 +1480,13 @@ def _recover_after_image_stream_timeout(
         conversation_id = _recover_image_conversation_id(
             backend,
             request,
-            reason="stream_timeout",
+            reason=recovery_reason,
             message=message or raw_error,
             started_at=stream_started_at,
         )
 
     followup: dict[str, Any] = {
-        "reason": "sse_timeout",
+        "reason": "sse_timeout" if is_timeout else "sse_interrupted",
         "timeout_secs": config.image_stream_timeout_secs,
         "conversation_id": conversation_id,
         "stream_error": raw_error,
@@ -1414,6 +1507,9 @@ def _recover_after_image_stream_timeout(
     latest_assistant_text = ""
     policy_message = ""
     conversation_probe_error = ""
+    stream_failure = last.get("_image_failure")
+    stream_failure = stream_failure if isinstance(stream_failure, ImageFailure) else None
+    conversation_failure: ImageFailure | None = None
 
     if conversation_id:
         task_error, task_summaries, task_probe_error = _image_stream_timeout_task_diagnostics(backend, conversation_id)
@@ -1424,6 +1520,11 @@ def _recover_after_image_stream_timeout(
                 add_unique(file_ids, [str(item) for item in record.get("file_ids") or []])
                 add_unique(sediment_ids, [str(item) for item in record.get("sediment_ids") or []])
             policy_message = backend._find_content_policy_error_in_conversation(conversation)
+            if not (file_ids or sediment_ids):
+                conversation_failure = classify_conversation_failure(conversation)
+                snapshot_terminal_text = terminal_assistant_text(conversation)
+                if snapshot_terminal_text:
+                    latest_assistant_text = snapshot_terminal_text
         except Exception as exc:
             conversation_probe_error = diagnostic_excerpt(repr(exc), 1000)
 
@@ -1468,7 +1569,7 @@ def _recover_after_image_stream_timeout(
                 sediment_ids,
                 index=index,
                 total=total,
-                path="stream_timeout_followup",
+                path=recovery_path,
                 poll=False,
             )
             result_output = _image_result_output_from_urls(
@@ -1478,11 +1579,11 @@ def _recover_after_image_stream_timeout(
                 image_urls,
                 index,
                 total,
-                path="stream_timeout_followup",
+                path=recovery_path,
             )
             if result_output:
                 logger.info({
-                    "event": "image_stream_timeout_recovered_result",
+                    "event": f"image_{recovery_reason}_recovered_result",
                     "call_id": request.call_id,
                     "conversation_id": conversation_id,
                     "file_ids": file_ids,
@@ -1490,8 +1591,87 @@ def _recover_after_image_stream_timeout(
                     "url_count": len(image_urls),
                 })
                 return result_output
+        except ImageDownloadError:
+            raise
         except Exception as exc:
             followup["result_recovery_error"] = diagnostic_excerpt(repr(exc), 1000)
+
+    terminal_failure = merge_message_failure(stream_failure, conversation_failure)
+    if terminal_failure is not None:
+        followup["failure_code"] = terminal_failure.code
+
+    # 断流或流超时时上游多半还在画：只查一次会话往往还没出图。实测连接中途断开后上游照样画完
+    # 并扣了额度，直接报错等于白扣一次。没有失败信号（或只有“最新是生图指令”的笼统工具错误）时，
+    # 按正常结果路径继续轮询这条会话；轮询到期仍没有图，再按原来的失败报出。
+    may_still_be_drawing = terminal_failure is None or terminal_failure.code == "image_tool_error"
+    if conversation_id and may_still_be_drawing and not (file_ids or sediment_ids):
+        poll_budget = _recovery_poll_budget_secs(request)
+        if poll_budget > 0:
+            logger.info({
+                "event": f"image_{recovery_reason}_poll_recovery_start",
+                "call_id": request.call_id,
+                "conversation_id": conversation_id,
+                "poll_budget_secs": round(poll_budget, 1),
+            })
+            try:
+                image_urls = _resolve_image_urls_with_monitor(
+                    backend,
+                    request,
+                    conversation_id,
+                    [],
+                    [],
+                    index=index,
+                    total=total,
+                    path=f"{recovery_path}_poll",
+                    poll_timeout_secs=poll_budget,
+                )
+                result_output = _image_result_output_from_urls(
+                    backend,
+                    request,
+                    conversation_id,
+                    image_urls,
+                    index,
+                    total,
+                    path=f"{recovery_path}_poll",
+                )
+                if result_output:
+                    logger.info({
+                        "event": f"image_{recovery_reason}_poll_recovered_result",
+                        "call_id": request.call_id,
+                        "conversation_id": conversation_id,
+                        "url_count": len(image_urls),
+                    })
+                    return result_output
+            except ImageDownloadError:
+                raise
+            except Exception as exc:
+                followup["poll_recovery_error"] = diagnostic_excerpt(repr(exc), 1000)
+                # 轮询查到了明确的失败（如内容违规、鉴权失败）就按它报，比笼统的超时更准确。
+                if classify_image_exception(exc).code != "image_poll_timeout":
+                    raise
+
+    if terminal_failure is not None and terminal_failure.code != "image_tool_error":
+        failure_detail = ""
+        raw_detail = terminal_failure.raw_detail
+        if isinstance(raw_detail, str):
+            failure_detail = raw_detail.strip()
+        elif raw_detail not in (None, ""):
+            failure_detail = json.dumps(raw_detail, ensure_ascii=False, default=str)
+        failure_detail = failure_detail or message or raw_error
+        terminal_exc = ImageGenerationError(
+            failure_detail,
+            failure=terminal_failure.with_raw_detail(failure_detail),
+            conversation_id=conversation_id,
+            raw_error=raw_error,
+            upstream_error="" if terminal_failure.code == "upstream_text_reply" else failure_detail,
+            raw_upstream_message=latest_assistant_text or message,
+        )
+        if is_timeout:
+            setattr(terminal_exc, "stream_timeout_secs", config.image_stream_timeout_secs)
+        setattr(terminal_exc, "stream_timeout_followup", followup)
+        if conversation_snapshot:
+            setattr(terminal_exc, "last_conversation_snapshot", conversation_snapshot)
+        raise terminal_exc
 
     upstream_error = task_error or policy_message
     if not upstream_error:
@@ -1505,7 +1685,7 @@ def _recover_after_image_stream_timeout(
             default=str,
         )
     logger.warning({
-        "event": "image_stream_timeout_followup",
+        "event": f"image_{recovery_reason}_followup",
         "call_id": request.call_id,
         "conversation_id": conversation_id,
         "task_error": diagnostic_excerpt(task_error, 500),
@@ -1522,6 +1702,7 @@ def _recover_after_image_stream_timeout(
         latest_assistant_text or message,
         followup,
         conversation_snapshot,
+        failure_code=failure_code,
     )
 
 
@@ -1581,6 +1762,8 @@ def _image_result_output_from_urls(
         request.response_format,
         request.base_url,
         int(time.time()),
+        requested_size=request.size,
+        **({"deadline_monotonic": request.deadline_monotonic} if request.deadline_monotonic > 0 else {}),
     )["data"]
     if not data:
         return None
@@ -1592,6 +1775,21 @@ def _image_result_output_from_urls(
         data=data,
         conversation_id=conversation_id,
     )
+
+
+def _is_stream_interruption(exc: BaseException) -> bool:
+    if isinstance(exc, (UpstreamHTTPError, RequestCancelledError)):
+        return False
+    if isinstance(exc, curl_exceptions.RequestException):
+        return True
+    return is_stream_transport_error(str(exc))
+
+
+def _tool_arguments_failure_code(message: str, argument_text: str) -> str:
+    """只有生图指令、没有图时的失败码。指令后面跟着“已达生图上限”之类的说明按额度耗尽处理；
+    只看指令以外上游补充的话，指令里带着用户提示词，提示词本身可能就含这类字样。"""
+    trailing_text = message.replace(argument_text, "") if argument_text else message
+    return "image_quota_exhausted" if text_says_image_quota_exhausted(trailing_text) else "image_tool_error"
 
 
 def stream_image_outputs(
@@ -1647,6 +1845,26 @@ def stream_image_outputs(
             index,
             total,
             conversation_wall_started,
+        )
+        return
+    except Exception as exc:
+        # SSE 中途断开（连接重置、HTTP/2 流错误、超时类请求异常）：已经拿到会话/图片 id 才有得救，
+        # 上游多半还在画并已扣额度，继续轮询会话而不是直接报 image_stream_interrupted。
+        if not _is_stream_interruption(exc) or not any((
+            last.get("conversation_id"),
+            last.get("file_ids"),
+            last.get("sediment_ids"),
+        )):
+            raise
+        yield _recover_after_image_stream_timeout(
+            backend,
+            request,
+            last,
+            exc,
+            index,
+            total,
+            conversation_wall_started,
+            failure_code="image_stream_timeout" if isinstance(exc, curl_exceptions.Timeout) else "image_stream_interrupted",
         )
         return
 
@@ -1773,6 +1991,25 @@ def stream_image_outputs(
         yield result_output
         return
 
+    terminal_args = last.get("_terminal_tool_arguments")
+    if isinstance(terminal_args, dict) and terminal_args.get("text"):
+        # 终态消息只是生图指令的回显，没有图：工具没真正出图（或额度已用完），不是给用户的文字回复。
+        code = _tool_arguments_failure_code(message, str(terminal_args.get("text") or ""))
+        raise ImageGenerationError(
+            message or str(terminal_args.get("text") or ""),
+            conversation_id=conversation_id,
+            raw_upstream_message=message,
+            failure=image_failure(code, raw_detail=message),
+        )
+    stream_failure = last.get("_image_failure")
+    if isinstance(stream_failure, ImageFailure) and stream_failure.code == "image_quota_exhausted":
+        raise ImageGenerationError(
+            message or "image quota exhausted",
+            conversation_id=conversation_id,
+            raw_upstream_message=message,
+            failure=stream_failure,
+        )
+
     if message and not should_poll_for_image:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
@@ -1858,11 +2095,78 @@ def stream_codex_image_outputs(
         request.response_format,
         request.base_url,
         int(time.time()),
+        requested_size=request.size,
     )["data"]
     if data:
         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)
         return
     raise ImageGenerationError("No image result found in response")
+
+
+RECOVERY_POLL_DEADLINE_MARGIN_SECS = 10.0
+
+
+def _image_start_deadline(request: ConversationRequest) -> float | None:
+    """最晚可以开始一次生成的时间点：请求截止时间减去一次生成流的超时。
+
+    排队等账号等到这个时间还没拿到号，剩下的时间已经不够跑完生成，再开始只会白白消耗
+    上游额度后被截止时间中断，因此直接按账号繁忙排队超时失败。
+    """
+    if request.deadline_monotonic <= 0:
+        return None
+    return request.deadline_monotonic - float(config.image_stream_timeout_secs)
+
+
+def _recovery_poll_budget_secs(request: ConversationRequest) -> float:
+    """断流后继续轮询的时长：不超过结果等待上限，也不越过请求的总截止时间（留出下载余量）。"""
+    budget = float(config.image_poll_timeout_secs)
+    if request.deadline_monotonic > 0:
+        budget = min(budget, request.deadline_monotonic - time.monotonic() - RECOVERY_POLL_DEADLINE_MARGIN_SECS)
+    return max(0.0, budget)
+
+
+def _acquire_image_token(excluded_tokens: set[str], **kwargs: Any) -> str:
+    """Lease an image account, avoiding accounts that already failed this image.
+
+    Raises ImageAccountSelectionError when only excluded accounts are available.
+    """
+    if excluded_tokens:
+        kwargs["excluded_tokens"] = set(excluded_tokens)
+    return account_service.get_available_access_token(**kwargs)
+
+
+_SYNTHETIC_INCOMPLETE_MESSAGES = frozenset({
+    "Image generation completed upstream but the result could not be retrieved. Please try again in a moment.",
+    "Image generation started upstream but the response was incomplete. Please try again.",
+})
+
+# 上游文本回复/内容策略拒绝/送达失败等是请求或送达层面的问题，不是账号的错：只放回槽位，不降权。
+_REQUEST_SCOPED_NO_PENALTY_CODES = frozenset(
+    {"image_download_failed", "account_busy_timeout", "account_queue_full"}
+) | TEXT_REVIEW_FAILURE_CODES
+
+
+def _release_image_account_without_failure(token: str, failure: ImageFailure) -> None:
+    """Free the slot for a failure that is not the account's fault; at most deprioritize it."""
+    account_service.release_image_slot(token)
+    if failure.code in _REQUEST_SCOPED_NO_PENALTY_CODES:
+        return
+    try:
+        account_service.penalize_image_account(token, reason=failure.code)
+    except Exception as exc:
+        logger.warning({"event": "image_account_penalize_failed", "code": failure.code, "error": str(exc)[:200]})
+
+
+def _output_size_text(outputs: list[ImageOutput]) -> str:
+    """Actual result sizes, e.g. "1024x1024" or "1024x1024,1536x1024"; empty when unknown."""
+    sizes: list[str] = []
+    for output in outputs:
+        if output.kind != "result":
+            continue
+        for item in output.data:
+            if isinstance(item, dict) and item.get("width") and item.get("height"):
+                sizes.append(f"{item['width']}x{item['height']}")
+    return ",".join(sizes)
 
 
 def _generate_single_image(
@@ -1874,6 +2178,10 @@ def _generate_single_image(
 
     该函数在独立线程中运行，每个线程使用不同的账号，
     实现并行生图，避免串行超时阻塞。
+    可换号的失败（上游错误回复、额度耗尽、429 等）最多换
+    config.image_account_retry_count 次账号重试（= image_max_account_attempts - 1，
+    image_account_retry_enabled 关闭时为 0）。每次尝试（成功/失败/出口回退）记录到
+    image_attempts，随输出或异常带给日志层。
     """
     account_email = ""
     retry_token = ""
@@ -1881,6 +2189,87 @@ def _generate_single_image(
     fallback_retry_used = False
     fallback_from_egress: dict[str, Any] = {}
     single_started = time.perf_counter()
+    excluded_tokens: set[str] = set()
+    account_retries_left = config.image_account_retry_count
+    image_attempts: list[dict[str, Any]] = []
+    attempt_started = time.perf_counter()
+    current_egress: dict[str, Any] = {}
+    current_fallback = False
+    best_error: ImageGenerationError | None = None
+    best_failure: ImageFailure | None = None
+
+    def final_error(error: ImageGenerationError, failure: ImageFailure) -> ImageGenerationError:
+        """Return the most informative error across attempts.
+
+        The winning error keeps its own public status/code; the classified
+        failure is attached for diagnostics only, so API responses stay as before.
+        """
+        nonlocal best_error, best_failure
+        if error.failure is None:
+            error.failure = failure
+        merged = merge_failures(best_failure, failure)
+        if merged is not None and merged.code == failure.code:
+            best_error = error
+        best_failure = merged
+        resolved = best_error or error
+        resolved.image_attempts = list(image_attempts)
+        return resolved
+
+    def attempt_base(status: str) -> dict[str, Any]:
+        attempt: dict[str, Any] = {
+            "slot": index,
+            "attempt": len(image_attempts) + 1,
+            "account_email": account_email,
+            "status": status,
+            "switched_account": False,
+            "duration_ms": int((time.perf_counter() - attempt_started) * 1000),
+        }
+        for key in ("egress_key", "egress_label", "proxy_source", "proxy_group_id", "proxy_node_name"):
+            value = current_egress.get(key)
+            if value:
+                attempt[key] = value
+        if current_fallback:
+            attempt["egress_fallback"] = True
+        return attempt
+
+    def record_attempt(failure: ImageFailure, retry_kind: str = "") -> dict[str, Any]:
+        attempt = {**attempt_base("failed"), **failure.diagnostic_fields()}
+        if retry_kind:
+            attempt["retry_kind"] = retry_kind
+        image_attempts.append(attempt)
+        return attempt
+
+    def record_success(status: str = "success") -> None:
+        image_attempts.append(attempt_base(status))
+
+    def switch_account(error: ImageGenerationError, failure: ImageFailure) -> bool:
+        """Move to another account when the failure allows it; False means raise."""
+        nonlocal account_retries_left
+        attempt = record_attempt(failure)
+        final_error(error, failure)
+        if not failure.switch_account or account_retries_left <= 0:
+            return False
+        account_retries_left -= 1
+        excluded_tokens.add(token)
+        attempt["switched_account"] = True
+        logger.warning({
+            "event": "image_account_switch_retry",
+            "call_id": request.call_id,
+            "account_email": account_email,
+            "failure_code": failure.code,
+            "retries_left": account_retries_left,
+            "index": index,
+        })
+        _monitor_image_stage(
+            request,
+            "image_account_switch_retry",
+            account_email=account_email,
+            failure_code=failure.code,
+            status="retrying",
+            index=index,
+            total=total,
+        )
+        return True
 
     while True:
         account_wait_started = time.perf_counter()
@@ -1896,12 +2285,23 @@ def _generate_single_image(
                 _monitor_image_stage(request, "image_getting_account", index=index, total=total)
                 plan_type, _ = split_image_model(request.model)
                 codex_model = is_codex_image_model(request.model)
-                token = account_service.get_available_access_token(
+                acquire_kwargs: dict[str, Any] = {}
+                start_deadline = _image_start_deadline(request)
+                if start_deadline is not None:
+                    acquire_kwargs["deadline_monotonic"] = start_deadline
+                token = _acquire_image_token(
+                    excluded_tokens,
                     plan_type=plan_type,
-                    source_type="codex" if codex_model else None,
-                    plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+                    source_type=account_service.CODEX_IMAGE_SOURCE if codex_model else None,
+                    plan_types=None,
+                    **acquire_kwargs,
                 )
+                if not token and best_error is not None:
+                    raise best_error
         except ImageAccountSelectionError as exc:
+            if best_error is not None:
+                # No other account left: report the failure that made us switch.
+                raise best_error from exc
             _monitor_image_stage(
                 request,
                 "image_local_rejected",
@@ -1918,6 +2318,8 @@ def _generate_single_image(
                 account_email=account_email,
             ) from exc
         except RuntimeError as exc:
+            if best_error is not None:
+                raise best_error from exc
             _monitor_image_stage(
                 request,
                 "image_local_rejected",
@@ -1933,20 +2335,55 @@ def _generate_single_image(
         returned_result = False
         image_slot_finalized = False
 
-        def finalize_image_slot(success: bool, *, refresh_account: bool = False) -> None:
+        def finalize_image_slot(
+                success: bool,
+                *,
+                refresh_account: bool = False,
+                failure: ImageFailure | None = None,
+                upstream_status: int = 0,
+                account_fault: bool = True,
+        ) -> None:
             nonlocal image_slot_finalized
             if image_slot_finalized:
                 return
             image_slot_finalized = True
-            account_service.mark_image_result(
-                token,
-                success,
-                refresh_account=refresh_account,
-            )
+            if not success and (not account_fault or (failure is not None and not failure.account_failure)):
+                # 文本结果/内容策略拒绝/送达失败不是账号的错：只放回槽位，不计失败、不触发冷却或自动暂停。
+                _release_image_account_without_failure(
+                    token,
+                    failure or image_failure("upstream_text_reply"),
+                )
+                return
+            try:
+                account_service.mark_image_result(
+                    token,
+                    success,
+                    refresh_account=refresh_account,
+                    failure_code=failure.code if failure is not None else "",
+                    status_code=upstream_status,
+                )
+            except Exception as mark_error:  # noqa: BLE001 - 账号状态写失败也必须归还槽位
+                logger.warning({
+                    "event": "image_account_result_update_failed",
+                    "call_id": request.call_id,
+                    "account_email": account_email,
+                    "error": diagnostic_excerpt(mark_error, 300),
+                })
+                try:
+                    account_service.release_image_slot(token)
+                except Exception as release_error:  # noqa: BLE001
+                    logger.warning({
+                        "event": "image_account_slot_release_failed",
+                        "call_id": request.call_id,
+                        "error": diagnostic_excerpt(release_error, 300),
+                    })
 
         account_wait_ms = int((time.perf_counter() - account_wait_started) * 1000)
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
+        attempt_started = time.perf_counter()
+        current_egress = {}
+        current_fallback = False
         _monitor_image_stage(
             request,
             "image_account_lookup",
@@ -1993,12 +2430,18 @@ def _generate_single_image(
                         code="connection_failed",
                         account_email=account_email,
                     )
+            deadline_kwargs: dict[str, Any] = (
+                {"deadline_monotonic": request.deadline_monotonic} if request.deadline_monotonic > 0 else {}
+            )
             backend = OpenAIBackendAPI(
                 access_token=token,
                 proxy_profile=fallback_profile,
                 reserve_image_egress=fallback_profile is None,
+                **deadline_kwargs,
             )
             backend.cancel_checker = lambda: _raise_if_request_cancelled(request)
+            current_egress = _backend_egress_data(backend)
+            current_fallback = using_fallback_profile
             if request.trace_image_perf:
                 egress_data = _backend_egress_data(backend)
                 if using_fallback_profile:
@@ -2015,7 +2458,9 @@ def _generate_single_image(
                     total=total,
                     **egress_data,
                 )
-            egress_acquire_ms = proxy_settings.acquire_image_egress(backend.proxy_profile)
+            # 已在 get_profile 里预占的出口名额也要在失败时归还。
+            egress_acquired = bool(getattr(backend.proxy_profile, "image_egress_reserved", False))
+            egress_acquire_ms = proxy_settings.acquire_image_egress(backend.proxy_profile, **deadline_kwargs)
             egress_acquired = int(getattr(backend.proxy_profile, "image_concurrency_limit", 0) or 0) > 0
             egress_wait_ms = int((time.perf_counter() - egress_started) * 1000)
             if request.trace_image_perf:
@@ -2061,17 +2506,28 @@ def _generate_single_image(
                 _raise_if_request_cancelled(request)
                 if account_email and not output.account_email:
                     output.account_email = account_email
-                if output.kind == "message" and request.message_as_error:
-                    status_code, error_type, code = _image_message_error_metadata(output.text)
+                # 上游用文字说"生图额度用完"：按额度耗尽处理（置限流、换号），不当文本结果返回。
+                if output.kind == "message" and text_says_image_quota_exhausted(output.text):
+                    raise ImageGenerationError(
+                        output.text,
+                        account_email=account_email,
+                        conversation_id=output.conversation_id,
+                        upstream_error=output.text,
+                        raw_upstream_message=output.text,
+                        failure=image_failure("image_quota_exhausted", raw_detail=output.text),
+                    )
+                # An upstream-side error reply is never a usable text result:
+                # fail it (and switch accounts) even when messages are allowed.
+                if output.kind == "message" and (
+                        request.message_as_error or is_upstream_error_reply_text(output.text)
+                ):
                     raise ImageGenerationError(
                         output.text or "Image generation was rejected by upstream policy.",
-                        status_code=status_code,
-                        error_type=error_type,
-                        code=code,
                         account_email=account_email,
                         conversation_id=output.conversation_id,
                         upstream_error=output.text or "",
                         raw_upstream_message=output.text or "",
+                        failure=classify_image_message_text(output.text),
                     )
                 emitted_for_token = True
                 returned_message = output.kind == "message"
@@ -2102,10 +2558,17 @@ def _generate_single_image(
                 })
             if returned_message:
                 message_text = outputs[-1].text if outputs else ""
+                # 上游给出的文字回复（内容策略拒绝等）是请求层面的结果，不记账号失败；
+                # 只有我们自己合成的“结果取不回/响应不完整”提示才算上游/账号侧问题。
+                synthetic_incomplete = message_text in _SYNTHETIC_INCOMPLETE_MESSAGES
                 finalize_image_slot(
                     False,
-                    refresh_account=should_refresh_image_account(message_text),
+                    refresh_account=synthetic_incomplete and should_refresh_image_account(message_text),
+                    account_fault=synthetic_incomplete,
                 )
+                record_success("message")
+                if outputs:
+                    outputs[-1].image_attempts = list(image_attempts)
                 if request.trace_image_perf:
                     _monitor_image_stage(
                         request,
@@ -2142,6 +2605,9 @@ def _generate_single_image(
                 return outputs
             _cleanup_image_conversations_after_success(backend, outputs)
             finalize_image_slot(True)
+            record_success("success")
+            if outputs:
+                outputs[-1].image_attempts = list(image_attempts)
             if request.trace_image_perf:
                 _monitor_image_stage(
                     request,
@@ -2151,6 +2617,7 @@ def _generate_single_image(
                     account_email=account_email,
                     index=index,
                     total=total,
+                    result_size=_output_size_text(outputs),
                 )
                 logger.info({
                     "event": "image_single_done",
@@ -2161,6 +2628,7 @@ def _generate_single_image(
                     "total_ms": int((time.perf_counter() - single_started) * 1000),
                     "status": "success",
                     "account_email": account_email,
+                    "result_size": _output_size_text(outputs),
                 })
             return outputs
         except ImagePollTimeoutError as exc:
@@ -2201,7 +2669,8 @@ def _generate_single_image(
             ):
                 if hasattr(exc, attr):
                     setattr(image_error, attr, getattr(exc, attr))
-            raise image_error from exc
+            switch_account(image_error, classify_image_exception(image_error))
+            raise (best_error or image_error) from exc
         except RequestCancelledError as exc:
             finalize_image_slot(False)
             if request.trace_image_perf:
@@ -2221,7 +2690,7 @@ def _generate_single_image(
                 account_email=account_email,
             ) from exc
         except ImageContentPolicyError as exc:
-            finalize_image_slot(False)
+            finalize_image_slot(False, account_fault=False)
             if request.trace_image_perf:
                 _monitor_image_stage(
                     request,
@@ -2240,7 +2709,7 @@ def _generate_single_image(
                 "error": diagnostic_excerpt(exc, 1000),
                 "index": index,
             })
-            raise ImageGenerationError(
+            policy_error = ImageGenerationError(
                 str(exc) or "Image generation was rejected by upstream policy.",
                 status_code=400,
                 error_type="invalid_request_error",
@@ -2249,10 +2718,22 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
                 upstream_error=str(exc),
                 raw_upstream_message=str(exc),
-            ) from exc
+            )
+            switch_account(policy_error, classify_image_exception(policy_error))
+            raise (best_error or policy_error) from exc
         except ImageTextReplyError as exc:
-            finalize_image_slot(False)
             text_reply = str(exc) or "上游返回了文本回复而不是图片。"
+            if text_says_image_quota_exhausted(text_reply):
+                text_failure = image_failure("image_quota_exhausted", raw_detail=text_reply)
+            else:
+                text_failure = upstream_error_reply_failure(
+                    image_failure("upstream_text_reply", raw_detail=text_reply).with_public_detail(text_reply)
+                )
+            finalize_image_slot(
+                False,
+                failure=text_failure,
+                refresh_account=text_failure.code == "image_quota_exhausted",
+            )
             if request.trace_image_perf:
                 _monitor_image_stage(
                     request,
@@ -2282,6 +2763,7 @@ def _generate_single_image(
                 raw_error=text_reply,
                 upstream_error=str(getattr(exc, "upstream_error", "") or text_reply),
                 raw_upstream_message=str(getattr(exc, "raw_upstream_message", "") or text_reply),
+                failure=text_failure if text_failure.code in {"upstream_error_reply", "image_quota_exhausted"} else None,
             )
             for attr in (
                 "upstream_message_preview",
@@ -2290,14 +2772,18 @@ def _generate_single_image(
             ):
                 if hasattr(exc, attr):
                     setattr(image_error, attr, getattr(exc, attr))
-            raise image_error from exc
+            if switch_account(image_error, text_failure):
+                continue
+            raise (best_error or image_error) from exc
         except ImageGenerationError as exc:
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
+            failure = classify_image_exception(exc)
             finalize_image_slot(
                 False,
                 refresh_account=should_refresh_image_account(error_text),
+                failure=failure,
             )
             if request.trace_image_perf:
                 _monitor_image_stage(
@@ -2314,10 +2800,39 @@ def _generate_single_image(
                 "event": "image_stream_generation_error",
                 "request_token": token,
                 "account_email": account_email,
+                "failure_code": failure.code,
                 "error": diagnostic_excerpt(error_text, 1000),
                 "index": index,
             })
+            if switch_account(exc, failure):
+                continue
+            if best_error is not None and best_error is not exc:
+                raise best_error from exc
             raise
+        except ProxyReferenceUnavailableError as exc:
+            # 代理引用解析不出（缺失/停用/无节点）：绝不回落直连，按明确失败码报错，不记账号失败。
+            proxy_failure = image_failure("proxy_unavailable", raw_detail=str(exc))
+            finalize_image_slot(False, failure=proxy_failure, account_fault=False)
+            proxy_error = ImageGenerationError(
+                str(exc) or "proxy is unavailable",
+                account_email=account_email,
+                failure=proxy_failure,
+            )
+            record_attempt(proxy_failure)
+            final_error(proxy_error, proxy_failure)
+            raise (best_error or proxy_error) from exc
+        except ImageEgressDeadlineError as exc:
+            # 等出口并发等到请求截止：本次没开始生成，不记账号失败，直接按繁忙超时报错。
+            busy_failure = image_failure("account_busy_timeout", raw_detail=str(exc))
+            finalize_image_slot(False, failure=busy_failure, account_fault=False)
+            busy_error = ImageGenerationError(
+                str(exc) or "image request deadline exceeded while waiting for egress capacity",
+                account_email=account_email,
+                failure=busy_failure,
+            )
+            record_attempt(busy_failure)
+            final_error(busy_error, busy_failure)
+            raise (best_error or busy_error) from exc
         except Exception as exc:
             last_error = str(exc)
             stream_error_ms = int((time.perf_counter() - stream_started) * 1000) if stream_started > 0 else 0
@@ -2362,6 +2877,7 @@ def _generate_single_image(
             if early_connection_failure and fallback_reference and not fallback_retry_used:
                 fallback_retry_used = True
                 fallback_retry_pending = True
+                record_attempt(classify_image_exception(exc), retry_kind="egress_fallback")
                 retry_token = token
                 fallback_from_egress = _backend_egress_data(backend) if backend is not None else {}
                 logger.warning({
@@ -2387,17 +2903,24 @@ def _generate_single_image(
                         fallback_from_egress_label=fallback_from_egress.get("egress_label", ""),
                     )
                 continue
+            failure = classify_image_exception(exc)
             finalize_image_slot(
                 False,
                 refresh_account=should_refresh_image_account(last_error),
+                failure=failure,
+                upstream_status=int(exc.status_code) if isinstance(exc, UpstreamHTTPError) else 0,
             )
-            raise ImageGenerationError(
+            stream_error = ImageGenerationError(
                 image_stream_error_message(last_error),
                 account_email=account_email,
-                conversation_id="",
+                conversation_id=str(getattr(exc, "conversation_id", "") or ""),
                 raw_error=last_error,
                 upstream_error=last_error,
-            ) from exc
+                failure=failure if isinstance(exc, ImageDownloadError) else None,
+            )
+            if switch_account(stream_error, failure):
+                continue
+            raise (best_error or stream_error) from exc
         finally:
             if egress_acquired and backend is not None:
                 proxy_settings.release_image_egress(backend.proxy_profile)
@@ -2405,8 +2928,68 @@ def _generate_single_image(
                 backend.close()
 
 
+def _select_image_pool_error(errors: dict[int, Exception]) -> Exception | None:
+    """Select one deterministic failure across slots and retain every slot's attempts.
+
+    Ported from yukkcat/chatgpt2api (AGPL-3.0-only).
+    """
+    if not errors:
+        return None
+
+    def score(item: tuple[int, Exception]) -> tuple[int, int]:
+        slot, exc = item
+        return (image_failure_priority(classify_image_exception(exc)), -slot)
+
+    _, selected = max(errors.items(), key=score)
+    if getattr(selected, "failure", None) is None:
+        try:
+            setattr(selected, "failure", classify_image_exception(selected))
+        except Exception:
+            pass
+    attempts: list[dict[str, Any]] = []
+    for slot, exc in sorted(errors.items()):
+        raw_attempts = getattr(exc, "image_attempts", None)
+        if not isinstance(raw_attempts, (list, tuple)):
+            continue
+        for attempt_number, raw_attempt in enumerate(raw_attempts, start=1):
+            if not isinstance(raw_attempt, dict):
+                continue
+            attempt = dict(raw_attempt)
+            attempt.setdefault("slot", slot)
+            attempt.setdefault("attempt", attempt_number)
+            if attempt not in attempts:
+                attempts.append(attempt)
+    attempts.sort(key=lambda item: (int(item.get("slot") or 0), int(item.get("attempt") or 0)))
+    if attempts:
+        setattr(selected, "image_attempts", attempts)
+    return selected
+
+
+def _pool_failure_error(errors: dict[int, Exception], last_error: str, attempts: list[dict[str, Any]]) -> Exception:
+    """Error raised when no slot produced an image."""
+    selected = _select_image_pool_error(errors)
+    if isinstance(selected, ImageGenerationError):
+        if attempts and not selected.image_attempts:
+            selected.image_attempts = list(attempts)
+        return selected
+    if not last_error:
+        last_error = "no account in the pool could generate images — check account quota and rate-limit status"
+    pool_error = ImageGenerationError(
+        image_stream_error_message(last_error),
+        conversation_id="",
+        raw_error=last_error,
+        upstream_error=last_error,
+    )
+    pool_error.image_attempts = list(attempts)
+    return pool_error
+
+
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
-    """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
+    """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。
+
+    整个请求共享一个截止时间（request.deadline_monotonic）：排队等号、等出口并发、
+    断流恢复轮询都受它约束；串行模式下某一张失败不会中止后续，有成功就返回成功的。
+    """
     if not is_supported_image_model(request.model):
         _monitor_image_stage(
             request,
@@ -2416,9 +2999,17 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         )
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
 
+    if request.deadline_monotonic <= 0:
+        request.deadline_monotonic = time.monotonic() + max(0.001, float(config.image_request_timeout_secs))
+
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）
-        outputs = _generate_single_image(request, 1, 1)
+        outputs = _generate_single_image(replace(request), 1, 1)
+        if not outputs:
+            raise ImageGenerationError(
+                "image generation completed without output",
+                failure=image_failure("no_image_generated"),
+            )
         for output in outputs:
             yield output
         return
@@ -2430,10 +3021,50 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
             "n": request.n,
             "model": request.model,
         })
+        serial_errors: dict[int, Exception] = {}
+        serial_failed_attempts: list[dict[str, Any]] = []
+        serial_succeeded = False
         for index in range(1, request.n + 1):
-            outputs = _generate_single_image(request, index, request.n)
+            try:
+                outputs = _generate_single_image(replace(request), index, request.n)
+            except Exception as exc:
+                serial_errors[index] = exc
+                serial_failed_attempts.extend(getattr(exc, "image_attempts", None) or [])
+                logger.warning({
+                    "event": "image_serial_generation_error",
+                    "index": index,
+                    "error": str(exc)[:300],
+                })
+                if isinstance(exc, RequestCancelledError) or getattr(exc, "code", "") == "request_cancelled":
+                    break
+                if time.monotonic() >= request.deadline_monotonic:
+                    break
+                continue
+            if serial_failed_attempts and outputs:
+                outputs[-1].image_attempts = [*outputs[-1].image_attempts, *serial_failed_attempts]
+                serial_failed_attempts = []
+            if any(output.kind == "result" and output.data for output in outputs):
+                serial_succeeded = True
             for output in outputs:
                 yield output
+        if serial_succeeded:
+            for index, exc in serial_errors.items():
+                logger.warning({
+                    "event": "image_serial_partial_failure",
+                    "failed_index": index,
+                    "error": str(exc)[:200],
+                })
+            if serial_failed_attempts:
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=request.n,
+                    total=request.n,
+                    image_attempts=list(serial_failed_attempts),
+                )
+            return
+        if serial_errors:
+            raise _pool_failure_error(serial_errors, "", serial_failed_attempts)
         return
 
     logger.info({
@@ -2442,40 +3073,84 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         "model": request.model,
     })
     # 每张图片一个线程，同时启动
-    futures = {}
-    results: dict[int, list[ImageOutput]] = {}
+    futures: dict[Any, int] = {}
     errors: dict[int, Exception] = {}
-    with ThreadPoolExecutor(max_workers=request.n) as executor:
+    processed_futures: set[Any] = set()
+    emitted = False
+    last_error = ""
+    failed_slot_attempts: list[dict[str, Any]] = []
+    executor = ThreadPoolExecutor(max_workers=request.n)
+
+    def consume_future(future: Any) -> list[ImageOutput]:
+        nonlocal emitted, last_error, failed_slot_attempts
+        index = futures[future]
+        processed_futures.add(future)
+        try:
+            outputs = future.result()
+        except Exception as exc:
+            errors[index] = exc
+            failed_slot_attempts.extend(getattr(exc, "image_attempts", None) or [])
+            last_error = str(exc)
+            logger.warning({
+                "event": "image_parallel_generation_error",
+                "index": index,
+                "error": last_error[:300],
+            })
+            if not emitted:
+                logger.warning({
+                    "event": "image_parallel_failure_before_success",
+                    "failed_index": index,
+                    "error": last_error[:200],
+                })
+            return []
+        if failed_slot_attempts and outputs:
+            # 先失败的槽位尝试记录挂到后面成功的输出上，日志层才能看到完整时间线。
+            outputs[-1].image_attempts = [*outputs[-1].image_attempts, *failed_slot_attempts]
+            failed_slot_attempts = []
+        if outputs:
+            emitted = True
+        return outputs
+
+    try:
         for index in range(1, request.n + 1):
-            future = executor.submit(_generate_single_image, request, index, request.n)
-            futures[future] = index
+            futures[executor.submit(_generate_single_image, replace(request), index, request.n)] = index
 
         # yield 结果：按完成顺序立即输出，不再等所有图片都结束后才返回成功结果。
-        emitted = False
-        last_error = ""
-
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                outputs = future.result()
-                results[index] = outputs
-                for output in outputs:
-                    emitted = True
+        try:
+            remaining = max(0.0, request.deadline_monotonic - time.monotonic())
+            for future in as_completed(futures, timeout=remaining):
+                for output in consume_future(future):
                     yield output
-            except Exception as exc:
-                errors[index] = exc
-                last_error = str(exc)
-                logger.warning({
-                    "event": "image_parallel_generation_error",
-                    "index": index,
-                    "error": last_error[:300],
-                })
-                if not emitted:
-                    logger.warning({
-                        "event": "image_parallel_failure_before_success",
-                        "failed_index": index,
-                        "error": last_error[:200],
-                    })
+        except FuturesTimeoutError:
+            pending = [future for future in futures if future not in processed_futures]
+            done, _ = wait(pending, timeout=0.05)
+            for future in done:
+                for output in consume_future(future):
+                    yield output
+            for future in pending:
+                if future in processed_futures:
+                    continue
+                future.cancel()
+                errors[futures[future]] = ImageGenerationError(
+                    f"image slot {futures[future]} exceeded the request deadline",
+                    failure=image_failure("task_interrupted"),
+                )
+    finally:
+        for future in futures:
+            if not future.done():
+                future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    # 所有成功输出都已产出之后才失败的槽位：其尝试记录没有后续输出可挂，
+    # 用一个不带文本的尾部输出带给日志层（对客户端不可见）。
+    if emitted and failed_slot_attempts:
+        yield ImageOutput(
+            kind="progress",
+            model=request.model,
+            index=request.n,
+            total=request.n,
+            image_attempts=list(failed_slot_attempts),
+        )
 
     # 如果有失败但也有成功，记录警告
     if emitted:
@@ -2486,16 +3161,9 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                     "failed_index": index,
                     "error": str(errors[index])[:200],
                 })
+        return
 
-    if not emitted:
-        if not last_error:
-            last_error = "no account in the pool could generate images — check account quota and rate-limit status"
-        raise ImageGenerationError(
-            image_stream_error_message(last_error),
-            conversation_id="",
-            raw_error=last_error,
-            upstream_error=last_error,
-        )
+    raise _pool_failure_error(errors, last_error, failed_slot_attempts)
 
 
 def _image_stream_payload(output: ImageOutput, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2504,6 +3172,8 @@ def _image_stream_payload(output: ImageOutput, event_type: str, payload: dict[st
         item["_account_email"] = output.account_email
     if output.conversation_id:
         item["_conversation_id"] = output.conversation_id
+    if output.image_attempts:
+        item["_image_attempts"] = list(output.image_attempts)
     return item
 
 
@@ -2514,32 +3184,61 @@ def stream_image_chunks(
     partial_images: object = 0,
 ) -> Iterator[dict[str, Any]]:
     prefix = str(event_prefix or "image_generation").strip() or "image_generation"
+    emitted = False
+    last_output: ImageOutput | None = None
     # ChatGPT Web only gives us final image bytes here. Emitting those bytes as a
     # synthetic partial_image makes some clients display the same image twice.
     for output in outputs:
+        last_output = output
         if output.kind == "result":
             for item_index, item in enumerate(output.data):
                 if not isinstance(item, dict):
                     continue
                 b64_json = str(item.get("b64_json") or "").strip()
-                if not b64_json:
+                image_url = str(item.get("url") or "").strip()
+                if not b64_json and not image_url:
                     continue
-                completed: dict[str, Any] = {"b64_json": b64_json}
+                completed: dict[str, Any] = {}
+                if b64_json:
+                    completed["b64_json"] = b64_json
+                if image_url:
+                    completed["url"] = image_url
                 if usage_builder:
                     usage = usage_builder([item])
                     if usage:
                         completed["usage"] = usage
                 completed_payload = _image_stream_payload(output, f"{prefix}.completed", completed)
-                image_url = str(item.get("url") or "").strip()
                 if image_url:
                     completed_payload["_image_urls"] = [image_url]
+                if item.get("width") and item.get("height"):
+                    completed_payload["_image_result"] = {"width": item["width"], "height": item["height"]}
+                emitted = True
                 yield completed_payload
         elif output.kind == "message" and output.text:
+            emitted = True
             yield _image_stream_payload(
                 output,
                 f"{prefix}.failed",
-                {"error": {"message": output.text, "type": "image_generation_error"}},
+                {"error": {
+                    "message": output.text,
+                    "type": "image_generation_error",
+                    "code": classify_image_message_text(output.text).code,
+                }},
             )
+        elif output.kind == "progress" and not output.text and output.image_attempts:
+            # 仅供日志层收集尝试记录，LoggedCall 不会把它转发给客户端。
+            yield {"_log_only": True, "_image_attempts": list(output.image_attempts)}
+    if not emitted:
+        # 一张图都没发出去时必须明确失败，否则客户端收到空流、日志却记成功。
+        failed = {"error": {
+            "message": "image generation returned no image",
+            "type": "image_generation_error",
+            "code": "no_image_generated",
+        }}
+        if last_output is not None:
+            yield _image_stream_payload(last_output, f"{prefix}.failed", failed)
+        else:
+            yield {"type": f"{prefix}.failed", **failed}
 
 
 def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
@@ -2548,10 +3247,13 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
     message = ""
     progress_parts: list[str] = []
     account_email = ""
+    attempts: list[dict[str, Any]] = []
     for output in outputs:
         created = created or output.created
         if output.account_email and not account_email:
             account_email = output.account_email
+        if output.image_attempts:
+            attempts.extend(item for item in output.image_attempts if item not in attempts)
         if output.kind == "progress" and output.text:
             progress_parts.append(output.text)
         elif output.kind == "message":
@@ -2566,4 +3268,6 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
             result["message"] = text
     if account_email:
         result["_account_email"] = account_email
+    if attempts:
+        result["_image_attempts"] = attempts
     return result

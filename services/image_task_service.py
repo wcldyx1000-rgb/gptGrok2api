@@ -8,10 +8,19 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from services.bounded_task_runner import BoundedTaskRunner, env_int
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
+from services.genbox_push_service import auto_push_gallery_urls
 from services.json_file import read_json_file, write_json_file
-from services.log_service import LOG_TYPE_CALL, log_service
+from services.log_service import (
+    LOG_TYPE_CALL,
+    collect_image_attempts,
+    image_request_meta,
+    image_result_summary,
+    log_service,
+)
+from services.call_outcome import apply_outcome_fields
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from services.realtime_monitor_service import realtime_monitor_service
 from services.register.grok_account_store import grok_account_store
@@ -103,6 +112,11 @@ def _task_key(owner_id: str, task_id: str) -> str:
     return f"{owner_id}:{task_id}"
 
 
+def _attempts_extra(value: object) -> dict[str, Any]:
+    attempts = collect_image_attempts(value)
+    return {"image_attempts": attempts} if attempts else {}
+
+
 def _collect_image_urls(data: list[Any]) -> list[str]:
     urls: list[str] = []
     for item in data:
@@ -125,7 +139,8 @@ def _is_grok_image_task(model: str) -> bool:
 
 
 def _grok_task_timeout_secs() -> float:
-    return float(max(config.image_stream_timeout_secs, config.image_poll_timeout_secs) + 60)
+    # 流超时 + 轮询超时 + 30 秒余量；与 ChatGPT 生图路径使用同一个总上限。
+    return float(config.image_request_timeout_secs)
 
 
 def _run_grok_generation(payload: dict[str, Any], trace: dict[str, Any]) -> dict[str, Any]:
@@ -183,6 +198,20 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+class ImageTaskQueueFullError(RuntimeError):
+    """后台图片任务的排队容量已满（API 返回 503 + code image_task_queue_full）。"""
+
+    code = "image_task_queue_full"
+
+    def __init__(self, message: str = "图片任务队列已满，请稍后再试") -> None:
+        super().__init__(message)
+
+
+# 未带 ids 查询时一次最多返回的任务数（按更新时间倒序），避免任务累积后响应无限增大。
+LIST_TASKS_DEFAULT_LIMIT = 100
+LIST_TASKS_MAX_LIMIT = 500
+
+
 class ImageTaskService:
     def __init__(
         self,
@@ -192,14 +221,21 @@ class ImageTaskService:
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         grok_generation_handler: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] = _run_grok_generation,
         grok_edit_handler: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] = _run_grok_edit,
-        retention_days_getter: Callable[[], int] | None = None,
+        retention_hours_getter: Callable[[], int] | None = None,
+        task_runner: BoundedTaskRunner | None = None,
     ):
         self.path = path
+        # 有界并发 + 有界排队，避免突发请求为每个任务各开一个线程。
+        self.task_runner = task_runner or BoundedTaskRunner(
+            name="image-task",
+            max_workers=env_int("CHATGPT2API_IMAGE_TASK_WORKERS", 32),
+            queue_size=env_int("CHATGPT2API_IMAGE_TASK_QUEUE_SIZE", 512),
+        )
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.grok_generation_handler = grok_generation_handler
         self.grok_edit_handler = grok_edit_handler
-        self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
+        self.retention_hours_getter = retention_hours_getter or (lambda: config.image_retention_hours)
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -246,6 +282,7 @@ class ImageTaskService:
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
+        reservation: Any = None,
     ) -> dict[str, Any]:
         selected_model = _clean(model, "gpt-image-2")
         spec = _grok_model_spec(selected_model)
@@ -264,11 +301,34 @@ class ImageTaskService:
             "response_format": "url",
             "base_url": base_url,
         }
-        return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
+        return self._submit(
+            identity, client_task_id=client_task_id, mode="edit", payload=payload, reservation=reservation
+        )
 
-    def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
+    def reserve_submission(self):
+        """先预占队列名额（再读取上传图片、再提交）；失败/取消必须 rollback() 释放。
+
+        Ported from yukkcat/chatgpt2api (AGPL-3.0-only): reserve_submission.
+        """
+        reservation = self.task_runner.reserve()
+        if reservation is not None and self._over_queue_limit(reserved_included=True):
+            reservation.rollback()
+            reservation = None
+        if reservation is None:
+            raise ImageTaskQueueFullError()
+        return reservation
+
+    def list_tasks(
+        self,
+        identity: dict[str, object],
+        task_ids: list[str],
+        *,
+        limit: int = LIST_TASKS_DEFAULT_LIMIT,
+    ) -> dict[str, Any]:
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
+        limit = max(1, min(int(limit or LIST_TASKS_DEFAULT_LIMIT), LIST_TASKS_MAX_LIMIT))
+        has_more = False
         with self._lock:
             if self._cleanup_locked():
                 self._save_locked()
@@ -287,8 +347,10 @@ class ImageTaskService:
                     if task.get("owner_id") == owner
                 ]
                 items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+                has_more = len(items) > limit
+                items = items[:limit]
                 missing_ids = []
-            return {"items": items, "missing_ids": missing_ids}
+            return {"items": items, "missing_ids": missing_ids, "has_more": has_more}
 
     def _submit(
         self,
@@ -297,21 +359,39 @@ class ImageTaskService:
         client_task_id: str,
         mode: str,
         payload: dict[str, Any],
+        reservation: Any = None,
     ) -> dict[str, Any]:
         task_id = _clean(client_task_id)
         if not task_id:
+            if reservation is not None:
+                reservation.rollback()
             raise ValueError("client_task_id is required")
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
         now = _now_iso()
         should_start = False
         with self._lock:
-            cleaned = self._cleanup_locked()
-            task = self._tasks.get(key)
-            if task is not None:
-                if cleaned:
-                    self._save_locked()
-                return _public_task(task)
+            try:
+                cleaned = self._cleanup_locked()
+                task = self._tasks.get(key)
+                if task is not None:
+                    # 幂等重复提交：已有任务直接返回，释放预占名额。
+                    if reservation is not None:
+                        reservation.rollback()
+                    if cleaned:
+                        self._save_locked()
+                    return _public_task(task)
+                if reservation is None:
+                    try:
+                        reservation = self.reserve_submission()
+                    except ImageTaskQueueFullError:
+                        if cleaned:
+                            self._save_locked()
+                        raise
+            except BaseException:
+                if reservation is not None:
+                    reservation.rollback()
+                raise
             task = {
                 "id": task_id,
                 "owner_id": owner,
@@ -326,18 +406,52 @@ class ImageTaskService:
                 "created_ts": time.time(),
             }
             self._tasks[key] = task
-            self._save_locked()
+            try:
+                self._save_locked()
+            except BaseException:
+                self._tasks.pop(key, None)
+                reservation.rollback()
+                raise
             should_start = True
 
-        if should_start:
-            thread = threading.Thread(
-                target=self._run_task,
-                args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
-                name=f"image-task-{task_id[:16]}",
-                daemon=True,
+        if should_start and reservation is not None:
+            committed = reservation.commit(
+                self._run_task,
+                key,
+                mode,
+                payload,
+                dict(identity),
+                _clean(payload.get("model"), "gpt-image-2"),
+                on_cancel=lambda exc: self._fail_unstarted_task(key, exc),
             )
-            thread.start()
+            if not committed:
+                self._fail_unstarted_task(key, RuntimeError("图片任务队列已关闭"))
         return _public_task(task)
+
+    def _over_queue_limit(self, *, reserved_included: bool = False) -> bool:
+        """image_queue_limit > 0 时限制在途任务数（排队 + 运行）；0 表示只受队列容量约束。
+
+        reserved_included=True 表示 accepted 已包含刚预占的名额，因此用 > 比较。
+        """
+        limit = int(config.image_queue_limit or 0)
+        if limit <= 0:
+            return False
+        accepted = int(self.task_runner.status().get("accepted") or 0)
+        return accepted > limit if reserved_included else accepted >= limit
+
+    def _fail_unstarted_task(self, key: str, exc: BaseException) -> None:
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None or task.get("status") != TASK_STATUS_QUEUED:
+                return
+        self._update_task(key, status=TASK_STATUS_ERROR, error=str(exc) or "图片任务未能启动")
+
+    def shutdown(self) -> None:
+        self.task_runner.shutdown(wait=False)
+
+    def shutdown_cancel_pending_and_wait(self) -> None:
+        """优雅停机：取消尚未开始的任务（标记为失败），并等待运行中的任务收尾。"""
+        self.task_runner.shutdown_cancel_pending_and_wait()
 
     def _run_task(
         self,
@@ -431,6 +545,12 @@ class ImageTaskService:
                 duration_ms=duration_ms,
                 **_clear_task_details(),
             )
+            # 默认关闭；仅在启用 GenBox 推送且勾选“Studio 生成后自动推送”时才会入队，失败不影响任务结果。
+            auto_push_gallery_urls(
+                _collect_image_urls(data),
+                metadata={"prompt": payload.get("prompt"), "model": model},
+                base_url=_clean(payload.get("base_url")),
+            )
             self._log_call(
                 identity,
                 mode,
@@ -442,7 +562,8 @@ class ImageTaskService:
                 account_email=account_email,
                 call_id=call_id,
                 perf=perf_timings,
-                extra=grok_log_extra,
+                extra={**grok_log_extra, **image_result_summary(result), **_attempts_extra(result)},
+                request_meta=image_request_meta(payload),
             )
         except Exception as exc:
             perf_timings["handler_exec_ms"] = int((time.perf_counter() - handler_started) * 1000)
@@ -477,7 +598,8 @@ class ImageTaskService:
                 conversation_id=conversation_id,
                 call_id=call_id,
                 perf=perf_timings,
-                extra={**grok_log_extra, **error_details},
+                extra={**grok_log_extra, **error_details, **_attempts_extra(exc)},
+                request_meta=image_request_meta(payload),
             )
 
     def _apply_grok_trace(
@@ -568,6 +690,7 @@ class ImageTaskService:
         call_id: str = "",
         perf: dict[str, int] | None = None,
         extra: dict[str, Any] | None = None,
+        request_meta: dict[str, Any] | None = None,
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -587,6 +710,8 @@ class ImageTaskService:
             detail["perf"] = dict(perf)
         if request_preview:
             detail["request_text"] = request_preview
+        if request_meta:
+            detail["request_meta"] = dict(request_meta)
         if error:
             detail["error"] = error
         if extra:
@@ -601,6 +726,7 @@ class ImageTaskService:
         if urls:
             detail["urls"] = list(dict.fromkeys(urls))
         try:
+            apply_outcome_fields(detail)
             if call_id:
                 realtime_monitor_service.finish(detail)
             log_service.add(LOG_TYPE_CALL, f"{summary_prefix}{suffix}", detail)
@@ -687,10 +813,10 @@ class ImageTaskService:
 
     def _cleanup_locked(self) -> bool:
         try:
-            retention_days = max(1, int(self.retention_days_getter()))
+            retention_hours = max(1, int(self.retention_hours_getter()))
         except Exception:
-            retention_days = 30
-        cutoff = time.time() - retention_days * 86400
+            retention_hours = 24
+        cutoff = time.time() - retention_hours * 3600
         removed_keys = [
             key
             for key, task in self._tasks.items()
@@ -723,17 +849,25 @@ class ImageTaskService:
                 raise ValueError("task has no conversation_id")
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
+            reservation = self.task_runner.reserve()
+            if reservation is None:
+                raise ImageTaskQueueFullError("图片任务队列已满，请稍后再试")
             # 将任务状态重置为 running
             self._update_task(key, status=TASK_STATUS_RUNNING, error="", **_clear_task_details())
 
-        # 启动新线程继续轮询
-        thread = threading.Thread(
-            target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
-            name=f"image-resume-{_clean(task_id)[:16]}",
-            daemon=True,
+        # 交给有界任务队列继续轮询
+        committed = reservation.commit(
+            self._run_resume_poll,
+            key,
+            conversation_id,
+            extra_timeout_secs,
+            dict(identity),
+            mode,
+            model,
+            on_cancel=lambda exc: self._update_task(key, status=TASK_STATUS_ERROR, error=str(exc)),
         )
-        thread.start()
+        if not committed:
+            self._update_task(key, status=TASK_STATUS_ERROR, error="图片任务队列已关闭")
         return _public_task(task)
 
     def _run_resume_poll(

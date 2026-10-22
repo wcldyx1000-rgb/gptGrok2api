@@ -99,6 +99,104 @@ function createElement(tagName) {
   };
 }
 
+function formatBrowserDate(date, offsetMin, longName) {
+  // Chrome's Date#toString: `Wed Oct 21 2026 08:02:54 GMT+0800 (China Standard Time)`.
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const local = new Date(date.getTime() - offsetMin * 60000);
+  const pad = (value) => String(value).padStart(2, '0');
+  const total = -offsetMin;
+  const sign = total >= 0 ? '+' : '-';
+  const hours = Math.floor(Math.abs(total) / 60);
+  const minutes = Math.abs(total) % 60;
+  const zone = longName || `GMT${sign}${pad(hours)}:${pad(minutes)}`;
+  return `${days[local.getUTCDay()]} ${months[local.getUTCMonth()]} ${pad(local.getUTCDate())} ${local.getUTCFullYear()} `
+    + `${pad(local.getUTCHours())}:${pad(local.getUTCMinutes())}:${pad(local.getUTCSeconds())} `
+    + `GMT${sign}${pad(hours)}${pad(minutes)} (${zone})`;
+}
+
+function installDateLocale(payload) {
+  if (payload.timezone_offset_min === undefined || payload.timezone_offset_min === null) return;
+  const offsetMin = Number(payload.timezone_offset_min) || 0;
+  const longName = String(payload.timezone_long_name || '');
+  Object.defineProperty(Date.prototype, 'toString', {
+    configurable: true,
+    writable: true,
+    value: function toString() {
+      return formatBrowserDate(this, offsetMin, longName);
+    },
+  });
+  Object.defineProperty(Date.prototype, 'getTimezoneOffset', {
+    configurable: true,
+    writable: true,
+    value: function getTimezoneOffset() {
+      return offsetMin;
+    },
+  });
+}
+
+function createNavigator(payload) {
+  // Sentinel reads Object.keys(Object.getPrototypeOf(navigator)), so the probes
+  // must live on an enumerable prototype the way they do in Chrome.
+  const proto = {};
+  const probes = Array.isArray(payload.navigator_probes) ? payload.navigator_probes : [];
+  for (const probe of probes) {
+    if (!Array.isArray(probe) || probe.length < 2) continue;
+    const name = String(probe[0]);
+    const text = String(probe[1]);
+    Object.defineProperty(proto, name, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        if (text === 'true' || text === 'false') return text === 'true';
+        if (text === 'null') return null;
+        return { toString: () => text };
+      },
+    });
+  }
+  const userAgent = String(payload.user_agent || 'Mozilla/5.0');
+  const own = {
+    userAgent,
+    appCodeName: 'Mozilla',
+    appName: 'Netscape',
+    product: 'Gecko',
+    productSub: '20030107',
+    language: String(payload.language || 'pt-BR'),
+    languages: Array.isArray(payload.languages) ? payload.languages : ['pt-BR', 'pt'],
+    hardwareConcurrency: Number(payload.hardware_concurrency || 12),
+    platform: /Macintosh|Mac OS X/i.test(userAgent) ? 'MacIntel' : 'Win32',
+    vendor: 'Google Inc.',
+    webdriver: false,
+  };
+  if (!probes.length) return own;
+  for (const name of ['userAgent', 'language', 'languages', 'hardwareConcurrency', 'platform', 'vendor', 'webdriver']) {
+    Object.defineProperty(proto, name, { configurable: true, enumerable: true, get: () => own[name] });
+  }
+  return Object.create(proto);
+}
+
+function exposeOnlyKeys(target, keys) {
+  // Object.keys(window/document) must look like a Chrome page, not like Node
+  // or this stub: hide every own enumerable key, then expose the given ones.
+  if (!Array.isArray(keys) || !keys.length) return;
+  for (const key of Object.keys(target)) {
+    try {
+      Object.defineProperty(target, key, { enumerable: false });
+    } catch {}
+  }
+  for (const key of keys) {
+    const name = String(key);
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(target, name);
+      if (descriptor) {
+        Object.defineProperty(target, name, { ...descriptor, enumerable: true });
+      } else {
+        Object.defineProperty(target, name, { configurable: true, enumerable: true, writable: true, value: {} });
+      }
+    } catch {}
+  }
+}
+
 function installRuntime(payload) {
   const screen = {
     width: Number(payload.screen_width || 1366),
@@ -108,16 +206,22 @@ function installRuntime(payload) {
     colorDepth: 24,
     pixelDepth: 24,
   };
+  installDateLocale(payload);
   const scripts = [];
   const documentElement = createElement('html');
   documentElement.clientWidth = screen.width;
   documentElement.clientHeight = screen.height;
+  const dataBuild = payload.data_build ? String(payload.data_build) : null;
+  documentElement.getAttribute = (name) => (String(name) === 'data-build' ? dataBuild : null);
+  const pageUrl = String(payload.page_url || payload.frame_url || 'https://chatgpt.com/backend-api/sentinel/frame.html');
   const document = {
     readyState: 'complete',
     hidden: false,
     visibilityState: 'visible',
-    referrer: String(payload.checkout_url || 'https://chatgpt.com/checkout/'),
-    URL: String(payload.frame_url || 'https://chatgpt.com/backend-api/sentinel/frame.html'),
+    referrer: String(
+      payload.referrer !== undefined ? payload.referrer : payload.checkout_url || 'https://chatgpt.com/checkout/',
+    ),
+    URL: pageUrl,
     cookie: `oai-did=${encodeURIComponent(payload.device_id || '')}`,
     scripts,
     currentScript: {
@@ -155,12 +259,25 @@ function installRuntime(payload) {
       return true;
     },
   };
+  // A chat page lists its own <script> tags (plus the injected loader/SDK);
+  // the bare frame only has the SDK itself.
+  const pageScripts = Array.isArray(payload.page_scripts) ? payload.page_scripts : [];
+  for (const src of pageScripts) {
+    if (src && src !== document.currentScript.src) scripts.push({ src: String(src), getAttribute() { return null; } });
+  }
   scripts.push(document.currentScript);
 
+  // performance.now() advances in real time from a page load a few seconds ago,
+  // so elapsed-time fields (e.g. the PoW solve time) are realistic.
+  const startedAt = Date.now();
+  const hrStart = process.hrtime.bigint();
+  const timeOrigin = payload.time_origin
+    ? Number(payload.time_origin)
+    : startedAt - Number(payload.performance_now || 1500 + Math.random() * 6500);
   const performance = {
-    now: () => Number(payload.performance_now || 12345.67),
-    timeOrigin: Number(payload.time_origin || 1710000000000),
-    memory: { jsHeapSizeLimit: Number(payload.js_heap_size_limit || 4294967296) },
+    now: () => startedAt - timeOrigin + Number(process.hrtime.bigint() - hrStart) / 1e6,
+    timeOrigin,
+    memory: { jsHeapSizeLimit: Number(payload.js_heap_size_limit || 4294705152) },
   };
 
   class TextEncoderPolyfill {
@@ -226,32 +343,19 @@ function installRuntime(payload) {
   globalThis.top = globalThis;
   globalThis.parent = globalThis;
   globalThis.document = document;
-  const navigatorValue = {
-    userAgent: String(payload.user_agent || 'Mozilla/5.0'),
-    appCodeName: 'Mozilla',
-    appName: 'Netscape',
-    product: 'Gecko',
-    productSub: '20030107',
-    language: String(payload.language || 'pt-BR'),
-    languages: Array.isArray(payload.languages) ? payload.languages : ['pt-BR', 'pt'],
-    hardwareConcurrency: Number(payload.hardware_concurrency || 12),
-    platform: /Macintosh|Mac OS X/i.test(String(payload.user_agent || '')) ? 'MacIntel' : 'Win32',
-    vendor: 'Google Inc.',
-    webdriver: false,
-  };
   Object.defineProperty(globalThis, 'navigator', {
     configurable: true,
     enumerable: true,
-    value: navigatorValue,
+    value: createNavigator(payload),
   });
+  const pageMatch = pageUrl.match(/^(https?:\/\/[^/?#]+)([^?#]*)(\?[^#]*)?/i);
   globalThis.location = {
-    href: String(payload.frame_url || 'https://chatgpt.com/backend-api/sentinel/frame.html'),
-    origin: 'https://chatgpt.com',
-    pathname: '/backend-api/sentinel/frame.html',
-    search: String(payload.frame_url || '').includes('?')
-      ? `?${String(payload.frame_url).split('?').slice(1).join('?')}`
-      : '',
+    href: pageUrl,
+    origin: pageMatch ? pageMatch[1] : 'https://chatgpt.com',
+    pathname: pageMatch && pageMatch[2] ? pageMatch[2] : '/',
+    search: pageMatch && pageMatch[3] ? pageMatch[3] : '',
   };
+  document.location = globalThis.location;
   globalThis.screen = screen;
   globalThis.performance = performance;
   globalThis.localStorage = createStorage();
@@ -305,9 +409,15 @@ function installRuntime(payload) {
   globalThis.CSS = globalThis.CSS || { supports() { return true; } };
   globalThis.indexedDB = globalThis.indexedDB || { open() { return { onerror: null, onsuccess: null, onupgradeneeded: null, result: {}, error: null }; }, deleteDatabase() { return {}; } };
   globalThis.fetch = async () => { throw new Error('fetch should not be called'); };
+  const nativeRandomUUID = globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
+    ? globalThis.crypto.randomUUID.bind(globalThis.crypto)
+    : undefined;
+  // The SDK's first UUID is its page-session sid; reuse the caller's sid so the
+  // requirements and proof tokens of one page share it, as in a real tab.
+  const presetUUIDs = payload.sid ? [String(payload.sid)] : [];
   const cryptoValue = {
-    randomUUID: globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
-      ? globalThis.crypto.randomUUID.bind(globalThis.crypto)
+    randomUUID: nativeRandomUUID
+      ? () => (presetUUIDs.length ? presetUUIDs.shift() : nativeRandomUUID())
       : undefined,
     getRandomValues(array) {
       for (let index = 0; index < array.length; index += 1) array[index] = Math.floor(Math.random() * 256);
@@ -329,14 +439,29 @@ function loadPatchedSdk(source) {
     /var ([A-Za-z_$][\w$]*)=new _;/,
     (match, name) => `${match}globalThis.__debugP=${name};`,
   );
+  // Newer SDK builds rename the instance class (e.g. `var E=new O;`); collect
+  // every top-level `var x=new Y;` and pick the one exposing the token API.
+  sdk = sdk.replace(
+    /var ([A-Za-z_$][\w$]*)=new ([A-Za-z_$][\w$]*);/g,
+    (match, name) => `${match}(globalThis.__sentinelCandidates=globalThis.__sentinelCandidates||[]).push(${name});`,
+  );
   sdk = sdk.replace(EXPOSE_PATCH, EXPOSE_REPLACEMENT);
   sdk = sdk.replace(CURRENT_EXPOSE_PATCH, CURRENT_EXPOSE_REPLACEMENT);
   eval(sdk);
+  if (!globalThis.__debugP || typeof globalThis.__debugP.getRequirementsToken !== 'function') {
+    const candidates = globalThis.__sentinelCandidates || [];
+    globalThis.__debugP = candidates.find(
+      (item) => item && typeof item.getRequirementsToken === 'function' && typeof item.getEnforcementToken === 'function',
+    );
+  }
+  if (!globalThis.__debugP) throw new Error('sentinel_sdk_instance_not_found');
 }
 
 async function run(payload, sdkSource) {
   installRuntime(payload);
   loadPatchedSdk(sdkSource);
+  exposeOnlyKeys(globalThis.document, payload.document_keys);
+  exposeOnlyKeys(globalThis, payload.window_keys);
   if (payload.action === 'requirements') {
     return { request_p: await globalThis.__debugP.getRequirementsToken() };
   }
@@ -347,11 +472,14 @@ async function run(payload, sdkSource) {
     const finalProof = await globalThis.__debugP.getEnforcementToken(challenge);
     const dx = challenge.turnstile ? challenge.turnstile.dx : null;
     let turnstile = null;
-    if (dx) {
-      if (typeof globalThis.SentinelSDK.__debug_bindProof === 'function') {
-        globalThis.SentinelSDK.__debug_bindProof(challenge, requestProof);
+    // Builds whose Turnstile solver cannot be exposed return t=null and the
+    // Python side falls back to the protocol solver.
+    const sdkGlobal = globalThis.SentinelSDK || {};
+    if (dx && typeof sdkGlobal.__debug_n === 'function') {
+      if (typeof sdkGlobal.__debug_bindProof === 'function') {
+        sdkGlobal.__debug_bindProof(challenge, requestProof);
       }
-      turnstile = await globalThis.SentinelSDK.__debug_n(challenge, dx);
+      turnstile = await sdkGlobal.__debug_n(challenge, dx);
     }
     return { final_p: finalProof, t: turnstile };
   }

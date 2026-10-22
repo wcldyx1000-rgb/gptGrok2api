@@ -4,17 +4,24 @@ import time
 from typing import Annotated, Literal
 
 import orjson
-from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api import grok
+from services.image_count import parse_image_count
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from app.platform.request_context import reset_grok_log_trace, set_grok_log_trace
 from services.content_filter import check_request, request_shape, request_text
-from services.editable_file_task_service import editable_file_task_service
+from services.editable_file_task_service import (
+    EditableFileTaskCleanupError,
+    EditableFileTaskInvalidIdError,
+    EditableFileTaskNotFoundError,
+    EditableFileTaskNotTerminalError,
+    editable_file_task_service,
+)
 from services.log_service import LoggedCall
 from services.realtime_monitor_service import realtime_monitor_service
 from services.register.grok_account_store import grok_account_store
@@ -33,7 +40,7 @@ from utils.helper import is_image_chat_request
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     model: str = "gpt-image-2"
-    n: int = Field(default=1, ge=1, le=10)
+    n: object = 1
     size: str | None = None
     quality: str = "auto"
     response_format: str = "url"
@@ -384,6 +391,12 @@ async def _run_logged_grok_dispatch(call: LoggedCall, dispatch):
 def create_router() -> APIRouter:
     router = APIRouter()
 
+    async def submit_editable_file_task(submit, identity, **kwargs):
+        try:
+            return await run_in_threadpool(submit, identity, **kwargs)
+        except EditableFileTaskInvalidIdError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
     @router.get("/v1/models")
     async def list_models(authorization: str | None = Header(default=None)):
         require_identity(authorization)
@@ -476,6 +489,8 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        # Grok 图片模型沿用其 1..10 的上限；ChatGPT 图片模型 n 限制为 1..4（400 + invalid_n / n_too_large）。
+        payload["n"] = parse_image_count(payload.get("n"), maximum=10 if grok.is_grok_model(body.model) else 4)
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         attach_trace_headers(call, request)
@@ -526,7 +541,8 @@ def create_router() -> APIRouter:
         call.attach_trace_metadata(payload)
         await filter_or_log(call, prompt)
         payload["images"] = await read_image_sources(image_sources)
-        payload["mask"] = await read_image_sources(mask_sources)
+        if mask_sources:
+            payload["mask"] = await read_image_sources(mask_sources)
         payload["base_url"] = resolve_image_base_url(request)
         if grok_edit:
             call.summary = f"Grok {call.summary}"
@@ -567,6 +583,9 @@ def create_router() -> APIRouter:
     async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        image_tool = openai_v1_response.response_image_tool(payload)
+        if "n" in image_tool:
+            parse_image_count(image_tool.get("n"))
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("input"), payload.get("instructions"))
         call = LoggedCall(
@@ -622,10 +641,24 @@ def create_router() -> APIRouter:
         return await call.run(openai_search.handle, body.model_dump(mode="python"))
 
     @router.get("/v1/editable-file-tasks")
-    async def list_editable_file_tasks(ids: str = "", authorization: str | None = Header(default=None)):
+    async def list_editable_file_tasks(
+        ids: str = "",
+        limit: int = Query(default=0, ge=0, le=100),
+        authorization: str | None = Header(default=None),
+    ):
         identity = require_identity(authorization)
         task_ids = [item.strip() for item in ids.split(",") if item.strip()]
-        return await run_in_threadpool(editable_file_task_service.list_tasks, identity, task_ids)
+        return await run_in_threadpool(editable_file_task_service.list_tasks, identity, task_ids, limit=limit)
+
+    @router.delete("/v1/editable-file-tasks/{task_id}")
+    async def delete_editable_file_task(task_id: str, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        try:
+            return await run_in_threadpool(editable_file_task_service.delete_task, identity, task_id)
+        except EditableFileTaskNotFoundError as exc:
+            raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+        except (EditableFileTaskNotTerminalError, EditableFileTaskCleanupError) as exc:
+            raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
     @router.post("/v1/editable-file-tasks")
     async def create_editable_file_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
@@ -639,7 +672,7 @@ def create_router() -> APIRouter:
             body.prompt,
         )
         submit = editable_file_task_service.submit_psd if kind == "psd" else editable_file_task_service.submit_ppt
-        return await run_in_threadpool(
+        return await submit_editable_file_task(
             submit,
             identity,
             client_task_id=body.client_task_id or "",
@@ -652,7 +685,7 @@ def create_router() -> APIRouter:
     async def download_editable_file(file_path: str):
         try:
             path = await run_in_threadpool(editable_file_task_service.public_file_path, file_path)
-        except Exception as exc:
+        except (FileNotFoundError, OSError, ValueError) as exc:
             raise HTTPException(status_code=404, detail={"error": "file not found"}) from exc
         return FileResponse(path, filename=path.name)
 
@@ -660,7 +693,7 @@ def create_router() -> APIRouter:
     async def create_ppt_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         await filter_or_log(LoggedCall(identity, "/v1/ppt/generations", "gpt-5-5-thinking", "PPT生成任务", request_text=body.prompt), body.prompt)
-        return await run_in_threadpool(
+        return await submit_editable_file_task(
             editable_file_task_service.submit_ppt,
             identity,
             client_task_id=body.client_task_id or "",
@@ -673,7 +706,7 @@ def create_router() -> APIRouter:
     async def create_psd_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         await filter_or_log(LoggedCall(identity, "/v1/psd/generations", "gpt-5-5-thinking", "PSD生成任务", request_text=body.prompt), body.prompt)
-        return await run_in_threadpool(
+        return await submit_editable_file_task(
             editable_file_task_service.submit_psd,
             identity,
             client_task_id=body.client_task_id or "",

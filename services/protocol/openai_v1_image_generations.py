@@ -8,6 +8,7 @@ from services.protocol.conversation import (
     count_text_tokens,
     stream_image_chunks,
     stream_image_outputs_with_pool,
+    stream_response_format,
 )
 from utils.image_tokens import count_image_output_items_tokens, image_usage
 
@@ -27,7 +28,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         n=n,
         size=size,
         quality=quality,
-        response_format=response_format,
+        response_format=stream_response_format(response_format) if body.get("stream") else response_format,
         base_url=base_url,
         message_as_error=True,
         progress_callback=progress_callback,

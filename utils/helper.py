@@ -17,8 +17,16 @@ from curl_cffi.requests.models import STREAM_END
 from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
+from utils.remote_image import fetch_public_image
 
-BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
+# 2.5 系列是兼容名，走 ChatGPT Web 的 auto 路由，不强制特定画图引擎。
+WEB_IMAGE_MODELS = (
+    "gpt-image-2",
+    "gpt-image-2.5",
+    "gpt-image-2.5-flare",
+    "gpt-image-2.5-sunburst",
+)
+BASE_IMAGE_MODELS = {*WEB_IMAGE_MODELS, "codex-gpt-image-2"}
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 PREFIXED_CODEX_IMAGE_MODELS = {
@@ -144,6 +152,7 @@ def is_image_chat_request(body: dict[str, object]) -> bool:
 
 
 _UPSTREAM_BODY_LOG_LIMIT = 500
+UPSTREAM_CREDENTIAL_SCOPES = frozenset({"account", "signed_asset", "public"})
 
 
 class UpstreamHTTPError(RuntimeError):
@@ -161,11 +170,20 @@ class UpstreamHTTPError(RuntimeError):
         status_code: int,
         body: Any,
         retry_after: int | None = None,
+        credential_scope: str = "account",
     ) -> None:
         self.context = context
         self.status_code = status_code
         self.body = body
         self.retry_after = retry_after
+        # account: 请求带的是账号凭据，401/403 可能说明账号失效；
+        # signed_asset: CDN 签名 URL（上传/下载），401/403 只说明链接过期或被拒，与账号无关；
+        # public: 不带凭据的公开页面。
+        self.credential_scope = (
+            credential_scope
+            if credential_scope in UPSTREAM_CREDENTIAL_SCOPES
+            else "account"
+        )
         if isinstance(body, (dict, list)):
             try:
                 body_str = json.dumps(body, ensure_ascii=False)
@@ -178,21 +196,93 @@ class UpstreamHTTPError(RuntimeError):
         super().__init__(f"{context} failed: status={status_code}, body={body_str}")
 
 
-def ensure_ok(response: requests.Response, context: str) -> None:
+_ERROR_BODY_READ_LIMIT = 64 * 1024
+
+
+def read_error_body(response: Any) -> Any:
+    """读取失败响应的正文，能解析成 JSON 就返回 JSON。
+
+    stream=True 的响应 .text 是空的（正文还在流里），需要从 iter_content 读最多
+    _ERROR_BODY_READ_LIMIT 字节，否则上游的结构化错误码（额度、内容策略、挑战页）会丢。
+    """
+    text: Any = ""
+    try:
+        text = response.text or ""
+    except Exception:
+        text = ""
+    if not isinstance(text, (str, bytes)):
+        text = ""
+    if not text and hasattr(response, "iter_content"):
+        chunks: list[bytes] = []
+        size = 0
+        try:
+            for chunk in response.iter_content():
+                if not chunk:
+                    continue
+                data = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8")
+                chunks.append(data)
+                size += len(data)
+                if size >= _ERROR_BODY_READ_LIMIT:
+                    break
+        except Exception:
+            pass
+        text = b"".join(chunks)[:_ERROR_BODY_READ_LIMIT]
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text) if text else text
+    except (TypeError, ValueError):
+        return text
+
+
+def ensure_ok(
+    response: requests.Response,
+    context: str,
+    *,
+    credential_scope: str = "account",
+) -> None:
     if 200 <= response.status_code < 300:
         return
-    body: Any = response.text
-    try:
-        body = response.json()
-    except Exception:
-        pass
+    body = read_error_body(response)
     retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
     retry_after: int | None = None
     if retry_after_header is not None:
         ra_str = str(retry_after_header).strip()
         if ra_str.isdigit():
             retry_after = int(ra_str)
-    raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after)
+    raise UpstreamHTTPError(
+        context,
+        response.status_code,
+        body,
+        retry_after=retry_after,
+        credential_scope=credential_scope,
+    )
+
+
+def stream_error_body(exc: BaseException) -> dict:
+    """流式错误帧：{message,type,param,code}，type/code 是结构化值，绝不是 Python 类名。
+
+    带 to_openai_error 的异常（如 ImageGenerationError）用它自己的投影（已不含账号邮箱）；
+    其余异常按图片失败分类得到 type/code，上游 HTTP 细节不外露。
+    """
+    if hasattr(exc, "to_openai_error"):
+        try:
+            return exc.to_openai_error()
+        except Exception:  # noqa: BLE001 - 投影失败时退回通用分类
+            pass
+    error_type, code, message = "server_error", "upstream_error", str(exc)
+    try:
+        from services.image_failure import classify_image_exception
+
+        failure = classify_image_exception(exc)
+        error_type, code = failure.error_type, failure.code
+    except Exception:  # noqa: BLE001
+        pass
+    if isinstance(exc, UpstreamHTTPError) or any(
+        marker in message.lower() for marker in ("backend-api/", "status=", "body=", "chatgpt.com")
+    ):
+        message = "Upstream request failed. Please try again later."
+    return {"error": {"message": message, "type": error_type, "param": None, "code": code}}
 
 
 def sse_json_stream(items) -> Iterator[str]:
@@ -206,10 +296,7 @@ def sse_json_stream(items) -> Iterator[str]:
             "error_type": exc.__class__.__name__,
             "error": str(exc),
         })
-        error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
-            "error": {"message": str(exc), "type": exc.__class__.__name__}
-        }
-        yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps(stream_error_body(exc), ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
 
 
@@ -225,11 +312,8 @@ def image_sse_stream(items) -> Iterator[str]:
             "error_type": exc.__class__.__name__,
             "error": str(exc),
         })
-        error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
-            "error": {"message": str(exc), "type": exc.__class__.__name__}
-        }
         yield "event: error\n"
-        yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps(stream_error_body(exc), ensure_ascii=False)}\n\n"
 
 
 def anthropic_sse_stream(items) -> Iterator[str]:
@@ -244,7 +328,7 @@ def anthropic_sse_stream(items) -> Iterator[str]:
             "error_type": exc.__class__.__name__,
             "error": str(exc),
         })
-        error = {"type": "error", "error": {"type": exc.__class__.__name__, "message": str(exc)}}
+        error = {"type": "error", "error": {"type": "api_error", "message": str(exc)}}
         yield "event: error\n"
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
@@ -261,7 +345,14 @@ def iter_sse_payloads(
     response: requests.Response,
     max_duration_secs: float | None = None,
     cancel_checker: Callable[[], None] | None = None,
+    stop_at: Callable[[], float | None] | None = None,
 ) -> Iterator[str]:
+    """Yield SSE data payloads.
+
+    ``max_duration_secs`` is a hard limit (raises TimeoutError). ``stop_at`` returns
+    an optional monotonic time after which the stream is closed and iteration ends
+    normally, so callers can hand off to another path without treating it as an error.
+    """
     started_at = time.monotonic()
     timeout_secs = float(max_duration_secs or 0)
     pending: bytes | None = None
@@ -286,6 +377,12 @@ def iter_sse_payloads(
         if remaining is not None and remaining <= 0:
             _abort_stream_nonblocking()
             raise _timeout_error()
+
+    def _soft_stop_reached() -> bool:
+        if stop_at is None:
+            return False
+        deadline = stop_at()
+        return deadline is not None and time.monotonic() >= deadline
 
     def _abort_stream_nonblocking() -> None:
         """Cancel curl_cffi streaming without waiting for its stream task.
@@ -319,6 +416,9 @@ def iter_sse_payloads(
             return
         while True:
             _raise_if_timeout()
+            if _soft_stop_reached():
+                _abort_stream_nonblocking()
+                return
             remaining = _remaining_secs()
             wait_secs = 1.0 if remaining is None else max(0.001, min(1.0, remaining))
             try:
@@ -359,6 +459,9 @@ def iter_sse_payloads(
         threading.Thread(target=_produce, name="sse-response-reader", daemon=True).start()
         while True:
             _raise_if_timeout()
+            if _soft_stop_reached():
+                _abort_stream_nonblocking()
+                return
             remaining = _remaining_secs()
             wait_secs = 1.0 if remaining is None else max(0.001, min(1.0, remaining))
             try:
@@ -507,28 +610,16 @@ def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
 
-    try:
-        response = requests.get(
-            source,
-            headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api vision fetcher"},
-            timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
-            allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = str(response.headers.get("content-length") or "").strip()
-    if content_length.isdigit() and int(content_length) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    image_data = response.content
-    if not image_data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(image_data) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0].lower()
-    guessed_mime = mimetypes.guess_type(parsed.path)[0] or ""
+    remote = fetch_public_image(
+        source,
+        max_bytes=MAX_JSON_IMAGE_BYTES,
+        timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
+        user_agent="chatgpt2api vision fetcher",
+        session_kwargs=proxy_settings.build_session_kwargs(),
+    )
+    image_data = remote.data
+    mime = str(remote.content_type or "image/png").split(";", 1)[0].lower()
+    guessed_mime = mimetypes.guess_type(remote.path)[0] or ""
     if mime and not mime.startswith("image/") and mime not in {"application/octet-stream", "binary/octet-stream"}:
         raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
     if not mime.startswith("image/") and guessed_mime.startswith("image/"):

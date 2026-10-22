@@ -7,19 +7,22 @@ import mimetypes
 import re
 from pathlib import PurePosixPath
 from typing import Any, TypeGuard
-from urllib.parse import unquote, unquote_to_bytes, urlparse
+from urllib.parse import unquote, unquote_to_bytes
 
-from curl_cffi import requests
 from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
+from services.image_count import parse_image_count
 from services.proxy_service import proxy_settings
+from utils.remote_image import fetch_public_image
 
 ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
 
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
+MAX_IMAGE_INPUT_BYTES = 100 * 1024 * 1024
+MAX_IMAGE_INPUTS = 16
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
 
@@ -50,14 +53,16 @@ def _parse_bool(value: object) -> bool | None:
 
 
 def _parse_count(value: object) -> int:
-    """解析生成数量：保持图片接口的 1 到 4 限制。"""
-    try:
-        count = int(value or 1)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
-    if count < 1 or count > 4:
-        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
-    return count
+    """解析生成数量：保持图片接口的 1 到 4 限制（400 + invalid_n / n_too_large）。"""
+    return parse_image_count(value)
+
+
+def _invalid_image_input(message: str) -> HTTPException:
+    """图片输入非法（超限、为空等）：400 + 结构化 code invalid_image_input。"""
+    return HTTPException(
+        status_code=400,
+        detail={"error": {"message": message, "type": "invalid_request_error", "code": "invalid_image_input"}},
+    )
 
 
 def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
@@ -93,8 +98,12 @@ def _json_reference_value(value: object) -> object:
 
 
 def _decode_base64_image(value: object, filename: str, mime_type: str) -> ImageInput:
+    encoded = str(value).strip()
+    # 先按长度预检，避免 base64 解码为超大输入再分配一份内存。
+    if len(encoded) > ((MAX_IMAGE_REFERENCE_BYTES + 2) // 3) * 4 + 4:
+        raise _invalid_image_input("image URL exceeds 50MB limit")
     try:
-        data = base64.b64decode(str(value).strip(), validate=True)
+        data = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "invalid base64 image data"}) from exc
     if not data:
@@ -234,9 +243,9 @@ def _decode_data_url(url: str) -> ImageInput:
     return data, f"image_url.{_extension_from_mime(mime_type)}", mime_type
 
 
-def _response_mime_type(response: requests.Response, parsed_path: str) -> str:
+def _response_mime_type(content_type: str, parsed_path: str) -> str:
     """识别下载图片类型：优先响应头，必要时按 URL 后缀推断。"""
-    header_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    header_type = str(content_type or "").split(";", 1)[0].strip().lower()
     guessed_type = mimetypes.guess_type(parsed_path)[0] or ""
     if header_type.startswith("image/"):
         return header_type
@@ -256,54 +265,62 @@ def _filename_from_url(parsed_path: str, mime_type: str) -> str:
 
 
 def _download_image_url(url: str) -> ImageInput:
-    """下载远程图片：把 http/https 图片链接转成标准图片输入元组。"""
+    """下载远程图片：把 http/https 图片链接转成标准图片输入元组（逐跳做 SSRF 校验）。"""
     source = _clean(url)
     if source.startswith("data:"):
         return _decode_data_url(source)
-    parsed = urlparse(source)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
-    try:
-        response = requests.get(
-            source,
-            headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
-            timeout=60,
-            allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = _clean(response.headers.get("content-length"))
-    if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    data = response.content
-    if not data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    mime_type = _response_mime_type(response, parsed.path)
-    return data, _filename_from_url(parsed.path, mime_type), mime_type
+    remote = fetch_public_image(
+        source,
+        max_bytes=MAX_IMAGE_REFERENCE_BYTES,
+        timeout=60,
+        user_agent="chatgpt2api image fetcher",
+        session_kwargs=proxy_settings.build_session_kwargs(),
+    )
+    mime_type = _response_mime_type(remote.content_type, remote.path)
+    return remote.data, _filename_from_url(remote.path, mime_type), mime_type
 
 
 async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
-    """读取图片来源：上传文件直接读取，URL 下载后统一返回图片元组。"""
+    """读取图片来源：上传文件分块读取，URL 经 SSRF 校验下载后统一返回图片元组。
+
+    限制：最多 16 张、单张 50MB、合计 100MB；超限返回 400 + invalid_image_input。
+    """
+    if len(sources) > MAX_IMAGE_INPUTS:
+        raise _invalid_image_input(f"at most {MAX_IMAGE_INPUTS} image inputs are supported")
     images: list[ImageInput] = []
+    total_bytes = 0
+
+    def append_image(image: ImageInput) -> None:
+        nonlocal total_bytes
+        image_bytes = len(image[0])
+        if image_bytes > MAX_IMAGE_REFERENCE_BYTES:
+            raise _invalid_image_input("image input exceeds 50MB limit")
+        total_bytes += image_bytes
+        if total_bytes > MAX_IMAGE_INPUT_BYTES:
+            raise _invalid_image_input("combined image inputs exceed 100MB limit")
+        images.append(image)
+
     for source in sources:
         if isinstance(source, tuple):
-            images.append(source)
+            append_image(source)
             continue
         if _is_upload(source):
+            buffer = bytearray()
             try:
-                image_data = await source.read()
+                while True:
+                    chunk = await source.read(64 * 1024)
+                    if not chunk:
+                        break
+                    buffer.extend(chunk)
+                    if len(buffer) > MAX_IMAGE_REFERENCE_BYTES:
+                        raise _invalid_image_input("image file exceeds 50MB limit")
             finally:
                 await source.close()
-            if not image_data:
-                raise HTTPException(status_code=400, detail={"error": "image file is empty"})
-            images.append((image_data, source.filename or "image.png", source.content_type or "image/png"))
+            if not buffer:
+                raise _invalid_image_input("image file is empty")
+            append_image((bytes(buffer), source.filename or "image.png", source.content_type or "image/png"))
             continue
-        images.append(await run_in_threadpool(_download_image_url, source))
+        append_image(await run_in_threadpool(_download_image_url, source))
     if not images:
-        raise HTTPException(status_code=400, detail={"error": "image file or image_url is required"})
+        raise _invalid_image_input("image file or image_url is required")
     return images
