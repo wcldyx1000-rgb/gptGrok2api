@@ -78,6 +78,14 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
         )
 
 
+def database_backend_or_none() -> DatabaseStorageBackend | None:
+    """当前配置的存储后端是数据库时返回它（供日志、看板指标同库存储），否则返回 None。"""
+    from services.config import config
+
+    backend = config.get_storage_backend()
+    return backend if isinstance(backend, DatabaseStorageBackend) else None
+
+
 def _mask_password(url: str) -> str:
     """隐藏数据库连接字符串中的密码"""
     if "://" not in url:

@@ -1,0 +1,9 @@
+{
+  "name": "gptgrok2api-image-upscale",
+  "private": true,
+  "type": "module",
+  "description": "Optional sharp runtime for image_upscale_engine=sharp_lanczos3 (Ported from yukkcat/chatgpt2api, AGPL-3.0-only).",
+  "dependencies": {
+    "sharp": "0.34.4"
+  }
+}
