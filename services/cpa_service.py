@@ -13,10 +13,16 @@ from threading import Lock
 
 from curl_cffi.requests import Session
 
+from services.account_processing import account_processing_worker_count
 from services.account_service import account_service
 from services.config import DATA_DIR
 from services.json_file import read_json_file, write_json_file
 from services.proxy_service import proxy_settings
+from services.remote_import_job_status import (
+    ensure_no_active_remote_import,
+    remote_import_start_lock,
+)
+from utils.diagnostics import collect_import_diagnostic_values, sanitize_diagnostic_text, sanitize_import_errors
 
 
 CPA_CONFIG_FILE = DATA_DIR / "cpa_config.json"
@@ -31,7 +37,19 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
+def _import_error_context(pool: dict, *sources: object) -> dict[str, tuple[str, ...]]:
+    """导入错误脱敏要擦掉的值：连接的 secret_key、导入过程中见过的 token 与代理密码。"""
+    sensitive_values, proxy_values = collect_import_diagnostic_values({"secret_key": pool.get("secret_key")}, *sources)
+    return {"sensitive_values": sensitive_values, "proxy_values": proxy_values}
+
+
+def _normalize_import_job(
+    raw: object,
+    *,
+    fail_unfinished: bool,
+    sensitive_values: tuple[str, ...] = (),
+    proxy_values: tuple[str, ...] = (),
+) -> dict | None:
     if not isinstance(raw, dict):
         return None
     status = str(raw.get("status") or "failed").strip() or "failed"
@@ -48,17 +66,22 @@ def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
         "skipped": int(raw.get("skipped") or 0),
         "refreshed": int(raw.get("refreshed") or 0),
         "failed": int(raw.get("failed") or 0),
-        "errors": raw.get("errors") if isinstance(raw.get("errors"), list) else [],
+        "errors": sanitize_import_errors(
+            raw.get("errors"), sensitive_values=sensitive_values, proxy_values=proxy_values,
+        ),
     }
 
 
 def _normalize_pool(raw: dict) -> dict:
+    secret_key = str(raw.get("secret_key") or "").strip()
     return {
         "id": str(raw.get("id") or _new_id()).strip(),
         "name": str(raw.get("name") or "").strip(),
         "base_url": str(raw.get("base_url") or "").strip(),
-        "secret_key": str(raw.get("secret_key") or "").strip(),
-        "import_job": _normalize_import_job(raw.get("import_job"), fail_unfinished=True),
+        "secret_key": secret_key,
+        "import_job": _normalize_import_job(
+            raw.get("import_job"), fail_unfinished=True, **_import_error_context({"secret_key": secret_key}),
+        ),
     }
 
 
@@ -332,7 +355,7 @@ class CPAImportService:
     def __init__(self, cpa_config: CPAConfig):
         self._config = cpa_config
 
-    def start_import(self, pool: dict, selected_files: list[str]) -> dict:
+    def start_import(self, pool: dict, selected_files: list[str], *, target_group_id: str | None = None) -> dict:
         names = list(dict.fromkeys(str(name or "").strip() for name in selected_files if str(name or "").strip()))
         if not names:
             raise ValueError("selected files is required")
@@ -351,13 +374,15 @@ class CPAImportService:
             "failed": 0,
             "errors": [],
         }
-        saved_pool = self._config.set_import_job(pool_id, job)
+        with remote_import_start_lock:
+            ensure_no_active_remote_import()
+            saved_pool = self._config.set_import_job(pool_id, job)
         if saved_pool is None:
             raise ValueError("pool not found")
 
         thread = threading.Thread(
             target=self._run_import,
-            args=(pool_id, pool, names),
+            args=(pool_id, pool, names, target_group_id),
             name=f"cpa-import-{pool_id}",
             daemon=True,
         )
@@ -379,15 +404,19 @@ class CPAImportService:
         current = self._config.get_import_job(pool_id)
         if current is None:
             return
+        context = _import_error_context(self._config.get_pool(pool_id) or {})
         errors = list(current.get("errors") or [])
-        errors.append({"name": file_name, "error": message})
+        errors.append({
+            "name": sanitize_diagnostic_text(file_name, limit=200, **context),
+            "error": sanitize_diagnostic_text(message, limit=500, **context),
+        })
         self._update_job(pool_id, errors=errors, failed=len(errors))
 
-    def _run_import(self, pool_id: str, pool: dict, names: list[str]) -> None:
+    def _run_import(self, pool_id: str, pool: dict, names: list[str], target_group_id: str | None = None) -> None:
         self._update_job(pool_id, status="running")
 
         tokens: list[str] = []
-        max_workers = min(16, max(1, len(names)))
+        max_workers = max(1, account_processing_worker_count(len(names)))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {executor.submit(fetch_remote_access_token, pool, name): name for name in names}
             for future in as_completed(future_map):
@@ -416,7 +445,13 @@ class CPAImportService:
             )
             return
 
-        add_result = account_service.add_accounts(tokens, source_type="codex")
+        if target_group_id is None:
+            add_result = account_service.add_accounts(tokens, source_type="codex")
+        else:
+            add_result = account_service.add_account_items(
+                [{"access_token": token, "source_type": "codex", "group_id": target_group_id} for token in tokens],
+                return_items=False,
+            )
         refresh_result = account_service.refresh_accounts(tokens)
         current = self._config.get_import_job(pool_id) or {}
         self._update_job(

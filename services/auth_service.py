@@ -107,7 +107,7 @@ class AuthService:
         if not candidate:
             raise ValueError("请输入新的专用密钥")
         admin_key = self._clean(config.auth_key)
-        if admin_key and hmac.compare_digest(candidate, admin_key):
+        if admin_key and hmac.compare_digest(candidate.encode("utf-8"), admin_key.encode("utf-8")):
             raise ValueError("这个密钥和管理员密钥冲突了，请换一个新的密钥")
         key_hash = _hash_key(candidate)
         if self._has_key_hash_locked(key_hash, exclude_id=exclude_id):

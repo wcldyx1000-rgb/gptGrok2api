@@ -19,9 +19,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat
 
 from services.account_service import account_service
+from services.account_import_credentials import extract_import_credentials
 from services.config import DATA_DIR, config
 from services.json_file import read_json_file, write_json_file
 from services.openai_agent_identity_store import openai_agent_identity_store
+from services.remote_import_job_status import (
+    ensure_no_active_remote_import,
+    remote_import_start_lock,
+)
+from utils.diagnostics import collect_import_diagnostic_values, sanitize_diagnostic_text, sanitize_import_errors
 from services.xai_cli_oauth_protocol import XAI_CLI_BASE_URL, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_SCOPE
 
 
@@ -102,7 +108,7 @@ def _slug_id(value: object) -> str:
 
 
 def _config_dict_list(key: str) -> list[dict]:
-    raw = config.get().get(key)
+    raw = config.get_internal().get(key)
     if not isinstance(raw, list):
         return []
     return [dict(item) for item in raw if isinstance(item, dict)]
@@ -170,7 +176,22 @@ def _build_local_group_bindings(group_bindings: list[dict], create_account_group
     return account_group_ids
 
 
-def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
+def _server_error_context(server: dict | None, *sources: object) -> dict[str, tuple[str, ...]]:
+    """导入错误脱敏要擦掉的值：服务器的登录密码 / API Key、导入过程中见过的 token 与代理密码。"""
+    item = server or {}
+    sensitive_values, proxy_values = collect_import_diagnostic_values(
+        {"password": item.get("password"), "api_key": item.get("api_key")}, *sources,
+    )
+    return {"sensitive_values": sensitive_values, "proxy_values": proxy_values}
+
+
+def _normalize_import_job(
+    raw: object,
+    *,
+    fail_unfinished: bool,
+    sensitive_values: tuple[str, ...] = (),
+    proxy_values: tuple[str, ...] = (),
+) -> dict | None:
     if not isinstance(raw, dict):
         return None
     status = _clean(raw.get("status")) or "failed"
@@ -187,12 +208,15 @@ def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
         "skipped": int(raw.get("skipped") or 0),
         "refreshed": int(raw.get("refreshed") or 0),
         "failed": int(raw.get("failed") or 0),
-        "errors": raw.get("errors") if isinstance(raw.get("errors"), list) else [],
+        "errors": sanitize_import_errors(
+            raw.get("errors"), sensitive_values=sensitive_values, proxy_values=proxy_values,
+        ),
     }
 
 
 def _normalize_server(raw: dict) -> dict:
     raw_verify_tls = raw.get("verify_tls")
+    secrets = _server_error_context({"password": _clean(raw.get("password")), "api_key": _clean(raw.get("api_key"))})
     return {
         "id": _clean(raw.get("id")) or _new_id(),
         "name": _clean(raw.get("name")),
@@ -205,7 +229,7 @@ def _normalize_server(raw: dict) -> dict:
         # explicitly turn this off only for a private trusted endpoint with a
         # self-signed certificate.
         "verify_tls": True if raw_verify_tls is None else _as_bool(raw_verify_tls, True),
-        "import_job": _normalize_import_job(raw.get("import_job"), fail_unfinished=True),
+        "import_job": _normalize_import_job(raw.get("import_job"), fail_unfinished=True, **secrets),
     }
 
 
@@ -1188,6 +1212,41 @@ def _extract_export_accounts(payload: object) -> list[dict]:
     return []
 
 
+def parse_sub2api_export(payload: object) -> list[dict]:
+    """Turn a Sub2API export document (local file) into account payloads for AccountService.
+
+    Accepts the usual envelope ({"accounts": [...]} possibly under "data"), a bare list of
+    accounts, or a single account object. Credentials may sit at the record root or inside
+    a nested credential object. Records without an access token are skipped.
+    """
+    if isinstance(payload, list):
+        accounts = [item for item in payload if isinstance(item, dict)]
+    else:
+        accounts = _extract_export_accounts(payload)
+        if not accounts and isinstance(payload, dict) and extract_import_credentials(payload).get("access_token"):
+            accounts = [payload]
+    results: list[dict] = []
+    for account in accounts:
+        credentials = extract_import_credentials(account)
+        access_token = credentials.get("access_token", "")
+        if not access_token:
+            continue
+        section = _account_section(account, "credentials", "credential")
+        extra = _account_section(account, "extra", "metadata", "meta")
+        item: dict[str, object] = {"access_token": access_token, "source_type": "codex"}
+        for key in ("refresh_token", "id_token"):
+            if credentials.get(key):
+                item[key] = credentials[key]
+        email = _account_email(account, section, extra)
+        plan_type = _account_plan_type(account, section, extra)
+        if email:
+            item["email"] = email
+        if plan_type:
+            item["type"] = plan_type
+        results.append(item)
+    return results
+
+
 def _account_access_token(account: dict) -> str:
     credentials = _account_section(account, "credentials", "credential")
     return _extract_access_token(credentials) or _extract_access_token(account)
@@ -1342,6 +1401,7 @@ class Sub2APIImportService:
         *,
         group_bindings: list[dict] | None = None,
         create_account_groups: bool = True,
+        target_group_id: str | None = None,
     ) -> dict:
         ids = list(dict.fromkeys(_clean(item) for item in account_ids if _clean(item)))
         if not ids:
@@ -1362,13 +1422,15 @@ class Sub2APIImportService:
             "failed": 0,
             "errors": [],
         }
-        saved = self._config.set_import_job(server_id, job)
+        with remote_import_start_lock:
+            ensure_no_active_remote_import()
+            saved = self._config.set_import_job(server_id, job)
         if saved is None:
             raise ValueError("server not found")
 
         thread = threading.Thread(
             target=self._run_import,
-            args=(server_id, server, ids, account_group_ids),
+            args=(server_id, server, ids, account_group_ids, target_group_id),
             name=f"sub2api-import-{server_id}",
             daemon=True,
         )
@@ -1386,8 +1448,12 @@ class Sub2APIImportService:
         current = self._config.get_import_job(server_id)
         if current is None:
             return
+        context = _server_error_context(self._config.get_server(server_id))
         errors = list(current.get("errors") or [])
-        errors.append({"name": account_id, "error": message})
+        errors.append({
+            "name": sanitize_diagnostic_text(account_id, limit=200, **context),
+            "error": sanitize_diagnostic_text(message, limit=500, **context),
+        })
         self._update_job(server_id, errors=errors, failed=len(errors))
 
     def _run_import(
@@ -1396,6 +1462,7 @@ class Sub2APIImportService:
         server: dict,
         account_ids: list[str],
         account_group_ids: dict[str, str],
+        target_group_id: str | None = None,
     ) -> None:
         self._update_job(server_id, status="running")
 
@@ -1423,6 +1490,8 @@ class Sub2APIImportService:
             local_group_id = account_group_ids.get(account_id)
             if local_group_id:
                 payload["group_id"] = local_group_id
+            elif target_group_id is not None:
+                payload["group_id"] = target_group_id
             payloads.append(payload)
             tokens.append(token)
 
