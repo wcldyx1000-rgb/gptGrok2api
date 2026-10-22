@@ -382,6 +382,63 @@ class RegisterGrokAccountsApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["detail"], {"error": "upstream unavailable"})
 
+    def test_register_events_prefers_authorization_header_over_query(self) -> None:
+        from fastapi import HTTPException
+
+        seen: list[str | None] = []
+
+        def reject(authorization):
+            seen.append(authorization)
+            raise HTTPException(status_code=401, detail="stop")
+
+        with patch.object(register_api, "require_admin", side_effect=reject):
+            self.client.get("/api/register/events", headers={"Authorization": "Bearer hdr-key"})
+            self.client.get("/api/register/events", params={"token": "legacy-key"})
+
+        self.assertEqual(seen, ["Bearer hdr-key", "Bearer legacy-key"])
+
+
+class RegisterOutlookPoolApiTest(unittest.TestCase):
+    def setUp(self) -> None:
+        app = FastAPI()
+        app.include_router(register_api.create_router())
+        self.client = TestClient(app)
+
+    def test_entries_endpoint_passes_filters(self) -> None:
+        view = {"provider_id": "p", "items": [], "total": 0, "page": 1, "page_size": 20, "pages": 1,
+                "state_counts": {}, "stats": {}}
+        with patch.object(register_api, "require_admin"), patch.object(
+            register_api.register_service, "outlook_pool_entries", return_value=view
+        ) as listing:
+            response = self.client.get(
+                "/api/register/outlook-pool/entries",
+                params={"provider_id": "p", "q": "abc", "state": "failed", "page": 2, "page_size": 20},
+            )
+        self.assertEqual(response.status_code, 200)
+        listing.assert_called_once_with("p", query="abc", state="failed", page=2, page_size=20)
+
+    def test_reset_and_delete_map_errors(self) -> None:
+        body = {"provider_id": "p", "mailbox_id": "m"}
+        with patch.object(register_api, "require_admin"):
+            with patch.object(
+                register_api.register_service, "reset_outlook_mailbox",
+                side_effect=register_api.OutlookPoolConflict("leased"),
+            ):
+                self.assertEqual(self.client.post("/api/register/outlook-pool/mailboxes/reset", json=body).status_code, 409)
+            with patch.object(
+                register_api.register_service, "delete_outlook_mailbox",
+                side_effect=register_api.OutlookPoolNotFound("gone"),
+            ):
+                self.assertEqual(self.client.post("/api/register/outlook-pool/mailboxes/delete", json=body).status_code, 404)
+            with patch.object(
+                register_api.register_service, "delete_outlook_mailbox", side_effect=ValueError("bad")
+            ):
+                self.assertEqual(self.client.post("/api/register/outlook-pool/mailboxes/delete", json=body).status_code, 400)
+
+    def test_endpoints_require_admin(self) -> None:
+        response = self.client.get("/api/register/outlook-pool/entries", params={"provider_id": "p"})
+        self.assertIn(response.status_code, {401, 403})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -671,6 +671,7 @@ class RegisterServiceGrokTest(unittest.TestCase):
 
             with (
                 patch.object(service, "_sync_backend_config", return_value=SimpleNamespace()),
+                patch.object(service, "_egress_preflight_passed", return_value=True),
                 patch.object(service, "_run"),
             ):
                 service.start()

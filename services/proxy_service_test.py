@@ -184,5 +184,126 @@ class RuntimeProxyEnvironmentTest(unittest.TestCase):
         self.assertEqual(profile.proxy_source, "explicit_direct")
 
 
+
+class _LocaleConfigStore(_ConfigStore):
+    def __init__(self, runtime_locale: dict[str, str] | None = None) -> None:
+        super().__init__()
+        self.runtime_locale = runtime_locale or {}
+        self.data = {
+            "proxy_groups": [
+                {
+                    "id": "us",
+                    "nodes": [
+                        {
+                            "id": "ny",
+                            "url": "http://ny.example:8080",
+                            "timezone": "America/New_York",
+                            "language": "en-US",
+                        }
+                    ],
+                },
+                {"id": "plain", "nodes": [{"id": "n1", "url": "http://plain.example:8080"}]},
+            ],
+            "proxy_profiles": [
+                {"id": "jp", "proxy": "http://jp.example:8080", "timezone": "Asia/Tokyo", "language": "ja-JP"},
+            ],
+        }
+
+    def get_proxy_runtime_settings(self) -> dict[str, object]:
+        return {**super().get_proxy_runtime_settings(), "enabled": False, **self.runtime_locale}
+
+
+class ProxyLocaleTest(unittest.TestCase):
+    def test_group_node_locale_is_attached_to_profile(self) -> None:
+        store = proxy_service.ProxySettingsStore(_LocaleConfigStore())
+        profile = store.get_profile(account={"proxy": "group:us"}, upstream=True)
+
+        self.assertEqual(profile.proxy_url, "http://ny.example:8080")
+        self.assertIsNotNone(profile.locale)
+        self.assertEqual(profile.locale.timezone, "America/New_York")
+        self.assertEqual(profile.locale.language, "en-US")
+
+    def test_proxy_profile_locale_is_attached(self) -> None:
+        store = proxy_service.ProxySettingsStore(_LocaleConfigStore())
+        profile = store.get_profile(proxy="profile:jp", upstream=True)
+
+        self.assertEqual(profile.locale.timezone, "Asia/Tokyo")
+
+    def test_unconfigured_egress_falls_back_to_runtime_default(self) -> None:
+        store = proxy_service.ProxySettingsStore(
+            _LocaleConfigStore({"timezone": "Europe/Berlin", "language": "de-DE"})
+        )
+        plain = store.get_profile(account={"proxy": "group:plain"}, upstream=True)
+        direct = store.get_profile(upstream=True)
+        node = store.get_profile(account={"proxy": "group:us"}, upstream=True)
+
+        self.assertEqual(plain.locale.timezone, "Europe/Berlin")
+        self.assertEqual(direct.locale.timezone, "Europe/Berlin")
+        self.assertEqual(node.locale.timezone, "America/New_York")
+
+    def test_direct_locale_applies_to_direct_and_custom_proxy_not_group_nodes(self) -> None:
+        class _Store(_LocaleConfigStore):
+            def get_direct_locale(self) -> dict[str, str]:
+                return {"timezone": "Asia/Tokyo", "language": "ja-JP"}
+
+        store = proxy_service.ProxySettingsStore(_Store({"timezone": "Europe/Berlin", "language": "de-DE"}))
+        direct = store.get_profile(upstream=True)
+        custom = store.get_profile(proxy="http://custom.example:8080", upstream=True)
+        node = store.get_profile(account={"proxy": "group:us"}, upstream=True)
+
+        self.assertEqual(direct.locale.timezone, "Asia/Tokyo")
+        self.assertEqual(custom.locale.language, "ja-JP")
+        # 代理组节点自带的地区环境优先，不被直连地区环境覆盖。
+        self.assertEqual(node.locale.timezone, "America/New_York")
+
+    def test_empty_direct_locale_keeps_previous_behavior(self) -> None:
+        class _Store(_LocaleConfigStore):
+            def get_direct_locale(self) -> dict[str, str]:
+                return {}
+
+        store = proxy_service.ProxySettingsStore(_Store({"timezone": "Europe/Berlin", "language": "de-DE"}))
+        self.assertEqual(store.get_profile(upstream=True).locale.timezone, "Europe/Berlin")
+
+    def test_no_locale_configured_keeps_none(self) -> None:
+        store = proxy_service.ProxySettingsStore(_LocaleConfigStore())
+        self.assertIsNone(store.get_profile(upstream=True).locale)
+
+
+class ProxyNodeImportTest(unittest.TestCase):
+    def test_import_dedupes_and_reports_invalid_lines(self) -> None:
+        result = proxy_service.import_proxy_nodes(
+            "\n".join(
+                [
+                    "http://1.2.3.4:8080 50",
+                    "",
+                    "http://1.2.3.4:8080",
+                    "socks5://u:p@5.6.7.8:1080",
+                    "http://9.9.9.9:80",
+                    "1.1.1.1:3128:user:pass",
+                    "http://bad host:1",
+                    "http://x:1 abc",
+                    "ftp://x:1",
+                    "http://a:1 2 3",
+                ]
+            ),
+            ["http://9.9.9.9"],
+        )
+        urls = [node["url"] for node in result["nodes"]]
+        self.assertEqual(
+            urls,
+            ["http://1.2.3.4:8080", "socks5h://u:p@5.6.7.8:1080", "http://user:pass@1.1.1.1:3128"],
+        )
+        self.assertEqual(result["nodes"][0]["image_concurrency_limit"], 50)
+        self.assertEqual(result["nodes"][1]["image_concurrency_limit"], proxy_service.DEFAULT_PROXY_NODE_IMAGE_CONCURRENCY_LIMIT)
+        self.assertEqual(result["added_count"], 3)
+        self.assertEqual(result["duplicate_count"], 2)
+        self.assertEqual(result["invalid_count"], 4)
+        self.assertEqual([item["line"] for item in result["invalid_items"]], [7, 8, 9, 10])
+
+    def test_import_rejects_too_many_lines(self) -> None:
+        with self.assertRaises(ValueError):
+            proxy_service.import_proxy_nodes("\n".join(f"http://h{i}:1" for i in range(10_001)))
+
+
 if __name__ == "__main__":
     unittest.main()

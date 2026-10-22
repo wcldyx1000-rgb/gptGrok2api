@@ -24,7 +24,7 @@ from curl_cffi import requests
 
 from services.config import DATA_DIR
 from services.xai_browser_bridge import XaiBrowserBridge, XaiBrowserBridgeError
-from services.xai_session_cookies import apply_cookie_jar, snapshot_session_cookie_jar
+from services.xai_session_cookies import apply_cookie_jar, normalize_cookie_jar, snapshot_session_cookie_jar
 
 
 DEFAULT_BASE_URL = "https://accounts.x.ai"
@@ -1405,6 +1405,16 @@ class GrokProtocolClient:
             # The persistent registration browser must solve its own visible widget
             # so the page's Turnstile callback and React state are updated together.
             return ""
+        token, solution = self.solve_turnstile_detached(self.session_cookie_jar())
+        self._adopt_turnstile_browser_state(solution)
+        return token
+
+    def solve_turnstile_detached(self, initial_cookies: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+        """Solve Turnstile without touching the protocol session.
+
+        Safe on a helper thread while the caller keeps using the session; the
+        returned browser state is applied later with adopt_turnstile_solution().
+        """
         metadata = self._metadata()
         solver_config = dict(self.config)
         if self.proxy and self.proxy.lower() != "direct":
@@ -1415,12 +1425,36 @@ class GrokProtocolClient:
                 website_url=metadata.signup_url,
                 sitekey=metadata.sitekey,
                 action=str(self.config.get("action") or "").strip(),
-                initial_cookies=self.session_cookie_jar(),
+                initial_cookies=initial_cookies,
             )
-            self._adopt_turnstile_browser_state(solver.last_solution)
-            return token
+            solution = solver.last_solution if isinstance(solver.last_solution, dict) else {}
+            return token, dict(solution)
         finally:
             solver.close()
+
+    def adopt_turnstile_solution(
+        self,
+        solution: dict[str, Any],
+        *,
+        cookies_before: list[dict[str, Any]],
+    ) -> None:
+        """Adopt a solution solved from an older cookie snapshot.
+
+        Cookies the session gained or changed after ``cookies_before`` was taken
+        are newer than the browser's copy, so they are restored on top of it.
+        """
+        baseline = {
+            (item["name"], item["domain"], item["path"]): item["value"]
+            for item in normalize_cookie_jar(cookies_before)
+        }
+        newer = [
+            item
+            for item in snapshot_session_cookie_jar(self.session)
+            if baseline.get((item["name"], item["domain"], item["path"])) != item["value"]
+        ]
+        self._adopt_turnstile_browser_state(solution)
+        if newer:
+            apply_cookie_jar(self.session, newer)
 
     def _adopt_turnstile_browser_state(self, solution: dict[str, Any]) -> None:
         if not isinstance(solution, dict) or not solution:

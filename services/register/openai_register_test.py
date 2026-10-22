@@ -90,7 +90,7 @@ class PasswordlessSignupFallbackTest(unittest.TestCase):
         self.assertEqual(result["source_type"], "web")
         registrar._register_user.assert_called_once_with("fallback@example.test", "SafePassword1!", 1)
         registrar._send_otp.assert_called_once_with(1)
-        wait_for_code.assert_called_once_with(mailbox, register_proxy="")
+        wait_for_code.assert_called_once_with(mailbox, register_proxy="", wait_timeout=ANY)
         registrar._validate_otp.assert_called_once_with("123456", 1)
         registrar._create_account.assert_called_once_with("Ada Lovelace", "1990-01-01", 1)
         mark_mailbox_result.assert_called_once_with(mailbox, success=True)
@@ -566,7 +566,7 @@ class ChatGPTWebRegistrarTest(unittest.TestCase):
         self.assertEqual(result["source_type"], "chatgpt_web")
         self.assertEqual(result["user_id"], "u-1")
         self.assertEqual(mailbox["_icloud_keyword"], "ChatGPT")
-        wait_for_code.assert_called_once_with(mailbox, register_proxy="")
+        wait_for_code.assert_called_once_with(mailbox, register_proxy="", wait_timeout=ANY)
         mark_mailbox_result.assert_called_once_with(mailbox, success=True)
 
     def test_register_explains_when_chatgpt_mailbox_never_receives_otp(self) -> None:
@@ -589,74 +589,118 @@ class ChatGPTWebRegistrarTest(unittest.TestCase):
         self.assertFalse(mark_mailbox_result.call_args.kwargs["success"])
 
 
+class _FakeClock:
+    """Monotonic clock that advances by the wait each mocked poll asked for."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def poller(self, results: list[str | None]):
+        queue = list(results)
+
+        def poll(_mailbox, *, register_proxy="", wait_timeout=None):
+            self.now += float(wait_timeout or 0)
+            return queue.pop(0) if queue else None
+
+        return poll
+
+
 class ChatGPTMailboxDeliveryTest(unittest.TestCase):
-    def test_cf_mailbox_uses_short_wait_and_resends_once(self) -> None:
-        mailbox = {
-            "address": "cf@example.test",
-            "provider": "cloudflare_temp_email",
-            "provider_ref": "cloudflare_temp_email:cf",
-            "label": "CF 邮箱",
-        }
-        resend = MagicMock()
+    _CF_MAILBOX = {
+        "address": "cf@example.test",
+        "provider": "cloudflare_temp_email",
+        "provider_ref": "cloudflare_temp_email:cf",
+        "label": "CF 邮箱",
+    }
 
+    def _wait(self, mailbox, results, *, inbox_empty=False, resend_error=None):
+        clock = _FakeClock()
+        resend = MagicMock(side_effect=resend_error)
         with (
-            patch.object(openai_register, "_configured_mail_wait_timeout", return_value=180),
-            patch.object(openai_register, "wait_for_code", side_effect=[None, "123456"]) as wait_for_code,
+            patch.object(openai_register, "_configured_mail_wait_timeout", return_value=30),
+            patch.object(openai_register, "wait_for_code", side_effect=clock.poller(results)) as wait_for_code,
+            patch.object(openai_register, "_mailbox_inbox_empty", return_value=inbox_empty) as inbox_probe,
+            patch.object(openai_register.time, "monotonic", side_effect=clock.monotonic),
             patch.object(openai_register, "step"),
         ):
-            code = openai_register._wait_for_chatgpt_registration_code(
-                mailbox,
-                1,
-                "",
-                resend=resend,
-            )
+            try:
+                code = openai_register._wait_for_chatgpt_registration_code(dict(mailbox), 1, "", resend=resend)
+                error = None
+            except openai_register.OpenAIMailboxDeliveryTimeout as raised:
+                code, error = None, raised
+        return SimpleNamespace(
+            code=code, error=error, resend=resend, wait_for_code=wait_for_code, inbox_probe=inbox_probe
+        )
 
-        self.assertEqual(code, "123456")
-        self.assertEqual(wait_for_code.call_count, 2)
-        self.assertEqual(wait_for_code.call_args_list[0].kwargs["wait_timeout"], 60.0)
-        self.assertEqual(wait_for_code.call_args_list[1].kwargs["wait_timeout"], 60.0)
-        resend.assert_called_once_with()
-        self.assertIn("_received_after", mailbox)
+    def test_resends_mid_wait_at_35_and_70_seconds(self) -> None:
+        result = self._wait(self._CF_MAILBOX, [None, None, "123456"])
 
-    def test_cf_mailbox_second_timeout_requests_provider_fallback(self) -> None:
-        mailbox = {
-            "address": "cf@example.test",
-            "provider": "cloudflare_temp_email",
-            "provider_ref": "cloudflare_temp_email:cf",
-            "label": "CF 邮箱",
-        }
-        resend = MagicMock()
+        self.assertEqual(result.code, "123456")
+        self.assertEqual(result.resend.call_count, 2)
+        timeouts = [call.kwargs["wait_timeout"] for call in result.wait_for_code.call_args_list]
+        self.assertAlmostEqual(timeouts[0], 35.0)
+        self.assertAlmostEqual(timeouts[1], 35.0)
+        self.assertAlmostEqual(timeouts[2], openai_register.OTP_EMPTY_INBOX_GRACE_SECONDS)
 
-        with (
-            patch.object(openai_register, "_configured_mail_wait_timeout", return_value=180),
-            patch.object(openai_register, "wait_for_code", side_effect=[None, None]),
-            patch.object(openai_register, "step"),
-            self.assertRaises(openai_register.OpenAIMailboxDeliveryTimeout) as raised,
-        ):
-            openai_register._wait_for_chatgpt_registration_code(mailbox, 1, "", resend=resend)
+    def test_first_code_before_resend_skips_resend(self) -> None:
+        result = self._wait(self._CF_MAILBOX, ["111111"])
 
-        self.assertEqual(raised.exception.provider_ref, "cloudflare_temp_email:cf")
-        self.assertIn("投递超时", str(raised.exception))
-        resend.assert_called_once_with()
+        self.assertEqual(result.code, "111111")
+        result.resend.assert_not_called()
 
-    def test_non_cf_mailbox_keeps_configured_wait_without_resend(self) -> None:
+    def test_empty_inbox_after_last_resend_stops_early_for_provider_fallback(self) -> None:
+        result = self._wait(self._CF_MAILBOX, [None, None, None], inbox_empty=True)
+
+        self.assertIsNotNone(result.error)
+        self.assertEqual(result.error.provider_ref, "cloudflare_temp_email:cf")
+        self.assertIn("未收到任何邮件", str(result.error))
+        # 35 + 35 + grace; never the remaining part of the 105s window.
+        self.assertEqual(result.wait_for_code.call_count, 3)
+        result.inbox_probe.assert_called_once()
+
+    def test_non_empty_inbox_keeps_waiting_until_window_ends(self) -> None:
+        result = self._wait(self._CF_MAILBOX, [None, None, None, None], inbox_empty=False)
+
+        self.assertIn("投递超时", str(result.error))
+        self.assertEqual(result.wait_for_code.call_count, 4)
+        total = sum(call.kwargs["wait_timeout"] for call in result.wait_for_code.call_args_list)
+        self.assertAlmostEqual(total, openai_register.OTP_RESEND_WAIT_WINDOW_SECONDS)
+
+    def test_resend_failure_does_not_abort_wait(self) -> None:
+        result = self._wait(
+            self._CF_MAILBOX,
+            [None, "222222"],
+            resend_error=RuntimeError("reference_resend_otp_http_500"),
+        )
+
+        self.assertEqual(result.code, "222222")
+        result.resend.assert_called_once_with()
+
+    def test_non_cf_mailbox_also_resends_mid_wait(self) -> None:
         mailbox = {
             "address": "icloud@example.test",
             "provider": "icloud_api",
             "provider_ref": "icloud_api:primary",
             "label": "iCloud",
         }
-        resend = MagicMock()
+        result = self._wait(mailbox, [None, "654321"])
 
+        self.assertEqual(result.code, "654321")
+        result.resend.assert_called_once_with()
+
+    def test_without_resend_keeps_single_configured_wait(self) -> None:
+        mailbox = {"address": "x@example.test", "provider": "icloud_api", "label": "iCloud"}
         with (
             patch.object(openai_register, "wait_for_code", return_value="654321") as wait_for_code,
             patch.object(openai_register, "step"),
         ):
-            code = openai_register._wait_for_chatgpt_registration_code(mailbox, 1, "", resend=resend)
+            code = openai_register._wait_for_chatgpt_registration_code(mailbox, 1, "")
 
         self.assertEqual(code, "654321")
         wait_for_code.assert_called_once_with(mailbox, register_proxy="")
-        resend.assert_not_called()
 
     def test_non_cf_query_error_keeps_the_real_provider_failure(self) -> None:
         mailbox = {
@@ -905,7 +949,7 @@ class TraditionalChatGPTRegistrarTest(unittest.TestCase):
         registrar._reference_validate_otp.assert_called_once_with("123456", 1)
         registrar._reference_create_account.assert_called_once_with("Ada Lovelace", "1990-01-01", 1)
         registrar._reference_capture_callback.assert_called_once_with("https://auth.openai.com/continue", 1)
-        wait_for_code.assert_called_once_with(mailbox, register_proxy="")
+        wait_for_code.assert_called_once_with(mailbox, register_proxy="", wait_timeout=ANY)
         self.assertNotEqual(mailbox["_received_after"], "before-resend")
         mark_mailbox_result.assert_called_once_with(mailbox, success=True)
 
@@ -1014,7 +1058,7 @@ class TraditionalChatGPTRegistrarTest(unittest.TestCase):
         registrar._reference_register_password.assert_called_once_with("registered@example.test", "registeredexample.test", 1)
         registrar._reference_send_otp.assert_called_once_with(1)
         registrar._reference_validate_otp.assert_called_once_with("123456", 1)
-        wait_for_code.assert_called_once_with(mailbox, register_proxy="")
+        wait_for_code.assert_called_once_with(mailbox, register_proxy="", wait_timeout=ANY)
         mark_mailbox_result.assert_called_once_with(mailbox, success=True)
 
 
@@ -1520,7 +1564,11 @@ class RegistrationCheckoutWorkerTest(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(call_order, ["account_saved", "checkout_extracted"])
-        add_account.assert_called_once_with([registrar.register.return_value])
+        add_account.assert_called_once()
+        saved = add_account.call_args.args[0][0]
+        self.assertEqual((saved["email"], saved["access_token"]), ("new@example.test", "chatgpt-access"))
+        # 新注册的号带入池时间，进入新号冷静期 + 放量期。
+        self.assertTrue(saved["new_account_joined_at"])
         extract.assert_called_once_with(
             "chatgpt-access",
             checkout_channel="upi",
@@ -1800,6 +1848,260 @@ class PlatformOAuthExtractionTest(unittest.TestCase):
             registrar.fingerprint,
         )
         fallback.assert_not_called()
+
+
+class OtpSendBudgetTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._saved_next_allowed = openai_register._otp_next_allowed
+        openai_register._otp_next_allowed = 0.0
+
+    def tearDown(self) -> None:
+        openai_register._otp_next_allowed = self._saved_next_allowed
+
+    def _budget(self, *, gap=8.0, cooldown=28.0):
+        return (
+            patch.object(openai_register, "OTP_SEND_MIN_GAP_SECONDS", gap),
+            patch.object(openai_register, "OTP_SEND_GAP_JITTER_SECONDS", (0.0, 0.0)),
+            patch.object(openai_register, "OTP_RATE_LIMIT_COOLDOWN_SECONDS", cooldown),
+            patch.object(openai_register, "OTP_RATE_LIMIT_COOLDOWN_JITTER_SECONDS", (0.0, 0.0)),
+            patch.object(openai_register, "step"),
+        )
+
+    def test_consecutive_sends_keep_minimum_gap(self) -> None:
+        clock = _FakeClock()
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock.now += seconds
+
+        a, b, c, d, e = self._budget(gap=8.0)
+        with (
+            a, b, c, d, e,
+            patch.object(openai_register.time, "monotonic", side_effect=clock.monotonic),
+            patch.object(openai_register.time, "sleep", side_effect=sleep),
+        ):
+            openai_register._wait_for_otp_slot(1)
+            first_at = clock.now
+            openai_register._wait_for_otp_slot(2)
+            second_at = clock.now
+
+        self.assertEqual(first_at, 1000.0)
+        self.assertAlmostEqual(second_at - first_at, 8.0)
+        self.assertTrue(all(value <= 4.0 for value in sleeps))
+
+    def test_rate_limited_send_triggers_global_cooldown(self) -> None:
+        clock = _FakeClock()
+
+        def sleep(seconds: float) -> None:
+            clock.now += seconds
+
+        class Sender:
+            calls = 0
+
+            @openai_register._otp_send
+            def send(self, index: int) -> None:
+                Sender.calls += 1
+                if Sender.calls == 1:
+                    raise RuntimeError("chatgpt_send_otp_http_429, rate_limit_exceeded")
+
+        a, b, c, d, e = self._budget(gap=0.0, cooldown=28.0)
+        with (
+            a, b, c, d, e,
+            patch.object(openai_register.time, "monotonic", side_effect=clock.monotonic),
+            patch.object(openai_register.time, "sleep", side_effect=sleep),
+        ):
+            sender = Sender()
+            with self.assertRaisesRegex(RuntimeError, "429"):
+                sender.send(1)
+            failed_at = clock.now
+            sender.send(1)
+
+        self.assertGreaterEqual(clock.now - failed_at, 28.0)
+        self.assertEqual(Sender.calls, 2)
+
+    def test_non_rate_limit_failure_does_not_cool_down(self) -> None:
+        class Sender:
+            @openai_register._otp_send
+            def send(self, index: int) -> None:
+                raise RuntimeError("chatgpt_send_otp_http_500")
+
+        a, b, c, d, e = self._budget(gap=0.0)
+        with a, b, c, d, e:
+            with self.assertRaises(RuntimeError):
+                Sender().send(1)
+            self.assertLessEqual(openai_register._otp_next_allowed, time.monotonic())
+
+    def test_all_otp_senders_use_the_shared_budget(self) -> None:
+        for owner, name in (
+            (openai_register.PlatformRegistrar, "_send_passwordless_otp"),
+            (openai_register.PlatformRegistrar, "_start_passwordless_signup"),
+            (openai_register.PlatformRegistrar, "_send_otp"),
+            (openai_register.ChatGPTWebRegistrar, "_send_chatgpt_otp"),
+            (openai_register.TraditionalChatGPTRegistrar, "_reference_send_otp"),
+            (openai_register.TraditionalChatGPTRegistrar, "_reference_resend_otp"),
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(hasattr(getattr(owner, name), "__wrapped__"))
+
+
+class OtpValidateRetryTest(unittest.TestCase):
+    def _run(self, validate, codes):
+        with (
+            patch.object(openai_register, "_configured_mail_wait_timeout", return_value=30),
+            patch.object(openai_register, "wait_for_code", side_effect=codes) as wait_for_code,
+            patch.object(openai_register, "step"),
+        ):
+            result = openai_register._validate_code_with_retry({"address": "a@example.test"}, 1, "", "111111", validate)
+        return result, wait_for_code
+
+    def test_invalid_code_waits_for_new_code_and_skips_repeats(self) -> None:
+        seen: list[str] = []
+
+        def validate(code: str) -> str:
+            seen.append(code)
+            if code == "111111":
+                raise RuntimeError('validate_otp_http_401_body={"error":{"code":"wrong_email_otp_code"}}')
+            return "https://auth.openai.com/about-you"
+
+        result, wait_for_code = self._run(validate, ["111111", "222222"])
+
+        self.assertEqual(result, "https://auth.openai.com/about-you")
+        self.assertEqual(seen, ["111111", "222222"])
+        self.assertEqual(wait_for_code.call_count, 2)
+
+    def test_gives_up_after_three_rounds(self) -> None:
+        validate = MagicMock(side_effect=RuntimeError("validate_otp_http_401_body=wrong_email_otp_code"))
+
+        with self.assertRaisesRegex(RuntimeError, "validate_otp_http_401"):
+            self._run(validate, ["222222", "333333", "444444"])
+
+        self.assertEqual(validate.call_count, 3)
+
+    def test_non_invalid_errors_are_not_retried(self) -> None:
+        for message in (
+            "validate_otp_http_429_body=rate_limit_exceeded",
+            "validate_otp_http_409_body=invalid_state",
+            "validate_otp_http_500_body=",
+        ):
+            with self.subTest(message=message):
+                validate = MagicMock(side_effect=RuntimeError(message))
+                with self.assertRaises(RuntimeError):
+                    self._run(validate, ["222222"])
+                validate.assert_called_once_with("111111")
+
+    def test_no_new_code_reraises_original_invalid_error(self) -> None:
+        validate = MagicMock(side_effect=RuntimeError("validate_otp_http_400_body=invalid_code"))
+
+        with self.assertRaisesRegex(RuntimeError, "invalid_code"):
+            self._run(validate, [None])
+
+        validate.assert_called_once_with("111111")
+
+
+class RegisterFingerprintPoolTest(unittest.TestCase):
+    def test_pool_only_contains_cloudflare_stable_targets(self) -> None:
+        targets = {profile["impersonate"] for profile in openai_register.REGISTER_BROWSER_PROFILES}
+
+        self.assertEqual(targets, {"chrome142", "chrome124", "chrome116"})
+
+    def test_client_hints_follow_the_user_agent(self) -> None:
+        mac = openai_register._complete_browser_fingerprint(
+            openai_register._browser_profile(
+                "chrome124",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            )
+        )
+        headers = openai_register._header_fingerprint(
+            {"sec-ch-ua": "stale", "sec-ch-ua-platform": '"Windows"', "sec-ch-ua-platform-version": '"10.0.0"',
+             "sec-ch-ua-full-version-list": "stale", "accept": "*/*"},
+            mac,
+        )
+
+        self.assertIn('"Google Chrome";v="124"', headers["sec-ch-ua"])
+        self.assertNotIn("Not_A Brand", headers["sec-ch-ua"])
+        self.assertEqual(headers["sec-ch-ua-platform"], '"macOS"')
+        # Reduced UA and frozen macOS version: no high-entropy hints invented.
+        self.assertNotIn("sec-ch-ua-platform-version", headers)
+        self.assertNotIn("sec-ch-ua-full-version-list", headers)
+        self.assertEqual(headers["accept"], "*/*")
+
+    def test_traditional_registrar_uses_stable_mac_chrome(self) -> None:
+        with patch.object(openai_register, "create_session", return_value=MagicMock()):
+            registrar = openai_register.TraditionalChatGPTRegistrar()
+
+        self.assertEqual(registrar.fingerprint["impersonate"], "chrome142")
+        self.assertEqual(registrar.fingerprint["sec_ch_ua_platform"], '"macOS"')
+        self.assertIn("Chrome/142", registrar.fingerprint["user_agent"])
+
+
+class AccountPoolExtrasTest(unittest.TestCase):
+    def _registrar(self):
+        with patch.object(openai_register, "create_session", return_value=MagicMock()):
+            return openai_register.PlatformRegistrar()
+
+    def test_outlook_token_mailbox_credentials_kept_for_pool(self) -> None:
+        registrar = self._registrar()
+        registrar.last_mailbox = {
+            "provider": "outlook_token",
+            "address": "alias+1@outlook.com",
+            "login_email": "alias@outlook.com",
+            "password": "mail-pass",
+            "client_id": "cid",
+            "refresh_token": "mail-rt",
+        }
+        extras = registrar.account_pool_extras({"email": "alias+1@outlook.com", "access_token": "at"})
+        self.assertEqual(extras["outlook_client_id"], "cid")
+        self.assertEqual(extras["outlook_refresh_token"], "mail-rt")
+        self.assertEqual(extras["outlook_login_email"], "alias@outlook.com")
+        self.assertEqual(extras["outlook_password"], "mail-pass")
+        self.assertEqual(extras["fp"]["oai-device-id"], registrar.device_id)
+        self.assertEqual(extras["fp"]["impersonate"], registrar.fingerprint["impersonate"])
+        self.assertEqual(extras["fp"]["user-agent"], registrar.fingerprint["user_agent"])
+
+    def test_other_mailboxes_and_existing_fp_untouched(self) -> None:
+        registrar = self._registrar()
+        registrar.last_mailbox = {"provider": "tempmail", "address": "x@example.test"}
+        extras = registrar.account_pool_extras({"fp": {"user-agent": "kept"}})
+        self.assertEqual(extras, {})
+
+    def test_worker_saves_extras_to_pool_but_not_downstream_result(self) -> None:
+        registrar = MagicMock()
+        registrar.account_pool_extras.return_value = {"outlook_refresh_token": "mail-rt"}
+        result = {"email": "new@example.test", "access_token": "at", "refresh_token": "rt", "source_type": "codex"}
+        saved: list[dict] = []
+        with (
+            patch.object(openai_register, "_register_with_retries", return_value=(registrar, dict(result))),
+            patch.object(openai_register.account_service, "add_account_items", side_effect=saved.extend),
+            patch.object(openai_register, "_sync_registered_account_to_sub2api", return_value=None) as sync,
+            patch.object(openai_register, "_sync_registered_account_to_cpa"),
+            patch.object(openai_register.account_service, "update_account"),
+            patch.object(openai_register.account_service, "refresh_accounts", return_value={"errors": []}),
+            patch.object(openai_register, "ensure_openai_agent_identity", return_value={}),
+        ):
+            openai_register.worker(1)
+        self.assertEqual(saved[0]["outlook_refresh_token"], "mail-rt")
+        self.assertNotIn("outlook_refresh_token", sync.call_args.args[1])
+
+
+def setUpModule() -> None:
+    # Registration flows in this module send OTPs back to back; the shared
+    # anti-429 budget is exercised explicitly in OtpSendBudgetTest.
+    global _otp_budget_patches
+    _otp_budget_patches = [
+        patch.object(openai_register, "OTP_SEND_MIN_GAP_SECONDS", 0.0),
+        patch.object(openai_register, "OTP_SEND_GAP_JITTER_SECONDS", (0.0, 0.0)),
+        patch.object(openai_register, "OTP_RATE_LIMIT_COOLDOWN_SECONDS", 0.0),
+        patch.object(openai_register, "OTP_RATE_LIMIT_COOLDOWN_JITTER_SECONDS", (0.0, 0.0)),
+    ]
+    for item in _otp_budget_patches:
+        item.start()
+
+
+def tearDownModule() -> None:
+    for item in _otp_budget_patches:
+        item.stop()
 
 
 if __name__ == "__main__":

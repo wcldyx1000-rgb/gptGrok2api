@@ -17,12 +17,12 @@ from urllib.parse import urlparse
 
 from services.account_service import account_service
 from services import cpa_service
-from services.config import DATA_DIR
+from services.config import DATA_DIR, config, restore_masked_proxy_credentials
 from services.cpa_service import normalize_cpa_delivery_config
 from services.json_file import read_json_object, write_json_file
 from services.openai_checkout_service import CheckoutSessionError, openai_checkout_service
 from services.proxy_service import normalize_proxy_url_list
-from services.register import mail_provider, openai_register
+from services.register import domain_mail, mail_provider, openai_register
 from services.register.grok_account_store import grok_account_store
 from services.sub2api_service import build_xai_oauth_export_account, normalize_sync_config
 from services.xai_oauth_delivery_service import (
@@ -30,11 +30,23 @@ from services.xai_oauth_delivery_service import (
     normalize_xai_oauth_delivery_config,
 )
 from services.xai_cli_oauth_store import xai_cli_oauth_store
+from utils.log import logger
+
+
+class OutlookPoolNotFound(ValueError):
+    """Outlook 邮箱池/邮箱不存在（API 映射为 404）。"""
+
+
+class OutlookPoolConflict(ValueError):
+    """操作与邮箱当前状态冲突，例如租约中不可重置/删除（API 映射为 409）。"""
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
 REGISTER_TARGETS = {"openai", "grok"}
 CHECKOUT_CHANNELS = {"upi", "pix"}
+# Gap between OpenAI task starts within one submission round.
+REGISTER_DIRECT_STAGGER_SECONDS = 2.5
+REGISTER_PROXY_STAGGER_SECONDS = 0.35
 DEFAULT_GROK_PROBE_CONFIG = {
     "enabled": False,
     "interval_minutes": 60,
@@ -46,10 +58,19 @@ DEFAULT_GROK_PROBE_CONFIG = {
     "last_error": "",
     "events": [],
 }
+DOMAIN_MAIL_SECRET_KEYS = ("cf_api_token", "imap_password")
+# 所有邮箱 provider 的凭据字段：GET /api/register 与 SSE 中只返回 `<key>_set`，保存时留空沿用已存值。
+PROVIDER_SECRET_KEYS = (
+    "api_key", "admin_key", "admin_password", "cf_api_key", "cf_api_token", "ddg_token", "cf_inbox_jwt",
+    "imap_password", "token", "temp_token", "access_token", "refresh_token", "password", "secret", "jwt",
+)
+GROK_SECRET_KEYS = ("api_key", "grok2api_admin_key")
+
 DEFAULT_GROK_CONFIG = {
     "signup_flow": "xconsole",
     "browser_flow_enabled": True,
     "max_mail_retries": 3,
+    "turnstile_prefetch": True,
     "provider": "yescaptcha",
     "api_key": "",
     "api_base": "",
@@ -544,6 +565,18 @@ def _default_config() -> dict:
     }
 
 
+def _normalize_egress_config(raw: object) -> dict:
+    """注册出口策略：开跑前出口检测、每出口每日上限与最短间隔（0 表示不限制）。"""
+    from services import egress_quota
+
+    source = raw if isinstance(raw, dict) else {}
+    return {
+        "check_enabled": _safe_bool(source.get("check_enabled"), True),
+        "block_unsupported": _safe_bool(source.get("block_unsupported"), True),
+        **egress_quota.normalize_settings(source),
+    }
+
+
 def _normalize(raw: dict) -> dict:
     cfg = _default_config()
     cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
@@ -607,6 +640,8 @@ def _normalize(raw: dict) -> dict:
     cfg["agent_identity_archive"] = {
         "enabled": _safe_bool(archive_source.get("enabled"), True),
     }
+    cfg["confirm_refresh_token"] = _safe_bool(cfg.get("confirm_refresh_token"), False)
+    cfg["egress"] = _normalize_egress_config(cfg.get("egress"))
     grok_source = cfg.get("grok") if isinstance(cfg.get("grok"), dict) else {}
     grok = {**DEFAULT_GROK_CONFIG, **grok_source}
     nested_bridge = grok_source.get("grok2api") if isinstance(grok_source.get("grok2api"), dict) else {}
@@ -638,6 +673,7 @@ def _normalize(raw: dict) -> dict:
     signup_flow = str(grok.get("signup_flow") or "xconsole").strip().lower()
     grok["signup_flow"] = signup_flow if signup_flow in {"legacy", "xconsole"} else "xconsole"
     grok["browser_flow_enabled"] = True
+    grok["turnstile_prefetch"] = _safe_bool(grok.get("turnstile_prefetch"), True)
     for key in (
         "api_key",
         "api_base",
@@ -729,6 +765,10 @@ class RegisterService:
         # different account job before leaving the queue lock, so a slow
         # Checkout flow cannot serialize every other saved account.
         self._checkout_retry_runners: list[threading.Thread] = []
+        # Set by stop() or an aborting task; running OpenAI tasks poll it at
+        # every wait so a stop takes effect without finishing each account.
+        self._register_stop_event = threading.Event()
+        openai_register.should_stop_callback = self._register_stop_event.is_set
         openai_register.register_log_sink = self._append_log
         openai_register.register_checkout_log_sink = self._append_checkout_log
         openai_register.register_checkout_task_sink = self._upsert_checkout_task
@@ -780,7 +820,7 @@ class RegisterService:
             backend.account_result_sink = self._persist_grok_account_snapshot
         config_keys = [
             "mail", "proxy", "total", "threads", "checkout", "sub2api_sync",
-            "cpa_sync", "agent_identity_archive",
+            "cpa_sync", "agent_identity_archive", "confirm_refresh_token", "egress",
         ]
         if runtime["target"] == "grok":
             config_keys.extend(["target", "grok"])
@@ -841,7 +881,157 @@ class RegisterService:
                 )
             )
         self._redact_outlook_pools(snapshot)
+        self._redact_domain_mail_secrets(snapshot)
         return snapshot
+
+    def get_public(self) -> dict:
+        """对外（前端 / API / SSE）使用的快照：邮箱 / 验证码服务凭据与代理密码已脱敏。
+
+        内部流程（注册线程、结账、OAuth 等）仍用 get() 取明文代理 / 凭据。
+        """
+        snapshot = self.get()
+        self._redact_provider_secrets(snapshot)
+        self._redact_grok_secrets(snapshot)
+        return config.mask_public(snapshot)
+
+    @staticmethod
+    def _redact_provider_secrets(snapshot: dict) -> None:
+        """其余邮箱 provider 的凭据同样只写不读：值置空，附带 `<key>_set` 与内部运行时缓存清理。"""
+        mail = snapshot.get("mail")
+        providers = mail.get("providers") if isinstance(mail, dict) else None
+        if not isinstance(providers, list):
+            return
+        for provider in providers:
+            if not isinstance(provider, dict):
+                continue
+            for key in [name for name in provider if str(name).startswith("_")]:
+                provider.pop(key, None)
+            for key in PROVIDER_SECRET_KEYS:
+                if key not in provider or (provider.get("type") == "custom_domain" and key in DOMAIN_MAIL_SECRET_KEYS):
+                    continue
+                value = str(provider.get(key) or "")
+                provider[key] = ""
+                provider[f"{key}_set"] = bool(value)
+
+    @staticmethod
+    def _redact_grok_secrets(snapshot: dict) -> None:
+        grok = snapshot.get("grok")
+        if not isinstance(grok, dict):
+            return
+        for key in GROK_SECRET_KEYS:
+            grok[f"{key}_set"] = bool(str(grok.get(key) or "").strip())
+            grok[key] = ""
+        headers = grok.get("custom_headers")
+        if isinstance(headers, dict):
+            # 自定义请求头常含 Authorization / API Key：只保留头名，值置空。
+            grok["custom_headers_set"] = [name for name, value in headers.items() if str(value or "")]
+            grok["custom_headers"] = {name: "" for name in headers}
+
+    @staticmethod
+    def _redact_domain_mail_secrets(snapshot: dict) -> None:
+        """自建域名邮箱的 Cloudflare 令牌与 IMAP 密码只写不读：输出为空，附带是否已设置与脱敏预览。"""
+        mail = snapshot.get("mail")
+        providers = mail.get("providers") if isinstance(mail, dict) else None
+        if not isinstance(providers, list):
+            return
+        for provider in providers:
+            if not isinstance(provider, dict) or provider.get("type") != "custom_domain":
+                continue
+            for key in DOMAIN_MAIL_SECRET_KEYS:
+                value = str(provider.get(key) or "")
+                provider[key] = ""
+                provider[f"{key}_set"] = bool(value)
+                provider[f"{key}_preview"] = domain_mail.mask_secret(value)
+
+    def _merge_domain_mail_secrets(self, updates: dict) -> None:
+        """前端提交空的令牌/密码表示不修改，沿用已保存的值（按 provider id 对齐）。"""
+        mail = updates.get("mail")
+        if not isinstance(mail, dict) or not isinstance(mail.get("providers"), list):
+            return
+        old_mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
+        old_by_id = {
+            _provider_id(provider): provider
+            for provider in (old_mail.get("providers") or [])
+            if isinstance(provider, dict) and provider.get("type") == "custom_domain" and _provider_id(provider)
+        }
+        for provider in mail["providers"]:
+            if not isinstance(provider, dict) or provider.get("type") != "custom_domain":
+                continue
+            old = old_by_id.get(_provider_id(provider)) or {}
+            for key in DOMAIN_MAIL_SECRET_KEYS:
+                if not str(provider.get(key) or "").strip():
+                    provider[key] = str(old.get(key) or "")
+                provider.pop(f"{key}_set", None)
+                provider.pop(f"{key}_preview", None)
+        self._merge_provider_secrets(updates)
+
+    def _merge_grok_secrets(self, updates: dict) -> None:
+        grok = updates.get("grok")
+        if not isinstance(grok, dict):
+            return
+        old = self._config.get("grok") if isinstance(self._config.get("grok"), dict) else {}
+        for key in GROK_SECRET_KEYS:
+            clear = _safe_bool(grok.pop(f"clear_{key}", False), False)
+            grok.pop(f"{key}_set", None)
+            if clear:
+                grok[key] = ""
+            elif not str(grok.get(key) or "").strip():
+                grok[key] = str(old.get(key) or "")
+        grok.pop("custom_headers_set", None)
+        headers = grok.get("custom_headers")
+        if isinstance(headers, dict):
+            old_headers = old.get("custom_headers") if isinstance(old.get("custom_headers"), dict) else {}
+            grok["custom_headers"] = {
+                name: (value if str(value or "").strip() else old_headers.get(name, ""))
+                for name, value in headers.items()
+            }
+
+    def _merge_provider_secrets(self, updates: dict) -> None:
+        """其余邮箱 provider：留空沿用已存凭据（按 provider id 对齐），`clear_<key>` 为真才清除。"""
+        mail = updates.get("mail")
+        if not isinstance(mail, dict) or not isinstance(mail.get("providers"), list):
+            return
+        old_mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
+        old_by_id = {
+            _provider_id(provider): provider
+            for provider in (old_mail.get("providers") or [])
+            if isinstance(provider, dict) and _provider_id(provider)
+        }
+        for provider in mail["providers"]:
+            if not isinstance(provider, dict):
+                continue
+            old = old_by_id.get(_provider_id(provider)) or {}
+            for key in PROVIDER_SECRET_KEYS:
+                if provider.get("type") == "custom_domain" and key in DOMAIN_MAIL_SECRET_KEYS:
+                    continue
+                clear = _safe_bool(provider.pop(f"clear_{key}", False), False)
+                provider.pop(f"{key}_set", None)
+                if clear:
+                    provider[key] = ""
+                elif not str(provider.get(key) or "").strip() and str(old.get(key) or "").strip():
+                    provider[key] = str(old.get(key) or "")
+
+    def domain_mail_cf_setup(self, provider_id: str) -> dict:
+        """用已保存的自建域名邮箱配置调用 Cloudflare 一键开启 catch-all 转发。"""
+        with self._lock:
+            mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
+            provider = next(
+                (
+                    dict(item)
+                    for item in (mail.get("providers") or [])
+                    if isinstance(item, dict) and item.get("type") == "custom_domain" and _provider_id(item) == str(provider_id or "").strip()
+                ),
+                None,
+            )
+        if provider is None:
+            raise ValueError("找不到这个自建域名邮箱配置，请先保存")
+        forward_to = str(provider.get("forward_to") or provider.get("imap_user") or "").strip()
+        results = domain_mail.cf_setup(
+            str(provider.get("cf_api_token") or ""),
+            domain_mail.parse_domains(provider.get("domains")),
+            forward_to,
+        )
+        return {"results": results, "usage_today": domain_mail.usage_today()}
 
     @staticmethod
     def _mask_email(email: str) -> str:
@@ -984,7 +1174,11 @@ class RegisterService:
 
     def update(self, updates: dict) -> dict:
         with self._lock:
+            # 前端回传的是脱敏后的配置：代理 `user:***@host` 还原为已存凭据，密钥留空沿用已存值。
+            updates = restore_masked_proxy_credentials(updates, self._config)  # type: ignore[assignment]
             self._merge_outlook_pools(updates)
+            self._merge_domain_mail_secrets(updates)
+            self._merge_grok_secrets(updates)
             self._config = _normalize({**self._config, **updates})
             if isinstance(updates.get("checkout"), dict):
                 self._refresh_checkout_retry_configs_locked()
@@ -992,7 +1186,7 @@ class RegisterService:
             self._sync_icloud_claims()
             self._sync_backend_config()
             self._save()
-            return self.get()
+            return self.get_public()
 
     def _refresh_checkout_retry_configs_locked(self) -> None:
         """Apply saved Checkout changes to queued jobs on their next attempt."""
@@ -1010,16 +1204,19 @@ class RegisterService:
 
     def start(self) -> dict:
         with self._lock:
+            self._register_stop_event.clear()
             if self._runner and self._runner.is_alive():
                 self._config["enabled"] = True
                 self._save()
-                return self.get()
+                return self.get_public()
             target = str(self._config.get("target") or "openai")
             self._sync_icloud_claims()
             backend = self._sync_backend_config(target)
             self._config["enabled"] = True
             self._drop_mail_proxy()
             self._logs = []
+            # 遗留的“瞬时错误被标 failed”邮箱先放回池（确定性错误不动）。
+            self.release_transient_outlook_failures()
             metrics = self._pool_metrics() if target == "openai" else {"current_quota": 0, "current_available": 0}
             job_id = uuid.uuid4().hex
             started_at = _now()
@@ -1045,7 +1242,7 @@ class RegisterService:
                     openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()
             self._runner = threading.Thread(
-                target=self._run,
+                target=self._run_with_egress_preflight,
                 args=(target, backend),
                 daemon=True,
                 name=f"{target}-register",
@@ -1071,21 +1268,23 @@ class RegisterService:
                     "yellow",
                 )
             self._runner.start()
-            return self.get()
+            return self.get_public()
 
     def stop(self) -> dict:
         with self._lock:
             self._config["enabled"] = False
+            if self._runner and self._runner.is_alive():
+                self._register_stop_event.set()
             self._config["stats"]["updated_at"] = _now()
             self._save()
-            self._append_log("已请求停止注册任务，正在等待当前运行任务结束", "yellow")
-            return self.get()
+            self._append_log("已请求停止注册任务，运行中的任务将在当前步骤结束后停止", "yellow")
+            return self.get_public()
 
     def stop_checkout_retries(self) -> dict:
         """Cancel queued/retrying payment-link jobs without changing accounts."""
         with self._lock:
             self._cancel_checkout_retries_locked()
-            return self.get()
+            return self.get_public()
 
     def clear_checkout_history(self) -> dict[str, Any]:
         """Remove terminal Checkout rows while preserving active queue state."""
@@ -1098,7 +1297,7 @@ class RegisterService:
                 if str(task.get("status") or "").strip().lower() in active_statuses
             ]
             removed = before - len(self._checkout_tasks)
-            return {"removed": removed, "register": self.get()}
+            return {"removed": removed, "register": self.get_public()}
 
     def enqueue_checkout_retries_for_accounts(self, access_tokens: list[str]) -> dict[str, int]:
         """Queue selected accounts for their configured final-link flow.
@@ -1174,7 +1373,7 @@ class RegisterService:
                 with openai_register.stats_lock:
                     openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
             self._save()
-            return self.get()
+            return self.get_public()
 
     def reset_outlook_pool(self, scope: str = "all") -> dict:
         scope = str(scope or "all").strip().lower()
@@ -1184,7 +1383,7 @@ class RegisterService:
                 self._sync_backend_config()
                 self._save()
                 self._append_log(f"已删除 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
-            return self.get()
+            return self.get_public()
         scope_aliases = {"failed": "retryable", "retryable": "retryable", "invalid": "invalid", "all": "all"}
         scope = scope_aliases.get(scope, "all")
         cleared = mail_provider.reset_outlook_token_pool_state(scope)
@@ -1194,7 +1393,7 @@ class RegisterService:
                 f"已重置 Outlook 邮箱池状态（范围={scope_label}），清除 {cleared} 条记录",
                 "yellow",
             )
-        return self.get()
+        return self.get_public()
 
     def retry_outlook_failed(self, provider_id: str, mailbox_ids: list[str]) -> dict:
         selected_ids = list(dict.fromkeys(str(value or "").strip() for value in mailbox_ids if str(value or "").strip()))
@@ -1263,6 +1462,7 @@ class RegisterService:
             started_at = _now()
             metrics = self._pool_metrics() if target == "openai" else {"current_quota": 0, "current_available": 0}
             self._config["enabled"] = True
+            self._register_stop_event.clear()
             self._logs = []
             self._config["stats"] = {
                 "job_id": uuid.uuid4().hex,
@@ -1294,7 +1494,135 @@ class RegisterService:
                 "yellow",
             )
             self._runner.start()
-            return self.get()
+            return self.get_public()
+
+    # --- Outlook 邮箱池逐邮箱管理（Ported from chatgpt-register (AGPL-3.0-only).）---
+
+    def _outlook_provider_locked(self, provider_id: str) -> tuple[dict, str]:
+        requested = str(provider_id or "").strip()
+        mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
+        providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
+        for index, item in enumerate(providers):
+            if not isinstance(item, dict) or item.get("type") != "outlook_token":
+                continue
+            item_id = _provider_id(item) or f"outlook-{index}"
+            if item_id == requested:
+                return item, item_id
+        raise OutlookPoolNotFound("Outlook 邮箱池配置不存在或已更改")
+
+    def release_transient_outlook_failures(self) -> int:
+        """启动时把遗留的“瞬时错误被标 failed”的 Outlook 邮箱放回池；确定性错误不动。"""
+        try:
+            released = mail_provider.release_outlook_transient_failed()
+        except Exception as exc:  # 状态库不可用不应阻塞启动/注册
+            logger.warning({"event": "outlook_transient_release_failed", "error": str(exc)})
+            return 0
+        if released:
+            logger.info({"event": "outlook_transient_failed_released", "count": released})
+            with self._lock:
+                self._append_log(f"已自动释放 {released} 个因瞬时错误被标记为失败的 Outlook 邮箱", "yellow")
+        return released
+
+    def outlook_pool_entries(
+        self,
+        provider_id: str,
+        *,
+        query: str = "",
+        state: str = "all",
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict:
+        with self._lock:
+            provider, resolved_id = self._outlook_provider_locked(provider_id)
+            provider_view = dict(provider)
+            pool_text = str(provider.get("mailboxes") or "")
+        base_credentials = mail_provider.parse_outlook_credentials(pool_text)
+        rows = mail_provider.outlook_pool_entries(base_credentials, provider_view)
+        keyword = str(query or "").strip().lower()
+        if keyword:
+            rows = [row for row in rows if keyword in str(row["_address"]).lower()]
+        state_counts: dict[str, int] = {}
+        for row in rows:
+            state_counts[row["state"]] = state_counts.get(row["state"], 0) + 1
+        wanted = str(state or "all").strip().lower()
+        if wanted == "in_use":
+            wanted = "leased"
+        if wanted not in {"", "all"}:
+            rows = [row for row in rows if row["state"] == wanted]
+        total = len(rows)
+        size = min(200, max(1, int(page_size or 50)))
+        pages = max(1, (total + size - 1) // size)
+        current = min(max(1, int(page or 1)), pages)
+        items = []
+        for row in rows[(current - 1) * size : current * size]:
+            address = row.pop("_address")
+            items.append({"id": _outlook_mailbox_id(resolved_id, address), **row})
+        expanded = mail_provider.expand_outlook_aliases(base_credentials, provider_view)
+        return {
+            "provider_id": resolved_id,
+            "items": items,
+            "total": total,
+            "page": current,
+            "page_size": size,
+            "pages": pages,
+            "state_counts": state_counts,
+            "stats": mail_provider.outlook_token_pool_stats(expanded),
+        }
+
+    def _outlook_address_by_id_locked(self, provider: dict, provider_id: str, mailbox_id: str) -> tuple[dict, bool]:
+        wanted = str(mailbox_id or "").strip()
+        base_credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
+        for credential in base_credentials:
+            if _outlook_mailbox_id(provider_id, credential["email"]) == wanted:
+                return credential, False
+            for item in mail_provider.expand_outlook_aliases([credential], provider):
+                if str(item.get("alias_of") or "").strip() and _outlook_mailbox_id(provider_id, item["email"]) == wanted:
+                    return item, True
+        raise OutlookPoolNotFound("邮箱已不在池中，请刷新后重试")
+
+    def reset_outlook_mailbox(self, provider_id: str, mailbox_id: str) -> dict:
+        with self._lock:
+            provider, resolved_id = self._outlook_provider_locked(provider_id)
+            credential, _is_alias = self._outlook_address_by_id_locked(provider, resolved_id, mailbox_id)
+            address = credential["email"]
+        result = mail_provider.reset_outlook_mailbox_state(address)
+        if result == "leased":
+            raise OutlookPoolConflict("该邮箱正被注册任务租用，不能重置")
+        if result == "not_resettable":
+            raise OutlookPoolConflict("该邮箱当前状态不需要重置")
+        if result == "missing":
+            raise OutlookPoolConflict("该邮箱没有可重置的状态记录（已是未使用，或状态继承自原邮箱，请重置原邮箱）")
+        with self._lock:
+            self._append_log(f"已将 Outlook 邮箱 {self._mask_email(address)} 重置为未使用", "yellow")
+        return self.outlook_pool_entries(resolved_id)
+
+    def delete_outlook_mailbox(self, provider_id: str, mailbox_id: str) -> dict:
+        with self._lock:
+            if self._runner and self._runner.is_alive():
+                raise OutlookPoolConflict("注册任务运行中，请等待当前任务结束")
+            provider, resolved_id = self._outlook_provider_locked(provider_id)
+            credential, is_alias = self._outlook_address_by_id_locked(provider, resolved_id, mailbox_id)
+            if is_alias:
+                raise ValueError("别名随原邮箱一起管理，请删除原邮箱")
+            addresses = [item["email"] for item in mail_provider.expand_outlook_aliases([credential], provider)]
+            addresses.append(credential["email"])
+            store = mail_provider._load_outlook_token_state()
+            for address in addresses:
+                entry = store.get(str(address).strip().lower())
+                if isinstance(entry, dict) and entry.get("state") == "in_use" and not mail_provider._outlook_entry_available(entry):
+                    raise OutlookPoolConflict("该邮箱（或其别名）正被注册任务租用，不能删除")
+            base_credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
+            kept = [item for item in base_credentials if item["email"].strip().lower() != credential["email"].strip().lower()]
+            provider["mailboxes"] = _serialize_outlook_pool(kept)
+            # used/family_used 记录保留：同一邮箱重新导入后不会被误当成新邮箱再次注册。
+            mail_provider.clear_outlook_token_states(
+                addresses,
+                states=set(mail_provider.OUTLOOK_RECORDED_STATES) - mail_provider.OUTLOOK_FAMILY_BLOCKING_STATES,
+            )
+            self._sync_backend_config()
+            self._save()
+            self._append_log(f"已从 Outlook 邮箱池删除 {self._mask_email(credential['email'])}", "yellow")
+        return self.outlook_pool_entries(resolved_id)
 
     def _mail_config_with_proxy(self) -> dict:
         mail = json.loads(json.dumps(self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}, ensure_ascii=False))
@@ -4177,13 +4505,106 @@ class RegisterService:
                 stats["elapsed_seconds"] = round(elapsed, 1)
                 stats["avg_seconds"] = round(elapsed / success, 1) if success else 0
                 stats["success_rate"] = round(success * 100 / max(1, success + fail), 1)
+            pool_checked = int(stats.get("pool_ok") or 0) + int(stats.get("pool_fail") or 0)
+            if pool_checked:
+                stats["pool_usable_rate"] = round(int(stats.get("pool_ok") or 0) * 100 / pool_checked, 1)
             self._config["stats"]["updated_at"] = _now()
             self._save()
+
+    def _register_running(self) -> bool:
+        return bool(self._config.get("enabled")) and not self._register_stop_event.is_set()
+
+    def _sleep_while_running(self, seconds: float) -> bool:
+        """Sleep up to ``seconds``; False as soon as the job is stopped."""
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while self._register_running():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return True
+            time.sleep(min(0.2, left))
+        return False
+
+    @staticmethod
+    def _submit_stagger_seconds(target: str, cfg: dict) -> float:
+        if target != "openai":
+            return 0.0
+        # Direct egress shares one IP across every thread; spreading the task
+        # starts keeps Cloudflare and the OTP endpoint from seeing a burst.
+        return REGISTER_DIRECT_STAGGER_SECONDS if not _clean_text(cfg.get("proxy")) else REGISTER_PROXY_STAGGER_SECONDS
+
+    def _warm_up_register_clearance(self, proxy_reference: str) -> None:
+        """开跑前按出口并行预热 auth.openai.com 的 clearance，不阻塞投放。
+
+        注册线程碰上正在预热的出口会等那一次清障完成，不会重复去刷 FlareSolverr。
+        """
+        from services.proxy_service import proxy_settings
+
+        def warmed(proxy_url: str, ok: bool) -> None:
+            if not self._register_running():
+                return
+            label = "代理出口" if proxy_url else "直连"
+            if ok:
+                self._append_log(f"已预热 Cloudflare clearance：{label}", "yellow")
+            else:
+                self._append_log(f"预热 clearance 未拿到凭证（遇到拦截时会再试）：{label}", "yellow")
+
+        try:
+            candidates = proxy_settings.egress_candidates(proxy_reference) or [""]
+            started = proxy_settings.warm_up(candidates, "https://auth.openai.com", on_done=warmed)
+        except Exception as error:
+            self._append_log(f"预热 clearance 失败（将在请求时重试）：{error}", "yellow")
+            return
+        if started:
+            self._append_log(f"正在为 {started} 个出口并行预热 Cloudflare clearance", "yellow")
+
+    def _run_with_egress_preflight(self, target: str, backend, run_options: dict[str, Any] | None = None) -> None:
+        if target == "openai" and not self._egress_preflight_passed(run_options):
+            return
+        self._run(target, backend, run_options)
+
+    def _egress_preflight_passed(self, run_options: dict[str, Any] | None = None) -> bool:
+        """开跑前检测 OpenAI 实际看到的出口；不支持地区（或全部连不上）时中止本批注册。"""
+        from services import egress_check
+
+        with self._lock:
+            cfg = {**self._config, **dict(run_options or {})}
+        settings = _normalize_egress_config(cfg.get("egress"))
+        if not settings["check_enabled"]:
+            return True
+        self._append_log("正在检测注册出口（OpenAI 实际看到的 IP 与地区）", "yellow")
+        try:
+            report = egress_check.preflight(
+                _clean_text(cfg.get("proxy")),
+                block_unsupported=bool(settings["block_unsupported"]),
+            )
+        except Exception as error:
+            self._append_log(f"出口检测出错，跳过检测继续注册：{error}", "yellow")
+            return True
+        for item in report.get("results") or []:
+            color = {"ok": "green", "warn": "yellow"}.get(str(item.get("verdict")), "red")
+            self._append_log(f"出口：{egress_check.describe(item)}", color)
+        if not report.get("ok"):
+            self._abort_register_job(str(report.get("message") or "出口检测没通过"))
+            return False
+        self._append_log(str(report.get("message") or "出口检测通过"), "green")
+        return True
+
+    def _abort_register_job(self, reason: str) -> None:
+        with self._lock:
+            already_stopped = self._register_stop_event.is_set()
+            self._config["enabled"] = False
+            self._register_stop_event.set()
+            self._save()
+        if not already_stopped:
+            self._append_log(f"注册任务已中止：{reason}", "red")
 
     def _run(self, target: str, backend, run_options: dict[str, Any] | None = None) -> None:
         options = dict(run_options or {})
         threads = max(1, int(options.get("threads") or self.get()["threads"]))
         submitted, done, success, fail = 0, 0, 0, 0
+        pool_ok, pool_fail = 0, 0
+        if target == "openai":
+            self._warm_up_register_clearance(_clean_text({**self.get(), **options}.get("proxy")))
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
@@ -4192,20 +4613,49 @@ class RegisterService:
                 cfg.update(options)
                 if target == "grok":
                     cfg["mode"] = "total"
-                while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
+                stagger = self._submit_stagger_seconds(target, cfg)
+                launched = 0
+                while len(futures) < threads and self.get()["enabled"] and not self._target_reached(cfg, submitted):
+                    if launched and stagger > 0 and not self._sleep_while_running(stagger):
+                        break
                     submitted += 1
+                    launched += 1
                     futures.add(executor.submit(backend.worker, submitted))
-                self._bump(running=len(futures), done=done, success=success, fail=fail)
+                self._bump(
+                    running=len(futures),
+                    done=done,
+                    success=success,
+                    fail=fail,
+                    pool_ok=pool_ok,
+                    pool_fail=pool_fail,
+                )
                 if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
                     break
                 if not futures:
-                    time.sleep(max(1, int(cfg.get("check_interval") or 5)))
+                    self._sleep_while_running(max(1, int(cfg.get("check_interval") or 5)))
                     continue
-                finished, futures = wait(futures, return_when=FIRST_COMPLETED)
+                finished: set = set()
+                while not finished:
+                    finished, futures = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
+                    if not finished and not self._register_running():
+                        for future in futures:
+                            future.cancel()
                 for future in finished:
-                    done += 1
+                    if future.cancelled():
+                        continue
+                    result = None
                     try:
                         result = future.result()
+                    except Exception as exc:
+                        self._append_log(f"任务结果处理失败: {type(exc).__name__}: {exc}", "red")
+                    if isinstance(result, dict) and result.get("stopped"):
+                        # Interrupted by a stop request: neither a success nor a failure.
+                        continue
+                    done += 1
+                    if result is None:
+                        fail += 1
+                        continue
+                    try:
                         ok = bool(result.get("ok")) if isinstance(result, dict) else False
                         has_grok_account = bool(
                             isinstance(result, dict)
@@ -4221,12 +4671,28 @@ class RegisterService:
                                 self._enqueue_grok_oauth_protocol(saved)
                         success += 1 if ok else 0
                         fail += 0 if ok else 1
+                        if isinstance(result, dict) and result.get("pool_usable") is True:
+                            pool_ok += 1
+                        elif isinstance(result, dict) and result.get("pool_usable") is False:
+                            pool_fail += 1
+                        abort_reason = _clean_text(result.get("abort_job")) if isinstance(result, dict) else ""
+                        if abort_reason:
+                            self._abort_register_job(abort_reason)
                     except Exception as exc:
                         fail += 1
                         self._append_log(f"任务结果处理失败: {type(exc).__name__}: {exc}", "red")
-        self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
+        self._bump(
+            running=0,
+            done=done,
+            success=success,
+            fail=fail,
+            pool_ok=pool_ok,
+            pool_fail=pool_fail,
+            finished_at=_now(),
+        )
         with self._lock:
             self._config["enabled"] = False
+            self._register_stop_event.clear()
             self._save()
         if target == "grok":
             self._append_log(f"Grok 注册任务已结束：成功 {success}，失败 {fail}", "yellow")

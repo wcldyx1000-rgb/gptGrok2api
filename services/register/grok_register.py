@@ -60,6 +60,10 @@ register_log_sink = None
 account_result_sink: Callable[[dict[str, Any]], None] | None = None
 _print_lock = threading.Lock()
 
+# A Turnstile token is accepted for about five minutes; anything older than
+# this is re-solved inline rather than risking a rejected account creation.
+TURNSTILE_PREFETCH_TTL_SECONDS = 240.0
+
 
 def _write_console(text: str, color: str = "") -> None:
     colors = {"red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m"}
@@ -205,6 +209,79 @@ def _mail_retryable(error: Exception) -> bool:
     )
 
 
+class _TurnstilePrefetch:
+    """Solve Turnstile on a helper thread while the mailbox wait runs.
+
+    The solver never touches the protocol session.  Its browser state is
+    adopted on the registration thread once the email and password steps are
+    done, so the protocol requests keep their original order.
+    """
+
+    def __init__(self, index: int, client: GrokProtocolClient, timeout: float) -> None:
+        self._index = index
+        self._client = client
+        self._timeout = timeout
+        self._cookies_before = client.session_cookie_jar()
+        self._token = ""
+        self._solution: dict[str, Any] = {}
+        self._error: Exception | None = None
+        self._solved_at = 0.0
+        self._done = threading.Event()
+        threading.Thread(
+            target=self._run,
+            daemon=True,
+            name=f"grok-turnstile-prefetch-{index}",
+        ).start()
+
+    def _run(self) -> None:
+        try:
+            token, solution = self._client.solve_turnstile_detached(list(self._cookies_before))
+            self._token = str(token or "").strip()
+            self._solution = solution if isinstance(solution, dict) else {}
+            self._solved_at = time.monotonic()
+        except Exception as error:
+            self._error = error
+        finally:
+            self._done.set()
+
+    def take(self) -> str:
+        """Return a fresh token already adopted into the session, or "" to solve inline."""
+        if not self._done.wait(self._timeout):
+            debug_step(self._index, "Turnstile 预取超时，改为当场解题", "yellow")
+            return ""
+        if self._error is not None or not self._token:
+            reason = _short_error(self._error) if self._error is not None else "未返回 token"
+            debug_step(self._index, f"Turnstile 预取失败，改为当场解题：{reason}", "yellow")
+            return ""
+        age = time.monotonic() - self._solved_at
+        if age > TURNSTILE_PREFETCH_TTL_SECONDS:
+            debug_step(self._index, f"Turnstile 预取 token 已过期（{age:.0f} 秒），重新解题", "yellow")
+            return ""
+        self._client.adopt_turnstile_solution(self._solution, cookies_before=self._cookies_before)
+        debug_step(self._index, f"使用预取的 Turnstile token（{age:.0f} 秒前生成）")
+        return self._token
+
+
+def _start_turnstile_prefetch(index: int, client: GrokProtocolClient) -> _TurnstilePrefetch | None:
+    grok_config = client.config if isinstance(getattr(client, "config", None), dict) else {}
+    if not _truthy(grok_config.get("turnstile_prefetch"), True):
+        return None
+    if not callable(getattr(client, "solve_turnstile_detached", None)):
+        return None
+    # The same-session browser solves its own visible widget; nothing to prefetch.
+    if getattr(client, "browser_bridge", None) is not None:
+        return None
+    try:
+        timeout = max(10.0, float(grok_config.get("captcha_timeout") or 180))
+    except (TypeError, ValueError):
+        timeout = 180.0
+    try:
+        return _TurnstilePrefetch(index, client, timeout)
+    except Exception as error:
+        debug_step(index, f"Turnstile 预取未启动：{_short_error(error)}", "yellow")
+        return None
+
+
 def _authorize_live_oauth(
     index: int,
     client: GrokProtocolClient,
@@ -303,6 +380,7 @@ def _register_once(
         client.bootstrap()
         client.send_email_validation_code(email)
         step(index, f"验证码已发送，等待邮件：{email}")
+        turnstile_prefetch = _start_turnstile_prefetch(index, client)
         code = mail_provider.wait_for_code(mail_config, mailbox)
         if not code:
             raise GrokProtocolError("等待 Grok 验证码超时", stage="mail", mail_retryable=True)
@@ -314,7 +392,9 @@ def _register_once(
         given_name, family_name = _random_name()
         password = _random_password()
         client.validate_password(email, password)
-        turnstile_token = client.solve_turnstile()
+        turnstile_token = turnstile_prefetch.take() if turnstile_prefetch is not None else ""
+        if not turnstile_token:
+            turnstile_token = client.solve_turnstile()
         draft = {
             "email": email,
             "password": password,

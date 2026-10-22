@@ -19,15 +19,34 @@ from curl_cffi.requests import Session
 
 from services.config import config
 from services.proxy_format import colon_proxy_to_url
+from utils.locale_env import LocaleEnv, locale_from_fields
 
 
 FlareSolverrRequestMethod = Callable[[str, bytes, dict[str, str], float], bytes]
 
+# FlareSolverr 每个会话就是一个常驻 Chrome：设上限，空闲久了自动关，避免出口多时把内存吃满。
+DEFAULT_FLARESOLVERR_MAX_SESSIONS = 4
+DEFAULT_FLARESOLVERR_SESSION_IDLE_SEC = 600
+# 凭证用到有效期的这个比例时后台提前换新，请求线程不用原地等一次清障。
+DEFAULT_CLEARANCE_EARLY_REFRESH_RATIO = 0.8
+
 DEFAULT_PROXY_NODE_IMAGE_CONCURRENCY_LIMIT = 30
+MAX_PROXY_NODE_IMAGE_CONCURRENCY_LIMIT = 10000
+# 出口连续失败多少次后临时停用、停用多久（秒）。
+DEFAULT_PROXY_NODE_FAIL_THRESHOLD = 1
+DEFAULT_PROXY_NODE_COOLDOWN_SEC = 600
 _COMPOSE_PRIVOXY_URL = "http://privoxy:8118"
 _DEFAULT_HOST_PRIVOXY_PORT = 40080
 def _replace_proxy_scheme(candidate: str, scheme: str) -> str:
     return f"{scheme}://{candidate.split('://', 1)[-1]}"
+
+
+class ProxyReferenceUnavailableError(RuntimeError):
+    """配置里引用的代理组不可用（已删除/停用/无可用节点）：明确报错，不静默回落直连泄露真实 IP。"""
+
+
+class ImageEgressDeadlineError(RuntimeError):
+    """图片请求在截止时间（time.monotonic 口径）前没等到出口并发名额。"""
 
 
 def normalize_proxy_url(url: str) -> str:
@@ -106,6 +125,8 @@ class ProxyRuntimeProfile:
     skip_ssl_verify: bool = False
     reset_session_status_codes: tuple[int, ...] = field(default_factory=lambda: (403,))
     clearance: dict[str, object] = field(default_factory=dict, repr=False)
+    # 出口地区环境（时区 + 语言）；None 表示未配置，调用方沿用原默认值。
+    locale: LocaleEnv | None = None
 
     @property
     def clearance_enabled(self) -> bool:
@@ -132,6 +153,35 @@ class ProxyRuntimeProfile:
             return max(1, int(self.clearance.get("timeout_sec") or 60))
         except (OverflowError, TypeError, ValueError):
             return 60
+
+    @property
+    def max_sessions(self) -> int:
+        try:
+            return min(16, max(1, int(self.clearance.get("max_sessions") or DEFAULT_FLARESOLVERR_MAX_SESSIONS)))
+        except (OverflowError, TypeError, ValueError):
+            return DEFAULT_FLARESOLVERR_MAX_SESSIONS
+
+    @property
+    def session_idle_sec(self) -> int:
+        try:
+            return max(30, int(self.clearance.get("session_idle_sec") or DEFAULT_FLARESOLVERR_SESSION_IDLE_SEC))
+        except (OverflowError, TypeError, ValueError):
+            return DEFAULT_FLARESOLVERR_SESSION_IDLE_SEC
+
+    @property
+    def early_refresh_ratio(self) -> float:
+        try:
+            value = float(self.clearance.get("early_refresh_ratio") or DEFAULT_CLEARANCE_EARLY_REFRESH_RATIO)
+        except (OverflowError, TypeError, ValueError):
+            return DEFAULT_CLEARANCE_EARLY_REFRESH_RATIO
+        return min(0.95, max(0.1, value))
+
+
+@dataclass
+class _FlareSession:
+    session_id: str
+    last_used: float
+    in_use: int = 0
 
 
 @dataclass(frozen=True)
@@ -166,6 +216,7 @@ class ProxyGroupSelection:
     image_concurrency_limit: int = 0
     image_egress_reserved: bool = False
     image_egress_wait_ms: int = 0
+    locale: LocaleEnv | None = None
 
     @property
     def egress_key(self) -> str:
@@ -193,27 +244,226 @@ class ResolvedProxyReference:
     image_concurrency_limit: int = 0
     image_egress_reserved: bool = False
     image_egress_wait_ms: int = 0
+    locale: LocaleEnv | None = None
 
 
 class FlareSolverrClearanceProvider:
-    def __init__(self, flaresolverr_url: str, request_method: FlareSolverrRequestMethod | None = None) -> None:
+    """FlareSolverr 清障客户端，按出口复用浏览器会话。
+
+    同一出口复用一个 FlareSolverr session（常驻 Chrome），第二次过验证不用再冷启动浏览器；
+    会话数有上限，满了先关最久没用的空闲会话，全部在忙时退回一次性无会话请求。
+    """
+
+    def __init__(
+        self,
+        flaresolverr_url: str,
+        request_method: FlareSolverrRequestMethod | None = None,
+        *,
+        max_sessions: int = DEFAULT_FLARESOLVERR_MAX_SESSIONS,
+        idle_sec: float = DEFAULT_FLARESOLVERR_SESSION_IDLE_SEC,
+        clock: Callable[[], float] | None = None,
+        start_sweeper: bool = True,
+    ) -> None:
         self.flaresolverr_url = str(flaresolverr_url or "").strip().rstrip("/")
         self._request_method = request_method or self._urllib_post
+        self._sessions: dict[str, _FlareSession] = {}
+        self._session_lock = threading.Lock()
+        self.max_sessions = max(1, int(max_sessions))
+        self.idle_sec = max(1.0, float(idle_sec))
+        self._clock = clock or time.time
+        self._start_sweeper = start_sweeper
+        self._sweeper: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+    def configure(self, *, max_sessions: int | None = None, idle_sec: float | None = None) -> None:
+        """跟随设置页调整会话上限和空闲回收时间；收紧上限时多出来的空闲会话在下次取会话时淘汰。"""
+        if max_sessions is not None:
+            self.max_sessions = max(1, int(max_sessions))
+        if idle_sec is not None:
+            self.idle_sec = max(1.0, float(idle_sec))
 
     def get_clearance(self, target_url: str, proxy_url: str = "", timeout_sec: int = 60) -> ClearanceBundle | None:
         if not self.flaresolverr_url:
             return None
 
         timeout = _coerce_timeout(timeout_sec)
+        proxy_url = normalize_proxy_url(proxy_url)
+        session_id = self._ensure_session(proxy_url, timeout)
+        try:
+            data = self._request(self._request_payload(target_url, timeout, session_id, proxy_url), timeout)
+            if data is None and session_id:
+                # 会话可能已被 FlareSolverr 回收或浏览器崩了：丢掉它，换一个再试一次。
+                self._drop_session(proxy_url, session_id)
+                session_id = self._ensure_session(proxy_url, timeout)
+                data = self._request(self._request_payload(target_url, timeout, session_id, proxy_url), timeout)
+        finally:
+            self._release_session(proxy_url, session_id)
+
+        if not isinstance(data, dict) or str(data.get("status") or "").lower() != "ok":
+            message = str(data.get("message") or "").lower() if isinstance(data, dict) else ""
+            if session_id and "session" in message:
+                self._drop_session(proxy_url, session_id)
+            return None
+        solution = data.get("solution")
+        if not isinstance(solution, dict):
+            return None
+
+        target_host = _host_from_url(target_url)
+        # 复用的浏览器会话里会攒下目标站的业务 Cookie（登录态、设备 ID 等），只带走 CF 相关的。
+        cookies = {
+            name: value
+            for name, value in _filter_flaresolverr_cookies(solution.get("cookies"), target_host).items()
+            if _is_clearance_cookie(name)
+        }
+        user_agent = str(solution.get("userAgent") or "").strip()
+        if not cookies and not user_agent:
+            return None
+        return ClearanceBundle(
+            target_host=target_host,
+            proxy_url=proxy_url,
+            cookies=cookies,
+            user_agent=user_agent,
+        )
+
+    def close_idle_sessions(self) -> int:
+        """关掉空闲超过 idle_sec 的会话，返回关掉的个数。"""
+        now = self._clock()
+        expired: list[str] = []
+        with self._session_lock:
+            for key, item in list(self._sessions.items()):
+                if item.in_use <= 0 and now - item.last_used >= self.idle_sec:
+                    expired.append(self._sessions.pop(key).session_id)
+        for session_id in expired:
+            self._destroy_remote(session_id)
+        return len(expired)
+
+    def session_count(self) -> int:
+        with self._session_lock:
+            return len(self._sessions)
+
+    def shutdown(self) -> None:
+        """停止空闲回收线程并关闭全部会话（服务退出时调用）。"""
+        self._stop_event.set()
+        with self._session_lock:
+            session_ids = [item.session_id for item in self._sessions.values()]
+            self._sessions.clear()
+            sweeper = self._sweeper
+        for session_id in session_ids:
+            self._destroy_remote(session_id)
+        if sweeper is not None and sweeper is not threading.current_thread():
+            sweeper.join(timeout=2.0)
+
+    @staticmethod
+    def _request_payload(target_url: str, timeout: float, session_id: str, proxy_url: str) -> dict[str, object]:
         payload: dict[str, object] = {
             "cmd": "request.get",
             "url": str(target_url or ""),
             "maxTimeout": int(timeout * 1000),
+            # 只要 Cookie 和 UA：不回传整页 HTML、不加载媒体，过验证更快也更省内存（旧版 FlareSolverr 会忽略）。
+            "returnOnlyCookies": True,
+            "disableMedia": True,
         }
-        proxy_url = normalize_proxy_url(proxy_url)
+        if session_id:
+            payload["session"] = session_id
         if proxy_url:
+            # 会话在 sessions.create 时已绑定同一代理；部分版本会忽略带会话请求里的 proxy，照带无害。
             payload["proxy"] = {"url": proxy_url}
+        return payload
 
+    def _ensure_session(self, proxy_url: str, timeout: float) -> str:
+        """取这个出口的会话并标记占用；满了先关最久没用的空闲会话，都在忙就不用会话。"""
+        if self._stop_event.is_set():
+            return ""
+        key = proxy_url or "direct"
+        self.close_idle_sessions()
+        evict: list[str] = []
+        with self._session_lock:
+            existing = self._sessions.get(key)
+            if existing is not None:
+                existing.in_use += 1
+                existing.last_used = self._clock()
+                return existing.session_id
+            while len(self._sessions) >= self.max_sessions:
+                idle = [(item.last_used, name) for name, item in self._sessions.items() if item.in_use <= 0]
+                if not idle:
+                    # 每个会话都在过验证：这次走一次性的无会话请求，不再多开浏览器。
+                    return ""
+                _last_used, victim = min(idle)
+                evict.append(self._sessions.pop(victim).session_id)
+        for session_id in evict:
+            self._destroy_remote(session_id)
+
+        create: dict[str, object] = {"cmd": "sessions.create"}
+        if proxy_url:
+            create["proxy"] = {"url": proxy_url}
+        data = self._request(create, min(timeout, 20.0))
+        session_id = ""
+        if isinstance(data, dict) and str(data.get("status") or "").lower() == "ok":
+            session_id = str(data.get("session") or "").strip()
+        if not session_id:
+            return ""
+        orphan = ""
+        with self._session_lock:
+            current = self._sessions.get(key)
+            if current is not None:
+                # 并发时别的线程先建好了：用它的，把自己这个关掉。
+                current.in_use += 1
+                current.last_used = self._clock()
+                orphan, session_id = session_id, current.session_id
+            else:
+                self._sessions[key] = _FlareSession(session_id=session_id, last_used=self._clock(), in_use=1)
+        if orphan:
+            self._destroy_remote(orphan)
+        self._ensure_sweeper()
+        return session_id
+
+    def _release_session(self, proxy_url: str, session_id: str) -> None:
+        if not session_id:
+            return
+        key = proxy_url or "direct"
+        with self._session_lock:
+            item = self._sessions.get(key)
+            if item is not None and item.session_id == session_id:
+                item.in_use = max(0, item.in_use - 1)
+                item.last_used = self._clock()
+
+    def _drop_session(self, proxy_url: str, session_id: str) -> None:
+        key = proxy_url or "direct"
+        with self._session_lock:
+            item = self._sessions.get(key)
+            if item is not None and item.session_id == session_id:
+                self._sessions.pop(key, None)
+        if session_id:
+            self._destroy_remote(session_id)
+
+    def _destroy_remote(self, session_id: str) -> None:
+        if session_id:
+            self._request({"cmd": "sessions.destroy", "session": session_id}, 8.0)
+
+    def _ensure_sweeper(self) -> None:
+        if not self._start_sweeper or self._stop_event.is_set():
+            return
+        with self._session_lock:
+            if self._sweeper is not None and self._sweeper.is_alive():
+                return
+            interval = max(5.0, min(60.0, self.idle_sec / 4))
+
+            def sweep() -> None:
+                # 没有会话时退出，下次建会话再起；服务退出时由 stop_event 叫醒。
+                while not self._stop_event.wait(interval):
+                    try:
+                        self.close_idle_sessions()
+                    except Exception:
+                        pass
+                    if not self.session_count():
+                        return
+
+            self._sweeper = threading.Thread(target=sweep, daemon=True, name="flaresolverr-session-sweeper")
+            self._sweeper.start()
+
+    def _request(self, payload: dict[str, object], timeout: float) -> dict | None:
+        if not self.flaresolverr_url:
+            return None
         endpoint = f"{self.flaresolverr_url}/v1"
         try:
             body = json.dumps(payload).encode("utf-8")
@@ -226,24 +476,7 @@ class FlareSolverrClearanceProvider:
             data = json.loads(raw_response.decode("utf-8") if isinstance(raw_response, bytes) else raw_response)
         except Exception:
             return None
-
-        if not isinstance(data, dict) or str(data.get("status") or "").lower() != "ok":
-            return None
-        solution = data.get("solution")
-        if not isinstance(solution, dict):
-            return None
-
-        target_host = _host_from_url(target_url)
-        cookies = _filter_flaresolverr_cookies(solution.get("cookies"), target_host)
-        user_agent = str(solution.get("userAgent") or "").strip()
-        if not cookies and not user_agent:
-            return None
-        return ClearanceBundle(
-            target_host=target_host,
-            proxy_url=proxy_url,
-            cookies=cookies,
-            user_agent=user_agent,
-        )
+        return data if isinstance(data, dict) else None
 
     @staticmethod
     def _urllib_post(endpoint: str, body: bytes, headers: dict[str, str], timeout: float) -> bytes:
@@ -266,6 +499,14 @@ class ProxySettingsStore:
         self._egress_inflight: dict[str, int] = {}
         self._lock = threading.RLock()
         self._egress_condition = threading.Condition(self._lock)
+        self._background_refreshing: set[tuple[str, str]] = set()
+        self._challenge_cooldown_until: dict[str, float] = {}
+        # 出口节点健康：连续失败次数、临时停用截止时间（time.time()）、最近错误；只在内存里，不改用户配置。
+        self._node_failures: dict[str, int] = {}
+        self._node_disabled_until: dict[str, float] = {}
+        self._node_last_error: dict[str, str] = {}
+        self._background_starter: Callable[[Callable[[], None]], None] = self._start_daemon
+        self._closed = threading.Event()
 
     def get_profile(
         self,
@@ -274,6 +515,7 @@ class ProxySettingsStore:
         resource: bool = False,
         upstream: bool = False,
         reserve_image_egress: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> ProxyRuntimeProfile:
         runtime = self._get_runtime_settings()
         clearance = dict(runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {})
@@ -298,6 +540,7 @@ class ProxySettingsStore:
         image_concurrency_limit = 0
         image_egress_reserved = False
         image_egress_wait_ms = 0
+        locale: LocaleEnv | None = None
 
         account_proxy = _clean((account or {}).get("proxy") if isinstance(account, dict) else "")
         if account_proxy:
@@ -306,6 +549,7 @@ class ProxySettingsStore:
                 source="account",
                 terminal_when_unresolved=True,
                 reserve_image_egress=reserve_image_egress,
+                deadline_monotonic=deadline_monotonic,
             )
             selected_proxy, source, terminal = resolved.proxy_url, resolved.source, resolved.terminal
             egress_key = resolved.egress_key
@@ -316,6 +560,7 @@ class ProxySettingsStore:
             image_concurrency_limit = resolved.image_concurrency_limit
             image_egress_reserved = resolved.image_egress_reserved
             image_egress_wait_ms = resolved.image_egress_wait_ms
+            locale = resolved.locale
 
         if not selected_proxy and not terminal:
             account_group_proxy = self._account_group_proxy_reference(account)
@@ -325,6 +570,7 @@ class ProxySettingsStore:
                     source="account_group",
                     terminal_when_unresolved=False,
                     reserve_image_egress=reserve_image_egress,
+                    deadline_monotonic=deadline_monotonic,
                 )
                 selected_proxy, source, terminal = resolved.proxy_url, resolved.source, resolved.terminal
                 egress_key = resolved.egress_key
@@ -335,6 +581,7 @@ class ProxySettingsStore:
                 image_concurrency_limit = resolved.image_concurrency_limit
                 image_egress_reserved = resolved.image_egress_reserved
                 image_egress_wait_ms = resolved.image_egress_wait_ms
+                locale = resolved.locale
 
         if not selected_proxy and not terminal:
             explicit_proxy = _clean(proxy)
@@ -344,6 +591,7 @@ class ProxySettingsStore:
                     source="explicit",
                     terminal_when_unresolved=True,
                     reserve_image_egress=reserve_image_egress,
+                    deadline_monotonic=deadline_monotonic,
                 )
                 selected_proxy, source, terminal = resolved.proxy_url, resolved.source, resolved.terminal
                 egress_key = resolved.egress_key
@@ -354,6 +602,7 @@ class ProxySettingsStore:
                 image_concurrency_limit = resolved.image_concurrency_limit
                 image_egress_reserved = resolved.image_egress_reserved
                 image_egress_wait_ms = resolved.image_egress_wait_ms
+                locale = resolved.locale
 
         if not selected_proxy and not terminal:
             legacy_proxy = _clean(self._config.get_proxy_settings())
@@ -363,6 +612,7 @@ class ProxySettingsStore:
                     source="default",
                     terminal_when_unresolved=False,
                     reserve_image_egress=reserve_image_egress,
+                    deadline_monotonic=deadline_monotonic,
                 )
                 selected_proxy, source, terminal = resolved.proxy_url, resolved.source, resolved.terminal
                 egress_key = resolved.egress_key
@@ -373,12 +623,17 @@ class ProxySettingsStore:
                 image_concurrency_limit = resolved.image_concurrency_limit
                 image_egress_reserved = resolved.image_egress_reserved
                 image_egress_wait_ms = resolved.image_egress_wait_ms
+                locale = resolved.locale
 
         if not selected_proxy and not terminal and runtime_proxy:
             selected_proxy = runtime_proxy
             source = runtime_proxy_source
             egress_key = _egress_key_for_proxy(runtime_proxy)
             egress_label = runtime_proxy_source
+
+        if locale is None and selected_proxy:
+            # 账号 / 默认代理直接指向某个出口槽位时，沿用该槽位设置的时区和语言。
+            locale = _egress_slot_locale(selected_proxy)
 
         return ProxyRuntimeProfile(
             proxy_url=normalize_proxy_url(selected_proxy),
@@ -397,7 +652,20 @@ class ProxySettingsStore:
             skip_ssl_verify=bool(runtime.get("skip_ssl_verify")),
             reset_session_status_codes=_status_codes_tuple(runtime.get("reset_session_status_codes")),
             clearance=clearance,
+            locale=locale or self._default_locale(source, runtime),
         )
+
+    def _default_locale(self, source: str, runtime: Mapping) -> LocaleEnv | None:
+        """没有代理组节点 / 槽位地区环境时的兜底：
+        运行时单代理沿用 proxy_runtime 的时区语言；直连与自定义代理 URL 优先使用“直连出口地区环境”，
+        未配置则保持原行为（proxy_runtime 的时区语言）。
+        """
+        if not str(source or "").startswith("runtime"):
+            getter = getattr(self._config, "get_direct_locale", None)
+            direct = LocaleEnv.from_config(getter()) if callable(getter) else None
+            if direct is not None:
+                return direct
+        return locale_from_fields(runtime)
 
     def get_fallback_proxy_reference(self) -> str:
         try:
@@ -479,6 +747,12 @@ class ProxySettingsStore:
         if bundle is None or not bundle.is_valid_for(target_host, profile.proxy_url):
             return merged_headers
 
+        # 请求头路径也要触发提前刷新：注册/出图线程每个请求只走 build_headers，
+        # 不然凭证只会在到期后遇挑战才强刷。只起后台刷新，当前请求仍用旧凭证。
+        self._maybe_refresh_early(
+            profile, target_url, self._cache_key(profile.proxy_url, target_host), bundle
+        )
+
         if bundle.user_agent and _find_header_key(merged_headers, "user-agent") is None:
             merged_headers["User-Agent"] = bundle.user_agent
 
@@ -515,6 +789,7 @@ class ProxySettingsStore:
 
         cached_before = self._get_cached_bundle(key)
         if cached_before is not None and not force and cached_before.is_valid_for(target_host, profile.proxy_url):
+            self._maybe_refresh_early(profile, target_url, key, cached_before)
             return cached_before
 
         lock = self._get_flight_lock(key)
@@ -529,21 +804,23 @@ class ProxySettingsStore:
                 return cached_now
 
             flaresolverr_url = str(profile.clearance.get("flaresolverr_url") or "").strip()
-            provider = self._get_provider(flaresolverr_url)
+            provider = self._get_provider(flaresolverr_url, profile)
             new_bundle = provider.get_clearance(target_url, proxy_url=profile.proxy_url, timeout_sec=profile.timeout_sec)
             if new_bundle is not None:
-                expires_at = time.time() + profile.refresh_interval if profile.refresh_interval else None
-                if (
-                    not new_bundle.target_host
-                    or normalize_proxy_url(new_bundle.proxy_url) != normalize_proxy_url(profile.proxy_url)
-                    or new_bundle.expires_at != expires_at
-                ):
-                    new_bundle = replace(
-                        new_bundle,
-                        target_host=new_bundle.target_host or target_host,
-                        proxy_url=profile.proxy_url,
-                        expires_at=expires_at,
-                    )
+                # 新凭证只带回本次下发的 CF Cookie，旧凭证里其余仍有效的 Cookie 和 UA 一并保留。
+                keep = cached_now or cached_before
+                merged_cookies = dict(keep.cookies) if keep is not None else {}
+                merged_cookies.update(new_bundle.cookies)
+                now = time.time()
+                new_bundle = replace(
+                    new_bundle,
+                    target_host=new_bundle.target_host or target_host,
+                    proxy_url=profile.proxy_url,
+                    cookies=merged_cookies,
+                    user_agent=new_bundle.user_agent or (keep.user_agent if keep is not None else ""),
+                    created_at=now,
+                    expires_at=now + profile.refresh_interval if profile.refresh_interval else None,
+                )
                 self._set_cached_bundle(key, new_bundle)
                 return new_bundle
             return cached_now or cached_before
@@ -564,17 +841,323 @@ class ProxySettingsStore:
         with self._lock:
             self._clearance_cache.pop(key, None)
 
+    def warm_up(
+        self,
+        proxies: list[str],
+        target_url: str = "https://auth.openai.com",
+        *,
+        on_done: Callable[[str, bool], None] | None = None,
+    ) -> int:
+        """按出口并行预热 FlareSolverr clearance，不阻塞调用方；返回起了几个预热。
+
+        已有有效凭证的出口不会重复清障；请求线程碰上正在预热的出口会等这一次完成（single flight）。
+        """
+        started = 0
+        seen: set[str] = set()
+        for raw in proxies:
+            reference = _clean(raw)
+            try:
+                profile = self.get_profile(proxy=reference, upstream=True)
+            except ProxyReferenceUnavailableError:
+                continue
+            if not profile.clearance_enabled or profile.clearance_mode != "flaresolverr":
+                continue
+            if profile.proxy_url in seen:
+                continue
+            seen.add(profile.proxy_url)
+            proxy_url = profile.proxy_url
+
+            def run(proxy_url: str = proxy_url, reference: str = reference) -> None:
+                ok = False
+                try:
+                    # 代理组引用每次解析可能落到不同节点，按已解析出的节点地址预热。
+                    ok = self.refresh_clearance(
+                        target_url=target_url,
+                        proxy=proxy_url or reference,
+                        upstream=True,
+                    ) is not None
+                except Exception:
+                    ok = False
+                if on_done is not None:
+                    try:
+                        on_done(proxy_url, ok)
+                    except Exception:
+                        pass
+
+            if self._run_in_background(run):
+                started += 1
+        return started
+
+    def warm_up_on_start(self, target_url: str = "https://chatgpt.com") -> int:
+        """按设置页“启动后预热 clearance”在服务启动时预热默认出口；未开启时什么都不做。"""
+        clearance = self._get_runtime_settings().get("clearance")
+        if not isinstance(clearance, dict) or not clearance.get("warm_up_on_start"):
+            return 0
+        try:
+            reference = _clean(self._config.get_proxy_settings())
+        except AttributeError:
+            reference = ""
+        return self.warm_up(self.egress_candidates(reference) or [""], target_url)
+
+    def proxy_group_references(self, group_id: object) -> list[str]:
+        """列出仍引用该代理组（group:<id>）的地方；供删除前检查，空列表表示可以安全删除。
+
+        检查：全局默认代理、备用代理、账号分组、各账号自己的 proxy、注册任务的 proxy。
+        任一来源读取失败只跳过该来源，不让检查本身抛错。
+        """
+        target = _clean(group_id)
+        if not target:
+            return []
+
+        def refers(value: object) -> bool:
+            raw = _clean(value)
+            return raw.lower().startswith("group:") and _clean(raw.split(":", 1)[1]) == target
+
+        found: list[str] = []
+        try:
+            if refers(self._config.get_proxy_settings()):
+                found.append("全局默认代理")
+        except Exception:
+            pass
+        try:
+            if refers(self.get_fallback_proxy_reference()):
+                found.append("备用代理")
+        except Exception:
+            pass
+        try:
+            for group in self._config_dict_list("account_groups"):
+                if refers(group.get("proxy")) or _clean(group.get("proxy_group_id")) == target:
+                    found.append(f"账号分组「{_clean(group.get('name')) or _clean(group.get('id')) or '?'}」")
+        except Exception:
+            pass
+        try:
+            from services.account_service import account_service
+
+            using = sum(1 for item in account_service.list_accounts() if refers(item.get("proxy")))
+            if using:
+                found.append(f"{using} 个账号")
+        except Exception:
+            pass
+        try:
+            from services.register_service import register_service
+
+            if refers(register_service.get().get("proxy")):
+                found.append("注册任务代理")
+        except Exception:
+            pass
+        return found
+
+    def egress_candidates(self, reference: str = "") -> list[str]:
+        """展开一个代理引用能落到的全部出口：代理组展开为启用的节点，其余原样返回。"""
+        raw = _clean(reference)
+        if raw.lower().startswith("group:"):
+            group_id = raw.split(":", 1)[1].strip()
+            for group in self._config_dict_list("proxy_groups"):
+                if _clean(group.get("id")) != group_id or group.get("enabled") is False:
+                    continue
+                return [
+                    _clean(node.get("url"))
+                    for node in group.get("nodes", [])
+                    if isinstance(node, dict) and node.get("enabled", True) and _clean(node.get("url"))
+                ]
+            return []
+        return [raw]
+
+    def mark_challenge(self, proxy: str = "", *, cooldown_sec: float = 4.0) -> None:
+        """记录某出口刚被 Cloudflare 拦截，短时间内让各线程错开重试。"""
+        key = normalize_proxy_url(_clean(proxy)) or "direct"
+        with self._lock:
+            self._challenge_cooldown_until[key] = max(
+                float(self._challenge_cooldown_until.get(key) or 0),
+                time.time() + max(0.5, float(cooldown_sec)),
+            )
+
+    def wait_challenge_cooldown(
+        self,
+        proxy: str = "",
+        *,
+        sleep: Callable[[float], object] | None = None,
+    ) -> float:
+        """若出口处于挑战冷却窗口则等待（加随机抖动，避免冷却结束瞬间齐射），返回实际等待秒数。"""
+        key = normalize_proxy_url(_clean(proxy)) or "direct"
+        with self._lock:
+            until = float(self._challenge_cooldown_until.get(key) or 0)
+        delay = until - time.time()
+        if delay <= 0:
+            return 0.0
+        delay += random.uniform(0.2, 1.2)
+        (sleep or time.sleep)(delay)
+        return delay
+
+    def report_proxy_outcome(self, proxy: str, *, ok: bool, error: str = "") -> bool:
+        """上报一次出口结果：连续失败达到阈值后临时停用该出口，冷却后自动恢复。
+
+        停用只影响代理组选节点（停用的节点不再被选中，整组都停用时照常选），
+        不会删除或改动用户保存的代理配置。返回这次上报是否让出口进入停用。
+        """
+        key = normalize_proxy_url(_clean(proxy))
+        if not key:
+            return False
+        with self._lock:
+            if ok:
+                self._node_failures.pop(key, None)
+                self._node_disabled_until.pop(key, None)
+                self._node_last_error.pop(key, None)
+                return False
+            threshold, cooldown = self._node_health_settings()
+            failures = int(self._node_failures.get(key, 0)) + 1
+            self._node_last_error[key] = _redact_url_credentials(_clean(error))[:200]
+            if failures < threshold:
+                self._node_failures[key] = failures
+                return False
+            now = time.time()
+            already_disabled = float(self._node_disabled_until.get(key) or 0) > now
+            self._node_disabled_until[key] = now + cooldown
+            # 恢复后重新从 0 计数，再连续失败到阈值才会再次停用。
+            self._node_failures[key] = 0
+            return not already_disabled
+
+    def is_proxy_disabled(self, proxy: str, *, now: float | None = None) -> bool:
+        key = normalize_proxy_url(_clean(proxy))
+        if not key:
+            return False
+        current = time.time() if now is None else now
+        with self._lock:
+            until = float(self._node_disabled_until.get(key) or 0)
+            if until and until <= current:
+                self._node_disabled_until.pop(key, None)
+                return False
+            return until > current
+
+    def disabled_proxies(self) -> set[str]:
+        now = time.time()
+        with self._lock:
+            for key, until in list(self._node_disabled_until.items()):
+                if until <= now:
+                    self._node_disabled_until.pop(key, None)
+            return set(self._node_disabled_until)
+
+    def node_health_snapshot(self) -> list[dict[str, object]]:
+        """当前被临时停用的出口（地址已脱敏），供页面展示。"""
+        now = time.time()
+        with self._lock:
+            items = [
+                {
+                    "proxy": _redact_url_credentials(key),
+                    "disabled_until": until,
+                    "remaining_sec": max(0, int(until - now)),
+                    "last_error": self._node_last_error.get(key, ""),
+                }
+                for key, until in self._node_disabled_until.items()
+                if until > now
+            ]
+        return sorted(items, key=lambda item: -int(item["remaining_sec"]))
+
+    def _node_health_settings(self) -> tuple[int, float]:
+        runtime = self._get_runtime_settings()
+        try:
+            threshold = int(runtime.get("node_fail_threshold") or DEFAULT_PROXY_NODE_FAIL_THRESHOLD)
+        except (TypeError, ValueError):
+            threshold = DEFAULT_PROXY_NODE_FAIL_THRESHOLD
+        try:
+            cooldown = float(runtime.get("node_cooldown_sec") or DEFAULT_PROXY_NODE_COOLDOWN_SEC)
+        except (TypeError, ValueError):
+            cooldown = float(DEFAULT_PROXY_NODE_COOLDOWN_SEC)
+        return max(1, threshold), max(10.0, cooldown)
+
+    def shutdown(self) -> None:
+        """停止后台清障任务并关闭 FlareSolverr 会话（服务退出时调用）。"""
+        self._closed.set()
+        with self._lock:
+            providers = list(self._provider_cache.values())
+        for provider in providers:
+            close = getattr(provider, "shutdown", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+    def _maybe_refresh_early(
+        self,
+        profile: ProxyRuntimeProfile,
+        target_url: str,
+        key: tuple[str, str],
+        bundle: ClearanceBundle,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """凭证有效期用掉 early_refresh_ratio（默认 80%）后在后台换新；返回是否起了后台刷新。"""
+        if profile.clearance_mode != "flaresolverr" or bundle.expires_at is None:
+            return False
+        lifetime = bundle.expires_at - bundle.created_at
+        if lifetime <= 0:
+            return False
+        current = time.time() if now is None else now
+        if current < bundle.created_at + lifetime * profile.early_refresh_ratio:
+            return False
+        with self._lock:
+            if key in self._background_refreshing:
+                return False
+            self._background_refreshing.add(key)
+        proxy_url = profile.proxy_url
+
+        def run() -> None:
+            try:
+                self.refresh_clearance(target_url=target_url, proxy=proxy_url, force=True, upstream=True)
+            except Exception:
+                pass
+            finally:
+                with self._lock:
+                    self._background_refreshing.discard(key)
+
+        if self._run_in_background(run):
+            return True
+        with self._lock:
+            self._background_refreshing.discard(key)
+        return False
+
+    def _run_in_background(self, target: Callable[[], None]) -> bool:
+        if self._closed.is_set():
+            return False
+        try:
+            self._background_starter(target)
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def _start_daemon(target: Callable[[], None]) -> None:
+        threading.Thread(target=target, daemon=True, name="clearance-background-refresh").start()
+
     def get_runtime_status(self) -> dict[str, object]:
-        profile = self.get_profile(upstream=True)
+        try:
+            profile = self.get_profile(upstream=True)
+        except ProxyReferenceUnavailableError as error:
+            # 状态接口不因默认代理引用失效而 500：把原因直接报出来。
+            runtime = self._get_runtime_settings()
+            return {
+                "enabled": bool(runtime.get("enabled")),
+                "egress_mode": str(runtime.get("egress_mode") or "direct"),
+                "has_proxy": False,
+                "reference_error": str(error),
+                "disabled_proxy_nodes": self.node_health_snapshot(),
+            }
         with self._lock:
             cached_hosts = [host for _proxy, host in self._clearance_cache]
             cached_count = len(self._clearance_cache)
+            providers = list(self._provider_cache.values())
+        session_count = 0
+        for provider in providers:
+            counter = getattr(provider, "session_count", None)
+            if callable(counter):
+                session_count += int(counter())
         return {
             "enabled": profile.runtime_enabled,
             "egress_mode": profile.egress_mode,
             "proxy_source": profile.proxy_source,
-            "egress_key": profile.egress_key,
-            "egress_label": profile.egress_label,
+            "egress_key": _redact_url_credentials(profile.egress_key),
+            "egress_label": _redact_url_credentials(profile.egress_label),
             "image_concurrency_limit": profile.image_concurrency_limit,
             "has_proxy": bool(profile.proxy_url),
             "skip_ssl_verify": profile.skip_ssl_verify,
@@ -582,12 +1165,24 @@ class ProxySettingsStore:
             "clearance_mode": profile.clearance_mode,
             "has_clearance_bundle": cached_count > 0,
             "cached_clearance_hosts": sorted(set(cached_hosts)),
+            "flaresolverr_sessions": session_count,
+            "disabled_proxy_nodes": self.node_health_snapshot(),
         }
 
     def should_skip_ssl_verify(self) -> bool:
         return bool(self._get_runtime_settings().get("skip_ssl_verify"))
 
-    def acquire_image_egress(self, profile: ProxyRuntimeProfile) -> int:
+    def acquire_image_egress(
+        self,
+        profile: ProxyRuntimeProfile,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> int:
+        """占用出口并发名额；deadline_monotonic（time.monotonic 口径，<=0/None 表示不限）
+        到期仍没名额则抛 ImageEgressDeadlineError。"""
+        remaining = _deadline_remaining(deadline_monotonic)
+        if remaining is not None and remaining <= 0:
+            raise ImageEgressDeadlineError("image request deadline exceeded before egress acquisition")
         if bool(getattr(profile, "image_egress_reserved", False)):
             return max(0, int(getattr(profile, "image_egress_wait_ms", 0) or 0))
         limit = max(0, int(getattr(profile, "image_concurrency_limit", 0) or 0))
@@ -597,7 +1192,14 @@ class ProxySettingsStore:
         started = time.perf_counter()
         with self._egress_condition:
             while int(self._egress_inflight.get(key, 0)) >= limit:
-                self._egress_condition.wait(timeout=1.0)
+                remaining = _deadline_remaining(deadline_monotonic)
+                if remaining is not None and remaining <= 0:
+                    raise ImageEgressDeadlineError(
+                        "image request deadline exceeded while waiting for egress capacity"
+                    )
+                self._egress_condition.wait(
+                    timeout=min(1.0, remaining) if remaining is not None else 1.0
+                )
             self._egress_inflight[key] = int(self._egress_inflight.get(key, 0)) + 1
         return int((time.perf_counter() - started) * 1000)
 
@@ -656,6 +1258,7 @@ class ProxySettingsStore:
         source: str,
         terminal_when_unresolved: bool,
         reserve_image_egress: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> ResolvedProxyReference:
         raw = _clean(value)
         lower = raw.lower()
@@ -664,19 +1267,27 @@ class ProxySettingsStore:
         if lower == "direct":
             return ResolvedProxyReference(source=f"{source}_direct", terminal=True)
         if lower.startswith("profile:"):
-            proxy = self._resolve_proxy_profile(raw.split(":", 1)[1])
+            profile_item = self._proxy_profile_item(raw.split(":", 1)[1])
+            proxy = _clean(profile_item.get("proxy")) if profile_item else ""
             return ResolvedProxyReference(
                 proxy_url=proxy,
                 source=f"{source}_profile",
                 terminal=bool(proxy) or terminal_when_unresolved,
                 egress_key=_egress_key_for_proxy(proxy),
                 egress_label=f"{source}_profile",
+                locale=locale_from_fields(profile_item) if proxy else None,
             )
         if lower.startswith("group:"):
+            group_ref = _clean(raw.split(":", 1)[1])
             selection = self._resolve_proxy_group(
-                raw.split(":", 1)[1],
+                group_ref,
                 reserve_image_egress=reserve_image_egress,
+                deadline_monotonic=deadline_monotonic,
             )
+            if not selection.proxy_url:
+                raise ProxyReferenceUnavailableError(
+                    f"proxy group is unavailable: {group_ref or '(missing id)'}"
+                )
             return ResolvedProxyReference(
                 proxy_url=selection.proxy_url,
                 source=f"{source}_group",
@@ -689,6 +1300,7 @@ class ProxySettingsStore:
                 image_concurrency_limit=selection.image_concurrency_limit,
                 image_egress_reserved=selection.image_egress_reserved,
                 image_egress_wait_ms=selection.image_egress_wait_ms,
+                locale=selection.locale,
             )
         return ResolvedProxyReference(
             proxy_url=raw,
@@ -699,19 +1311,24 @@ class ProxySettingsStore:
         )
 
     def _resolve_proxy_profile(self, profile_id: object) -> str:
+        profile = self._proxy_profile_item(profile_id)
+        return _clean(profile.get("proxy")) if profile else ""
+
+    def _proxy_profile_item(self, profile_id: object) -> dict | None:
         normalized = _clean(profile_id)
         if not normalized:
-            return ""
+            return None
         for profile in self._config_dict_list("proxy_profiles"):
             if _clean(profile.get("id")) == normalized and profile.get("enabled", True):
-                return _clean(profile.get("proxy"))
-        return ""
+                return profile
+        return None
 
     def _resolve_proxy_group(
         self,
         group_id: object,
         *,
         reserve_image_egress: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> ProxyGroupSelection:
         normalized = _clean(group_id)
         if not normalized:
@@ -727,10 +1344,18 @@ class ProxySettingsStore:
             ]
             if not nodes:
                 return ProxyGroupSelection()
+            # 临时停用的节点不参与选择；整组都停用时照常选，宁可试一次也不让请求无出口可用。
+            healthy = [node for node in nodes if not self.is_proxy_disabled(_clean(node.get("url")))]
+            nodes = healthy or nodes
             started = time.perf_counter()
             indexed_nodes = list(enumerate(nodes))
             with self._egress_condition:
                 while True:
+                    remaining = _deadline_remaining(deadline_monotonic)
+                    if remaining is not None and remaining <= 0:
+                        raise ImageEgressDeadlineError(
+                            "image request deadline exceeded while selecting proxy group capacity"
+                        )
                     available_nodes = [
                         (node_index, node)
                         for node_index, node in indexed_nodes
@@ -755,7 +1380,9 @@ class ProxySettingsStore:
                             key=lambda item: self._proxy_node_load_score(normalized, item[1], item[0]),
                         )
                         return _proxy_group_selection(normalized, selected, selected_index)
-                    self._egress_condition.wait(timeout=1.0)
+                    self._egress_condition.wait(
+                        timeout=min(1.0, remaining) if remaining is not None else 1.0
+                    )
         return ProxyGroupSelection()
 
     def _proxy_node_has_image_capacity(self, group_id: str, node: Mapping[str, object], index: int) -> bool:
@@ -804,14 +1431,21 @@ class ProxySettingsStore:
             expires_at=expires_at,
         )
 
-    def _get_provider(self, flaresolverr_url: str) -> FlareSolverrClearanceProvider:
+    def _get_provider(
+        self,
+        flaresolverr_url: str,
+        profile: ProxyRuntimeProfile | None = None,
+    ) -> FlareSolverrClearanceProvider:
         url = str(flaresolverr_url or "").strip().rstrip("/")
         with self._lock:
             provider = self._provider_cache.get(url)
             if provider is None:
                 provider = self._clearance_provider_factory(url)
                 self._provider_cache[url] = provider
-            return provider
+        configure = getattr(provider, "configure", None)
+        if profile is not None and callable(configure):
+            configure(max_sessions=profile.max_sessions, idle_sec=profile.session_idle_sec)
+        return provider
 
     def _get_flight_lock(self, key: tuple[str, str]) -> threading.Lock:
         with self._lock:
@@ -883,16 +1517,36 @@ def _proxy_group_node_key(group_id: str, node: Mapping[str, object], index: int)
     return f"group:{group_id}:{_proxy_node_id(node, index)}"
 
 
-def _proxy_node_image_concurrency_limit(node: Mapping[str, object]) -> int:
-    for key in ("image_concurrency_limit", "image_concurrency", "max_image_concurrency"):
-        value = node.get(key)
-        if value is None or value == "":
+PROXY_NODE_IMAGE_CONCURRENCY_FIELDS = ("image_concurrency_limit", "image_concurrency", "max_image_concurrency")
+
+
+def _deadline_remaining(deadline_monotonic: float | None) -> float | None:
+    if deadline_monotonic is None or deadline_monotonic <= 0:
+        return None
+    return deadline_monotonic - time.monotonic()
+
+
+def proxy_node_image_concurrency_limit(
+    node: Mapping[str, object],
+    *,
+    fallback: Mapping[str, object] | None = None,
+) -> int:
+    """节点出图并发上限：0 表示不限；上界夹取到 MAX_...；非法值回退默认值。"""
+    for source in (node, fallback):
+        if source is None:
             continue
-        try:
-            return max(0, int(float(value)))
-        except (OverflowError, TypeError, ValueError):
-            return DEFAULT_PROXY_NODE_IMAGE_CONCURRENCY_LIMIT
+        for key in PROXY_NODE_IMAGE_CONCURRENCY_FIELDS:
+            value = source.get(key)
+            if value is None or value == "":
+                continue
+            try:
+                return max(0, min(int(float(value)), MAX_PROXY_NODE_IMAGE_CONCURRENCY_LIMIT))
+            except (OverflowError, TypeError, ValueError):
+                return DEFAULT_PROXY_NODE_IMAGE_CONCURRENCY_LIMIT
     return DEFAULT_PROXY_NODE_IMAGE_CONCURRENCY_LIMIT
+
+
+_proxy_node_image_concurrency_limit = proxy_node_image_concurrency_limit
 
 
 def _proxy_group_selection(group_id: str, node: Mapping[str, object], index: int) -> ProxyGroupSelection:
@@ -903,6 +1557,7 @@ def _proxy_group_selection(group_id: str, node: Mapping[str, object], index: int
         node_id=node_id,
         node_name=_clean(node.get("name")) or node_id,
         image_concurrency_limit=_proxy_node_image_concurrency_limit(node),
+        locale=locale_from_fields(dict(node)),
     )
 
 
@@ -912,6 +1567,15 @@ def _coerce_timeout(value: object) -> float:
     except (OverflowError, TypeError, ValueError):
         timeout = 60.0
     return max(1.0, timeout)
+
+
+def _egress_slot_locale(proxy_url: str) -> LocaleEnv | None:
+    try:
+        from services import egress_slots
+
+        return egress_slots.slot_locale_for_proxy(proxy_url)
+    except Exception:  # noqa: BLE001 - 槽位不可用时回退到全局地区环境
+        return None
 
 
 def _is_valid_proxy_url(url: str) -> bool:
@@ -925,6 +1589,15 @@ def _domain_matches(host: str, domain: str) -> bool:
     if not normalized_domain:
         return True
     return normalized_host == normalized_domain or normalized_host.endswith(f".{normalized_domain}")
+
+
+def _is_clearance_cookie(name: str) -> bool:
+    lowered = str(name or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered in {"cf_clearance", "_cfuvid", "__cf_bm", "__cfruid", "__cfwaitingroom"}:
+        return True
+    return lowered.startswith(("cf_", "__cf", "cf_chl"))
 
 
 def _filter_flaresolverr_cookies(raw_cookies: object, target_host: str) -> dict[str, str]:
@@ -986,11 +1659,141 @@ def _redact_url_credentials(text: str) -> str:
     )
 
 
+_PROXY_NODE_IMPORT_MAX_LINES = 10_000
+_PROXY_NODE_IMPORT_ERRORS = {
+    "proxy node url is required": "地址为空",
+    "proxy node url cannot contain whitespace": "地址不能包含空白字符",
+    "proxy node url must start with http://, https://, socks5://, or socks5h://": (
+        "请填写以 http://、https://、socks5:// 或 socks5h:// 开头的地址，或 host:port:user:pass 简写"
+    ),
+    "proxy node url has an invalid host or port": "代理主机或端口格式无效",
+    "proxy node url uses an unsupported scheme": "仅支持 HTTP、HTTPS 和 SOCKS5 代理",
+    "proxy node url requires a host": "缺少代理主机",
+    "proxy node url has an invalid port": "代理端口格式无效",
+    "proxy node url cannot include a path": "代理地址不能包含路径",
+    "proxy node url cannot include parameters, a query, or a fragment": "代理地址不能包含参数、查询或片段",
+    "proxy node url has an invalid internationalized host": "国际化域名格式无效",
+}
+
+
+def _normalize_import_node_url(value: object) -> tuple[str, str]:
+    """Return ``(canonical_url, error)`` for one imported proxy node address.
+
+    Ported from yukkcat/chatgpt2api (AGPL-3.0-only). Compact ``host:port:user:pass``
+    style inputs are accepted through the shared colon-format helper.
+    """
+    raw = _clean(value)
+    if not raw:
+        return "", "proxy node url is required"
+    if any(char.isspace() for char in raw):
+        return "", "proxy node url cannot contain whitespace"
+    if "://" not in raw:
+        converted = colon_proxy_to_url(raw)
+        if "://" not in converted:
+            return "", "proxy node url must start with http://, https://, socks5://, or socks5h://"
+        raw = converted
+    try:
+        parsed = urlparse(raw)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return "", "proxy node url has an invalid host or port"
+    if parsed.scheme.lower() not in {"http", "https", "socks5", "socks5h", "socks"}:
+        return "", "proxy node url uses an unsupported scheme"
+    if not host:
+        return "", "proxy node url requires a host"
+    if parsed.netloc.endswith(":") or port == 0:
+        return "", "proxy node url has an invalid port"
+    if parsed.path not in {"", "/"}:
+        return "", "proxy node url cannot include a path"
+    if parsed.params or parsed.query or parsed.fragment:
+        return "", "proxy node url cannot include parameters, a query, or a fragment"
+
+    normalized = urlparse(normalize_proxy_url(raw))
+    scheme = normalized.scheme.lower()
+    hostname = (normalized.hostname or "").lower()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    else:
+        try:
+            hostname = hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            return "", "proxy node url has an invalid internationalized host"
+    userinfo = f"{normalized.netloc.rsplit('@', 1)[0]}@" if "@" in normalized.netloc else ""
+    normalized_port = normalized.port
+    if (scheme == "http" and normalized_port == 80) or (scheme == "https" and normalized_port == 443):
+        normalized_port = None
+    port_text = f":{normalized_port}" if normalized_port is not None else ""
+    return f"{scheme}://{userinfo}{hostname}{port_text}", ""
+
+
+def import_proxy_nodes(text: object, existing_urls: object = ()) -> dict[str, object]:
+    """Parse pasted proxy nodes (one per line, optional trailing image concurrency).
+
+    Duplicates (against ``existing_urls`` and inside the pasted text) are counted
+    and dropped; invalid lines are reported with their 1-based line number.
+    """
+    existing: set[str] = set()
+    for value in existing_urls if isinstance(existing_urls, (list, tuple, set)) else ():
+        normalized, error = _normalize_import_node_url(value)
+        if normalized and not error:
+            existing.add(normalized)
+    lines = [
+        (index, value.strip())
+        for index, value in enumerate(str(text or "").splitlines(), start=1)
+        if value.strip()
+    ]
+    if len(lines) > _PROXY_NODE_IMPORT_MAX_LINES:
+        raise ValueError(f"一次最多导入 {_PROXY_NODE_IMPORT_MAX_LINES} 个代理节点")
+    seen: set[str] = set()
+    nodes: list[dict[str, object]] = []
+    invalid: list[dict[str, object]] = []
+    duplicates = 0
+    concurrency_error = "图片并发必须是 0 到 10000 的整数"
+    for index, raw in lines:
+        parts = raw.split()
+        if len(parts) > 2:
+            invalid.append({"line": index, "raw": raw, "reason": "格式应为：代理地址 [图片并发]"})
+            continue
+        limit = DEFAULT_PROXY_NODE_IMAGE_CONCURRENCY_LIMIT
+        if len(parts) == 2:
+            if not parts[1].isdecimal() or int(parts[1]) > 10_000:
+                invalid.append({"line": index, "raw": raw, "reason": concurrency_error})
+                continue
+            limit = int(parts[1])
+        normalized, error = _normalize_import_node_url(parts[0])
+        if error:
+            invalid.append({"line": index, "raw": raw, "reason": _PROXY_NODE_IMPORT_ERRORS.get(error, error)})
+            continue
+        if normalized in existing or normalized in seen:
+            duplicates += 1
+            continue
+        seen.add(normalized)
+        nodes.append({"url": normalized, "image_concurrency_limit": limit})
+    return {
+        "nodes": nodes,
+        "added_count": len(nodes),
+        "duplicate_count": duplicates,
+        "invalid_count": len(invalid),
+        "invalid_items": invalid,
+    }
+
+
 def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
     candidate = normalize_proxy_url(_clean(url))
     proxy_source = "input"
     if not candidate:
-        profile = proxy_settings.get_profile(upstream=True)
+        try:
+            profile = proxy_settings.get_profile(upstream=True)
+        except ProxyReferenceUnavailableError as error:
+            return {
+                "ok": False,
+                "status": 0,
+                "latency_ms": 0,
+                "error": str(error),
+                "proxy_source": proxy_source,
+                "has_proxy": False,
+            }
         candidate = profile.proxy_url
         proxy_source = profile.proxy_source
     result_base = {"proxy_source": proxy_source, "has_proxy": bool(candidate)}

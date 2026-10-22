@@ -389,6 +389,7 @@ class PixProtocolReferenceTest(unittest.TestCase):
             "checkout_session_approval",
             user_agent="fingerprint-user-agent",
             sec_ch_ua="fingerprint-sec-ch-ua",
+            locale=None,
         )
         session.cookies.set.assert_called_once_with(
             "oai-sc",

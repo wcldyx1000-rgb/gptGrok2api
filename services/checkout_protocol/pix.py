@@ -290,6 +290,15 @@ def payment_elements_locale() -> str:
     return os.environ.get("PIX_ELEMENTS_LOCALE", "pt-BR").strip() or "pt-BR"
 
 
+def payment_sentinel_locale() -> Any:
+    """显式配置了 PIX_BROWSER_LOCALE / PIX_BROWSER_TIMEZONE 时给 sentinel 用的 LocaleEnv；未配置返回 None（行为不变）。"""
+    if not (os.environ.get("PIX_BROWSER_LOCALE", "").strip() and os.environ.get("PIX_BROWSER_TIMEZONE", "").strip()):
+        return None
+    from utils.locale_env import LocaleEnv
+
+    return LocaleEnv.from_config({"timezone": payment_browser_timezone(), "language": payment_browser_locale()})
+
+
 def payment_browser_timezone() -> str:
     return os.environ.get("PIX_BROWSER_TIMEZONE", "America/Sao_Paulo").strip() or "America/Sao_Paulo"
 
@@ -2571,6 +2580,7 @@ def warmup_approve_context(
             "checkout_session_approval",
             user_agent=str(fp.get("user-agent") or chatgpt.headers.get("User-Agent") or ""),
             sec_ch_ua=str(fp.get("sec-ch-ua") or chatgpt.headers.get("sec-ch-ua") or ""),
+            locale=payment_sentinel_locale(),
         )
         if not oai_sc:
             raise RuntimeError("Sentinel did not return oai-sc")

@@ -11,7 +11,12 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from api.support import require_admin
-from services.register_service import GrokAccountChatTestError, register_service
+from services.register_service import (
+    GrokAccountChatTestError,
+    OutlookPoolConflict,
+    OutlookPoolNotFound,
+    register_service,
+)
 from services.openai_survival_service import openai_survival_service
 
 
@@ -22,6 +27,8 @@ class RegisterConfigRequest(BaseModel):
     checkout: dict | None = None
     sub2api_sync: dict | None = None
     agent_identity_archive: dict | None = None
+    egress: dict | None = None
+    confirm_refresh_token: bool | None = None
     proxy: str | None = None
     total: int | None = None
     threads: int | None = None
@@ -40,9 +47,18 @@ class OutlookPoolRetryRequest(BaseModel):
     mailbox_ids: list[str] = Field(min_length=1)
 
 
+class OutlookMailboxActionRequest(BaseModel):
+    provider_id: str = Field(min_length=1, max_length=128)
+    mailbox_id: str = Field(min_length=1, max_length=128)
+
+
 class GptMailStatusRequest(BaseModel):
     provider: dict | None = None
     force: bool | None = None
+
+
+class DomainMailSetupRequest(BaseModel):
+    provider_id: str = Field(min_length=1, max_length=128)
 
 
 class OpenAISurvivalConfigRequest(BaseModel):
@@ -88,7 +104,7 @@ def create_router() -> APIRouter:
     @router.get("/api/register")
     async def get_register_config(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"register": register_service.get()}
+        return {"register": register_service.get_public()}
 
     @router.post("/api/register")
     async def update_register_config(body: RegisterConfigRequest, authorization: str | None = Header(default=None)):
@@ -141,6 +157,57 @@ def create_router() -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    def _outlook_pool_error(exc: ValueError) -> HTTPException:
+        if isinstance(exc, OutlookPoolNotFound):
+            return HTTPException(status_code=404, detail=str(exc))
+        if isinstance(exc, OutlookPoolConflict):
+            return HTTPException(status_code=409, detail=str(exc))
+        return HTTPException(status_code=400, detail=str(exc))
+
+    @router.get("/api/register/outlook-pool/entries")
+    async def list_outlook_pool_entries(
+        provider_id: str = Query(min_length=1, max_length=128),
+        q: str = Query(default="", max_length=200),
+        state: str = Query(default="all", max_length=32),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=50, ge=1, le=200),
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(
+                register_service.outlook_pool_entries,
+                provider_id,
+                query=q,
+                state=state,
+                page=page,
+                page_size=page_size,
+            )
+        except ValueError as exc:
+            raise _outlook_pool_error(exc) from exc
+
+    @router.post("/api/register/outlook-pool/mailboxes/reset")
+    async def reset_outlook_pool_mailbox(
+        body: OutlookMailboxActionRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(register_service.reset_outlook_mailbox, body.provider_id, body.mailbox_id)
+        except ValueError as exc:
+            raise _outlook_pool_error(exc) from exc
+
+    @router.post("/api/register/outlook-pool/mailboxes/delete")
+    async def delete_outlook_pool_mailbox(
+        body: OutlookMailboxActionRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(register_service.delete_outlook_mailbox, body.provider_id, body.mailbox_id)
+        except ValueError as exc:
+            raise _outlook_pool_error(exc) from exc
+
     @router.post("/api/register/gptmail/status")
     async def get_gptmail_status(body: GptMailStatusRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -154,6 +221,14 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         try:
             return {"status": register_service.refresh_gptmail_public_key(body.provider, force=body.force is not False)}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/api/register/domain-mail/cf-setup")
+    async def setup_domain_mail_routing(body: DomainMailSetupRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(register_service.domain_mail_cf_setup, body.provider_id)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -391,13 +466,18 @@ def create_router() -> APIRouter:
         )
 
     @router.get("/api/register/events")
-    async def register_events(token: str = ""):
-        require_admin(f"Bearer {token}")
+    async def register_events(
+        token: str = "",
+        authorization: str | None = Header(default=None),
+    ):
+        # 推荐使用 Authorization 头（前端已改为 fetch 流式读取）；
+        # query 的 token 仅为旧客户端兼容保留，密钥会进入访问日志，已不再被前端使用。
+        require_admin(authorization if authorization else f"Bearer {token}")
 
         async def stream():
             last = ""
             while True:
-                payload = json.dumps(register_service.get(), ensure_ascii=False)
+                payload = json.dumps(register_service.get_public(), ensure_ascii=False)
                 if payload != last:
                     last = payload
                     yield f"data: {payload}\n\n"
