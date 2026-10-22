@@ -33,11 +33,28 @@ services:
     restart: unless-stopped
     ports:
       - "${CHATGPT2API_PORT:-3000}:80"
+    stop_grace_period: 40s
+    healthcheck:
+      # 无鉴权 /health 仅返回 {status, version}
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:80/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./config.json:/app/config.json
+      # 可选：启用“管理台一键更新”（受管运行目录）。取消下一行注释并设置 GPTGROK2API_MANAGED_RUNTIME=1，
+      # 应用文件将保存在持久卷中；默认不启用，升级方式仍是拉取新镜像后重建容器。
+      # - gptgrok2api-runtime:/app   # 同时需在文件顶层声明 volumes: { gptgrok2api-runtime: {} }
     environment:
+      # GPTGROK2API_MANAGED_RUNTIME: "1"
       STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
       DATABASE_URL: ${DATABASE_URL:-}
       GIT_REPO_URL: ${GIT_REPO_URL:-}
@@ -47,6 +64,14 @@ services:
       GIT_AUTH_KEYS_FILE_PATH: ${GIT_AUTH_KEYS_FILE_PATH:-auth_keys.json}
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
-      CHATGPT2API_THREAD_TOKENS: ${CHATGPT2API_THREAD_TOKENS:-80}
+      CHATGPT2API_THREAD_TOKENS: ${CHATGPT2API_THREAD_TOKENS:-120}
+      GPTGROK2API_IMAGE_THREAD_TOKENS: ${GPTGROK2API_IMAGE_THREAD_TOKENS:-80}
+      CHATGPT2API_LOGIN_MAX_FAILURES: ${CHATGPT2API_LOGIN_MAX_FAILURES:-10}
+      CHATGPT2API_LOGIN_FAILURE_WINDOW_SECONDS: ${CHATGPT2API_LOGIN_FAILURE_WINDOW_SECONDS:-300}
+      CHATGPT2API_TRUST_PROXY_HEADERS: ${CHATGPT2API_TRUST_PROXY_HEADERS:-0}
+      SQLITE_BUSY_TIMEOUT_SECONDS: ${SQLITE_BUSY_TIMEOUT_SECONDS:-30}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+      DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-20}
+      DATABASE_POOL_TIMEOUT_SECONDS: ${DATABASE_POOL_TIMEOUT_SECONDS:-30}
       ICLOUD_PRIVACY_MAIL_BASE_URL: ${ICLOUD_PRIVACY_MAIL_BASE_URL:-http://icloud-privacy-mail:8787}
       TZ: ${TZ:-Asia/Shanghai}

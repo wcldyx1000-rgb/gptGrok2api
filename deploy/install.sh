@@ -6,12 +6,17 @@ REPO_NAME="${REPO_NAME:-gptGrok2api}"
 BRANCH="${BRANCH:-main}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/chatgpt2api}"
 PORT="${CHATGPT2API_PORT:-${PORT:-3000}}"
-THREAD_TOKENS="${CHATGPT2API_THREAD_TOKENS:-${THREAD_TOKENS:-80}}"
+THREAD_TOKENS="${CHATGPT2API_THREAD_TOKENS:-${THREAD_TOKENS:-120}}"
 MODE="${MODE:-}"
 WITH_WARP="${WITH_WARP:-0}"
 AUTH_KEY="${CHATGPT2API_AUTH_KEY:-${AUTH_KEY:-}}"
 STORAGE_BACKEND="${STORAGE_BACKEND:-json}"
 DATABASE_URL="${DATABASE_URL:-}"
+# Ported from yukkcat/chatgpt2api (AGPL-3.0-only): --database sqlite|postgres-local|postgres-url
+DATABASE_MODE="${DATABASE_MODE:-}"
+POSTGRES_DB="${POSTGRES_DB:-chatgpt2api}"
+POSTGRES_USER="${POSTGRES_USER:-chatgpt2api}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
 INSTALL_LANG="${INSTALL_LANG:-}"
 CHATGPT2API_IMAGE="${CHATGPT2API_IMAGE:-}"
 GIT_REPO_URL="${GIT_REPO_URL:-}"
@@ -38,12 +43,14 @@ EOF
   BRANCH=main
   INSTALL_DIR=/opt/chatgpt2api
   PORT=3000
-  CHATGPT2API_THREAD_TOKENS=80
+  CHATGPT2API_THREAD_TOKENS=120
   MODE=docker|python
   WITH_WARP=0|1
   AUTH_KEY=your-auth-key
   STORAGE_BACKEND=json|sqlite|postgres|git
   DATABASE_URL=postgresql://...
+  DATABASE_MODE=sqlite|postgres-local|postgres-url
+  POSTGRES_PASSWORD=generated-automatically
   INSTALL_LANG=zh|en
   CHATGPT2API_IMAGE=ghcr.io/auucoder/gptgrok2api:latest
   GIT_REPO_URL=your-repository-url
@@ -62,7 +69,9 @@ EOF
   --branch main
   --auth-key your-auth-key
   --storage-backend json|sqlite|postgres|git
+  --database sqlite|postgres-local|postgres-url
   --database-url postgresql://...
+  --postgres-password your-postgres-password
   --git-repo-url your-repository-url
   --git-token ghp_xxx
   --git-branch main
@@ -129,6 +138,7 @@ text() {
       err_unknown_arg) printf 'Unknown argument' ;;
       err_mode) printf 'MODE must be docker or python.' ;;
       err_storage) printf 'STORAGE_BACKEND must be json, sqlite, postgres or git.' ;;
+      err_database) printf 'DATABASE_MODE must be sqlite, postgres-local or postgres-url (postgres-local needs Docker mode).' ;;
       err_port) printf 'PORT must be a number.' ;;
       err_thread_tokens) printf 'CHATGPT2API_THREAD_TOKENS must be a positive number.' ;;
       err_not_git) printf 'exists but is not a git repository.' ;;
@@ -171,6 +181,7 @@ text() {
     err_unknown_arg) printf '未知参数' ;;
     err_mode) printf '运行模式只能是 docker 或 python。' ;;
     err_storage) printf '存储后端只能是 json、sqlite、postgres 或 git。' ;;
+    err_database) printf '数据库模式只能是 sqlite、postgres-local 或 postgres-url（postgres-local 仅支持 Docker 模式）。' ;;
     err_port) printf '端口必须是数字。' ;;
     err_not_git) printf '已存在，但不是 Git 仓库。' ;;
     err_compose) printf '未找到 docker compose 插件，请先安装 Docker Compose v2。' ;;
@@ -248,6 +259,38 @@ normalize_mode_choice() {
     1|d|docker) printf 'docker' ;;
     2|p|py|python) printf 'python' ;;
     *) return 1 ;;
+  esac
+}
+
+normalize_database_mode() {
+  local value="${1:-}"
+  value="${value,,}"
+  value="${value//[[:space:]]/}"
+  case "${value}" in
+    sqlite|sqlite3) printf 'sqlite' ;;
+    postgres-local|postgres_local|local-postgres) printf 'postgres-local' ;;
+    postgres-url|postgres_url|postgres|postgresql|pg) printf 'postgres-url' ;;
+    *) return 1 ;;
+  esac
+}
+
+# 把 --database 映射到 STORAGE_BACKEND；postgres-local 由 docker-compose.postgres.yml 注入 DATABASE_URL。
+apply_database_mode() {
+  [[ -z "${DATABASE_MODE}" ]] && return 0
+  local normalized=""
+  normalized="$(normalize_database_mode "${DATABASE_MODE}")" || { echo "[$(text prefix_error)] $(text err_database)" >&2; exit 1; }
+  DATABASE_MODE="${normalized}"
+  case "${DATABASE_MODE}" in
+    sqlite) STORAGE_BACKEND="sqlite" ;;
+    postgres-url) STORAGE_BACKEND="postgres" ;;
+    postgres-local)
+      STORAGE_BACKEND="postgres"
+      DATABASE_URL=""
+      if [[ "${MODE}" == "python" ]]; then
+        echo "[$(text prefix_error)] $(text err_database)" >&2
+        exit 1
+      fi
+      ;;
   esac
 }
 
@@ -404,8 +447,16 @@ parse_args() {
         STORAGE_BACKEND="${2:-}"
         shift 2
         ;;
+      --database)
+        DATABASE_MODE="${2:-}"
+        shift 2
+        ;;
       --database-url)
         DATABASE_URL="${2:-}"
+        shift 2
+        ;;
+      --postgres-password)
+        POSTGRES_PASSWORD="${2:-}"
         shift 2
         ;;
       --git-repo-url)
@@ -472,7 +523,12 @@ validate_inputs() {
     exit 1
   fi
 
-  if [[ "${STORAGE_BACKEND}" == "postgres" && -z "${DATABASE_URL}" ]]; then
+  if [[ "${DATABASE_MODE}" == "postgres-local" && -n "${POSTGRES_PASSWORD}" && ! "${POSTGRES_PASSWORD}" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+    echo "[$(text prefix_error)] POSTGRES_PASSWORD may only contain letters, digits and . _ ~ - (it is embedded in DATABASE_URL)." >&2
+    exit 1
+  fi
+
+  if [[ "${STORAGE_BACKEND}" == "postgres" && "${DATABASE_MODE}" != "postgres-local" && -z "${DATABASE_URL}" ]]; then
     echo "[$(text prefix_error)] PostgreSQL DATABASE_URL is required." >&2
     exit 1
   fi
@@ -585,12 +641,12 @@ write_default_config_json() {
   "image_account_concurrency": 3,
   "image_parallel_generation": true,
   "image_remove_conversation_after_result": false,
-  "image_poll_interval_secs": 10,
-  "image_poll_initial_wait_secs": 10,
+  "image_poll_interval_secs": 2,
+  "image_poll_initial_wait_secs": 1,
   "image_min_free_mb": 500,
   "image_settle_enabled": false,
   "image_check_before_hit_enabled": false,
-  "image_settle_secs": 2,
+  "image_settle_secs": 1.5,
   "auto_relogin_after_refresh": false,
   "image_timeout_retry_secs": 30
 }
@@ -606,6 +662,10 @@ prepare_docker_bundle() {
   mkdir -p "${INSTALL_DIR}"
   download_file "docker-compose.yml"
   download_optional_file "config.example.yaml"
+
+  if [[ "${DATABASE_MODE}" == "postgres-local" ]]; then
+    download_file "docker-compose.postgres.yml"
+  fi
 
   if [[ "${WITH_WARP}" == "1" ]]; then
     download_file "docker-compose.warp.yml"
@@ -637,9 +697,25 @@ prepare_repo() {
   git clone --branch "${BRANCH}" --depth 1 "$(repo_url)" "${INSTALL_DIR}"
 }
 
+ensure_postgres_password() {
+  [[ "${DATABASE_MODE}" == "postgres-local" ]] || return 0
+  [[ -n "${POSTGRES_PASSWORD}" ]] && return 0
+  # 重复安装时沿用 .env 中已有密码，否则已初始化的数据卷将无法登录。
+  local existing=""
+  if [[ -f "${INSTALL_DIR}/.env" ]]; then
+    existing="$(grep -E '^POSTGRES_PASSWORD=' "${INSTALL_DIR}/.env" | tail -n 1 | cut -d= -f2- || true)"
+  fi
+  if [[ -n "${existing}" ]]; then
+    POSTGRES_PASSWORD="${existing}"
+  else
+    POSTGRES_PASSWORD="$(generate_auth_key)"
+  fi
+}
+
 write_env_file() {
   local env_file="${INSTALL_DIR}/.env"
   local tmp_file="${env_file}.tmp"
+  ensure_postgres_password
 
   cat >"${tmp_file}" <<EOF
 CHATGPT2API_AUTH_KEY=${AUTH_KEY}
@@ -650,6 +726,7 @@ CHATGPT2API_BASE_URL=
 
 STORAGE_BACKEND=${STORAGE_BACKEND}
 DATABASE_URL=${DATABASE_URL}
+$([[ "${DATABASE_MODE}" == "postgres-local" ]] && printf 'POSTGRES_DB=%s\nPOSTGRES_USER=%s\nPOSTGRES_PASSWORD=%s' "${POSTGRES_DB}" "${POSTGRES_USER}" "${POSTGRES_PASSWORD}")
 
 GIT_REPO_URL=${GIT_REPO_URL}
 GIT_TOKEN=${GIT_TOKEN}
@@ -678,6 +755,9 @@ run_docker() {
   local compose_args=(-f docker-compose.yml)
   if [[ "${WITH_WARP}" == "1" ]]; then
     compose_args=(-f docker-compose.warp.yml)
+  fi
+  if [[ "${DATABASE_MODE}" == "postgres-local" ]]; then
+    compose_args+=(-f docker-compose.postgres.yml)
   fi
 
   ui_println "[$(text prefix_info)] $(text info_start_docker)"
@@ -737,8 +817,15 @@ main() {
   THREAD_TOKENS="$(prompt_input "$(text prompt_thread_tokens)" "${THREAD_TOKENS}")"
   INSTALL_DIR="$(prompt_input "$(text prompt_dir)" "${INSTALL_DIR}")"
   BRANCH="$(prompt_input "$(text prompt_branch)" "${BRANCH}")"
-  STORAGE_BACKEND="$(prompt_storage_choice "${STORAGE_BACKEND}")"
-  prompt_storage_details
+  if [[ -n "${DATABASE_MODE}" ]]; then
+    apply_database_mode
+    if [[ "${DATABASE_MODE}" == "postgres-url" && -z "${DATABASE_URL}" ]]; then
+      prompt_storage_details
+    fi
+  else
+    STORAGE_BACKEND="$(prompt_storage_choice "${STORAGE_BACKEND}")"
+    prompt_storage_details
+  fi
 
   if [[ -z "${AUTH_KEY}" || "${AUTH_KEY}" == "your_secret_key_here" ]]; then
     AUTH_KEY="$(generate_auth_key)"

@@ -4,13 +4,47 @@ on:
   push:
     tags:
       - "v*"
+  pull_request:
   workflow_dispatch:
 
 env:
   IMAGE_NAME: gptgrok2api
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Compile Python sources
+        run: python -m compileall -q api app services utils main.py
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-vue/package-lock.json
+
+      - name: Install and build web
+        working-directory: web-vue
+        run: |
+          npm ci
+          npm run build
+
   docker:
+    # PR 只做校验，不构建推送镜像。
+    if: github.event_name != 'pull_request'
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -62,7 +96,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: docker
+    needs: [verify, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -82,3 +116,41 @@ jobs:
               --title "$TAG_NAME" \
               --generate-notes
           fi
+
+  update-bundle:
+    # 在线更新包：仅在发布 Release 后上传，受管运行目录（GPTGROK2API_MANAGED_RUNTIME=1）才会使用。
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build web assets
+        working-directory: web-vue
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build update bundle
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          rm -rf web_dist && cp -r web-vue/dist web_dist
+          python3 scripts/build_update_bundle.py --output update-assets --version "$TAG_NAME"
+
+      - name: Upload update bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG_NAME" update-assets/gptgrok2api-app.tar.gz update-assets/checksums.txt \
+            --repo "$GITHUB_REPOSITORY" --clobber
