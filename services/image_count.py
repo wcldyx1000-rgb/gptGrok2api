@@ -17,8 +17,17 @@ def _n_error(message: str, code: str) -> HTTPException:
     )
 
 
-def parse_image_count(raw_value: object, *, maximum: int = MAX_IMAGE_COUNT) -> int:
-    """解析 n：缺省为 1；必须是 1..maximum 的整数，否则抛 400。"""
+def configured_image_max_n() -> int:
+    """ChatGPT 生图的 n 上限，取设置项 image_max_n（1..10，默认 4）。"""
+    from services.config import config
+
+    return config.image_max_n
+
+
+def parse_image_count(raw_value: object, *, maximum: int | None = None) -> int:
+    """解析 n：缺省为 1；必须是 1..maximum 的整数，否则抛 400。maximum 缺省取设置项 image_max_n。"""
+    if maximum is None:
+        maximum = configured_image_max_n()
     message = f"n must be an integer between {MIN_IMAGE_COUNT} and {maximum}"
     if raw_value is None or raw_value == "":
         return 1

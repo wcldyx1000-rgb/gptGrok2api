@@ -103,6 +103,21 @@ def _safe_relative_path(path: str) -> str:
     return Path(*parts).as_posix()
 
 
+def _image_extension(payload: bytes) -> str:
+    """按文件头给结果图选扩展名：output_format 转换后可能是 JPEG / WebP，其余一律 .png（与历史一致）。"""
+    head = bytes(payload[:12]) if payload else b""
+    if head.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    return ".png"
+
+
+def _content_type_for_rel(rel: str) -> str:
+    suffix = Path(str(rel or "")).suffix.lower()
+    return {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}.get(suffix, "image/png")
+
+
 def _image_dimensions(payload: bytes) -> tuple[int, int] | None:
     try:
         with Image.open(io.BytesIO(payload)) as image:
@@ -182,7 +197,8 @@ class WebDAVClient:
             if response.status_code >= 400:
                 raise ImageStorageError(f"WebDAV MKCOL failed: HTTP {response.status_code}")
 
-    def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
+    def put(self, rel: str, payload: bytes, content_type: str | None = None) -> str:
+        content_type = content_type or _content_type_for_rel(rel)
         self.ensure_dirs(rel)
         url = self.remote_url(rel)
         self._request("PUT", url, data=payload, headers={"Content-Type": content_type})
@@ -377,7 +393,7 @@ class ImageStorageService:
 
     def make_relative_path(self, image_data: bytes) -> str:
         file_hash = hashlib.md5(image_data).hexdigest()
-        filename = f"{int(time.time())}_{file_hash}.png"
+        filename = f"{int(time.time())}_{file_hash}{_image_extension(image_data)}"
         now = beijing_now()
         relative_dir = Path(now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"

@@ -182,6 +182,7 @@ class UpstreamChatModelsCatalogTest(unittest.TestCase):
         for model in ("auto", "gpt-6-t-mini", "gpt-6"):
             self.assertIn(model, catalog["chat_models"])
         self.assertIn("gpt-image-2.5", catalog["image_models"])
+        self.assertIn("gpt-image-2.6", catalog["image_models"])
 
     def test_get_does_not_touch_network(self) -> None:
         with patch.object(model_catalog_service.account_service, "get_text_access_token") as token:

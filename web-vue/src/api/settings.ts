@@ -119,6 +119,7 @@ const SETTINGS_SAVE_KEYS = [
   'image_preflight_fresh_secs',
   'image_account_retry_enabled',
   'image_max_account_attempts',
+  'image_max_n',
   'image_stream_post_tool_wait_secs',
   'image_poll_adaptive',
   'image_warm_enabled',
@@ -196,7 +197,7 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
 
 type PoolTuning = Pick<Settings,
   | 'image_account_cooldown_secs' | 'image_preflight_fresh_secs'
-  | 'image_account_retry_enabled' | 'image_max_account_attempts'
+  | 'image_account_retry_enabled' | 'image_max_account_attempts' | 'image_max_n'
   | 'image_stream_post_tool_wait_secs' | 'image_poll_adaptive' | 'image_warm_enabled'
   | 'chat_sentinel_vm_enabled' | 'chat_temporary_mode' | 'image_stream_direct_resolve' | 'image_drop_extra_variants'
   | 'image_upscale_enabled' | 'image_upscale_engine' | 'account_auto_pause_strikes' | 'account_auto_pause_hours' | 'account_relogin_enabled'
@@ -212,6 +213,7 @@ function normalizePoolTuning(source: RawSettings): Required<PoolTuning> {
     image_preflight_fresh_secs: clampNumber(source.image_preflight_fresh_secs, 600, 0, 3600),
     image_account_retry_enabled: boolValue(source.image_account_retry_enabled, true),
     image_max_account_attempts: clampNumber(source.image_max_account_attempts, 4, 1, 10),
+    image_max_n: clampNumber(source.image_max_n, 4, 1, 10),
     image_stream_post_tool_wait_secs: clampNumber(source.image_stream_post_tool_wait_secs, 45, 0, 120),
     image_poll_adaptive: boolValue(source.image_poll_adaptive, true),
     image_warm_enabled: boolValue(source.image_warm_enabled, true),

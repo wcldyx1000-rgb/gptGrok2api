@@ -5,6 +5,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
+from services.image_output_format import normalize_image_output_format
 from services.image_count import parse_image_count
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request
@@ -20,6 +21,7 @@ class ImageGenerationTaskRequest(BaseModel):
     n: object = 1
     size: str | None = None
     quality: str = "auto"
+    output_format: str | None = None
 
 
 class ResumePollRequest(BaseModel):
@@ -112,6 +114,7 @@ def create_router() -> APIRouter:
                 n=parse_image_count(body.n),
                 size=body.size,
                 quality=body.quality,
+                output_format=normalize_image_output_format(body.output_format),
                 base_url=resolve_image_base_url(request),
             )
         except ImageTaskQueueFullError as exc:
@@ -147,6 +150,7 @@ def create_router() -> APIRouter:
                 n=payload.get("n", 1),
                 size=payload["size"],
                 quality=payload["quality"],
+                output_format=payload.get("output_format"),
                 base_url=resolve_image_base_url(request),
                 images=images,
                 masks=masks,

@@ -30,6 +30,8 @@ export interface ModelCatalogResponse {
   }
   capabilities?: {
     image_upscale?: boolean
+    // 单次生图张数上限（设置项 image_max_n）。
+    image_max_n?: number
     // 支持 2K/4K 高分辨率尺寸的图片模型；Studio 的尺寸预设据此过滤。
     high_resolution_image_models?: string[]
   }

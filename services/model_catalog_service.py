@@ -283,6 +283,7 @@ def get_model_catalog() -> dict[str, Any]:
     }
     capabilities = {
         "image_upscale": bool(settings.get("image_upscale_enabled")),
+        "image_max_n": int(settings.get("image_max_n") or 4),
         "high_resolution_image_models": high_resolution_models,
     }
     source = {"chat": chat_source, "image": image_source, "grok": grok_source}

@@ -673,6 +673,7 @@ SETTINGS_UPDATE_KEYS = {
     "image_account_retry_count",
     "image_account_retry_enabled",
     "image_max_account_attempts",
+    "image_max_n",
     "account_auto_pause_strikes",
     "account_auto_pause_hours",
     "new_account_cooldown_hours",
@@ -970,6 +971,17 @@ class ConfigStore:
             return 4
 
     @property
+    def image_max_n(self) -> int:
+        """Max images one ChatGPT image request may ask for (n), 1..10, default 4.
+
+        Ported from yukkcat/chatgpt2api (AGPL-3.0-only).
+        """
+        try:
+            return min(10, max(1, int(self.data.get("image_max_n") or 4)))
+        except (TypeError, ValueError):
+            return 4
+
+    @property
     def image_account_retry_count(self) -> int:
         """How many times one image may move to another account (attempts - 1); 0 when switching is off."""
         if not self.image_account_retry_enabled:
@@ -1235,6 +1247,7 @@ class ConfigStore:
             data["image_account_retry_enabled"] = self.image_account_retry_enabled
             data["image_max_account_attempts"] = self.image_max_account_attempts
             data["image_account_retry_count"] = self.image_account_retry_count
+            data["image_max_n"] = self.image_max_n
             data["account_auto_pause_strikes"] = self.account_auto_pause_strikes
             data["account_auto_pause_hours"] = self.account_auto_pause_hours
             data["new_account_cooldown_hours"] = self.new_account_cooldown_hours

@@ -1,4 +1,5 @@
 import { computed, ref } from 'vue'
+import { setImageMaxN } from '@/api/imageTasks'
 import { modelsApi } from '@/api/models'
 import type { ModelCatalogResponse, ModelListResponse } from '@/api/models'
 import type { Settings } from '@/types/api'
@@ -30,6 +31,7 @@ function normalizeList(raw: unknown): string[] {
 
 function normalizeCatalog(payload: ModelCatalogResponse | null | undefined): ModelCatalogResponse | null {
   if (!payload) return null
+  if (payload.capabilities?.image_max_n !== undefined) setImageMaxN(payload.capabilities.image_max_n)
   const chatModels = normalizeList(payload.chat_models)
   const imageModels = normalizeList(payload.image_models)
   const imageEditModels = normalizeList(payload.image_edit_models)

@@ -101,7 +101,7 @@ def _image_count(value: object) -> int:
         count = int(value or 1)
     except (TypeError, ValueError):
         count = 1
-    return min(4, max(1, count))
+    return min(config.image_max_n, max(1, count))
 
 
 def _owner_id(identity: dict[str, object]) -> str:
@@ -256,6 +256,7 @@ class ImageTaskService:
         n: int = 1,
         size: str | None = None,
         quality: str = "auto",
+        output_format: str | None = None,
         base_url: str = "",
     ) -> dict[str, Any]:
         payload = {
@@ -264,6 +265,7 @@ class ImageTaskService:
             "n": _image_count(n),
             "size": size,
             "quality": quality,
+            "output_format": output_format,
             "response_format": "url",
             "base_url": base_url,
         }
@@ -279,6 +281,7 @@ class ImageTaskService:
         n: int = 1,
         size: str | None = None,
         quality: str = "auto",
+        output_format: str | None = None,
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
@@ -298,6 +301,7 @@ class ImageTaskService:
             "n": min(2, _image_count(n)) if grok_edit else _image_count(n),
             "size": "1024x1024" if grok_edit else size,
             "quality": quality,
+            "output_format": output_format,
             "response_format": "url",
             "base_url": base_url,
         }
@@ -401,6 +405,7 @@ class ImageTaskService:
                 "n": _image_count(payload.get("n")),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
+                "output_format": _clean(payload.get("output_format")),
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": time.time(),
@@ -911,12 +916,14 @@ class ImageTaskService:
                 task = self._tasks.get(key)
                 quality = _clean(task.get("quality"), "auto") if task else "auto"
                 size = _clean(task.get("size")) if task else None
+                output_format = _clean(task.get("output_format")) if task else ""
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
                 "b64_json",
                 "",
                 int(time.time()),
+                output_format=output_format or None,
             )["data"]
             self._update_task(
                 key,

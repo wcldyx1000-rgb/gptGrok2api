@@ -103,6 +103,8 @@ export interface Settings {
   image_account_retry_count?: number
   image_account_retry_enabled?: boolean
   image_max_account_attempts?: number
+  /** 单次生图请求 n 的上限，1–10，默认 4 */
+  image_max_n?: number
   image_stream_post_tool_wait_secs?: number
   image_poll_adaptive?: boolean
   image_warm_enabled?: boolean

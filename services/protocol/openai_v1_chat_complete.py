@@ -32,6 +32,7 @@ from services.protocol.web_search_tool import (
 )
 from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request
 from services.image_count import parse_image_count
+from services.image_output_format import normalize_image_output_format
 from utils.image_tokens import (
     chat_usage_from_image_usage,
     count_image_inputs_tokens,
@@ -240,11 +241,13 @@ def image_result_content(result: dict[str, Any]) -> str:
 
 def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     model, prompt, n, images, base_url = chat_image_args(body)
+    output_format = normalize_image_output_format(body.get("output_format"))
     result = collect_image_outputs(stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
         response_format="b64_json",
+        output_format=output_format,
         images=encode_images(images) or None,
         base_url=base_url,
         message_as_error=True,
@@ -269,11 +272,13 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
 
 def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     model, prompt, n, images, base_url = chat_image_args(body)
+    output_format = normalize_image_output_format(body.get("output_format"))
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
         response_format="b64_json",
+        output_format=output_format,
         images=encode_images(images) or None,
         base_url=base_url,
         message_as_error=True,

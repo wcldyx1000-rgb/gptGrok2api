@@ -41,6 +41,7 @@ from services.image_failure import (
     text_says_image_quota_exhausted,
     upstream_error_reply_failure,
 )
+from services.image_output_format import convert_image_bytes
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import (
     ImageContentPolicyError,
@@ -620,6 +621,7 @@ def format_image_result(
     message: str = "",
     requested_size: str | None = None,
     deadline_monotonic: float | None = None,
+    output_format: str | None = None,
 ) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     for item in items:
@@ -628,9 +630,10 @@ def format_image_result(
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         image_bytes = base64.b64decode(b64_json)
-        upscaled = upscale_image_if_needed(image_bytes, requested_size)
-        if upscaled is not image_bytes:
-            image_bytes = upscaled
+        # 先放大再转格式：放大会按 PNG 重新编码，转格式放最后才能保证返回的是请求的格式。
+        processed = convert_image_bytes(upscale_image_if_needed(image_bytes, requested_size), output_format)
+        if processed is not image_bytes:
+            image_bytes = processed
             b64_json = base64.b64encode(image_bytes).decode("ascii")
         if deadline_monotonic is None:
             stored_url = save_image_bytes(image_bytes, base_url)
@@ -663,6 +666,8 @@ class ConversationRequest:
     size: str | None = None
     quality: str = "auto"
     response_format: str = "b64_json"
+    # 结果图输出格式 png / jpeg / webp（入口已校验并归一化）；None 表示保持上游原样。
+    output_format: str | None = None
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
@@ -1763,6 +1768,7 @@ def _image_result_output_from_urls(
         request.base_url,
         int(time.time()),
         requested_size=request.size,
+        output_format=request.output_format,
         **({"deadline_monotonic": request.deadline_monotonic} if request.deadline_monotonic > 0 else {}),
     )["data"]
     if not data:
@@ -2096,6 +2102,7 @@ def stream_codex_image_outputs(
         request.base_url,
         int(time.time()),
         requested_size=request.size,
+        output_format=request.output_format,
     )["data"]
     if data:
         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)

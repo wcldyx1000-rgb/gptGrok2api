@@ -94,6 +94,7 @@ type NumberKey =
   | 'image_account_cooldown_secs'
   | 'image_preflight_fresh_secs'
   | 'image_max_account_attempts'
+  | 'image_max_n'
   | 'image_stream_post_tool_wait_secs'
   | 'image_queue_limit'
   | 'account_processing_concurrency'
@@ -157,6 +158,13 @@ const schedulingFields = [
     help: '额度耗尽、429、上游报错回复等可换号的失败，一张图最多依次尝试几个账号（含首次），默认 4，范围 1–10。需先开启下方“生图失败自动换号”；设为 1 等同不换号。',
     fallback: 4,
     control: numberField('image_max_account_attempts', 4, 1, 10),
+  },
+  {
+    key: 'image_max_n',
+    label: '单次最多生图张数',
+    help: '一次图片请求（n 参数）和 Studio 数量按钮允许的最大张数，默认 4，范围 1–10。多张图会分给不同账号生成，调大后单次请求会同时占用更多账号。Grok 图片模型仍按其自身上限 10。',
+    fallback: 4,
+    control: numberField('image_max_n', 4, 1, 10),
   },
   {
     key: 'image_queue_limit',

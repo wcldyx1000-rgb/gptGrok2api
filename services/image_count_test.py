@@ -1,11 +1,26 @@
 import unittest
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
+from services.config import config
 from services.image_count import parse_image_count
 
 
 class ParseImageCountTest(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.dict(config.data, {"image_max_n": 4})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_configured_maximum(self):
+        with patch.dict(config.data, {"image_max_n": 8}):
+            self.assertEqual(parse_image_count(8), 8)
+            self.assertEqual(self.error(9), "n_too_large")
+        for raw, expected in ((0, 4), ("abc", 4), (99, 10), (1, 1)):
+            with patch.dict(config.data, {"image_max_n": raw}):
+                self.assertEqual(config.image_max_n, expected, raw)
+
     def error(self, value, **kwargs):
         with self.assertRaises(HTTPException) as ctx:
             parse_image_count(value, **kwargs)

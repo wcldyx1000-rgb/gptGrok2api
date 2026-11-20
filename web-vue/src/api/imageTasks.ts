@@ -1,3 +1,4 @@
+import { computed, ref } from 'vue'
 import apiClient from './client'
 
 export type ImageTaskStatus = 'queued' | 'running' | 'success' | 'error'
@@ -227,12 +228,17 @@ export const IMAGE_QUALITY_OPTIONS = [
   { label: '高', value: 'high' },
 ]
 
-export const IMAGE_COUNT_OPTIONS = [
-  { label: '1 张', value: 1 },
-  { label: '2 张', value: 2 },
-  { label: '3 张', value: 3 },
-  { label: '4 张', value: 4 },
-]
+// 单次生图张数上限，来自模型目录 capabilities.image_max_n（设置项 image_max_n，1–10，默认 4）。
+export const imageMaxN = ref(4)
+
+export function setImageMaxN(value: unknown) {
+  const count = Math.trunc(Number(value))
+  imageMaxN.value = Number.isFinite(count) && count >= 1 ? Math.min(10, count) : 4
+}
+
+export const IMAGE_COUNT_OPTIONS = computed(() =>
+  Array.from({ length: imageMaxN.value }, (_, index) => ({ label: `${index + 1} 张`, value: index + 1 })),
+)
 
 function cleanString(value: unknown, fallback = '') {
   const text = String(value ?? '').trim()
@@ -241,7 +247,7 @@ function cleanString(value: unknown, fallback = '') {
 
 export function normalizeImageCount(value: unknown) {
   const count = Number.isFinite(Number(value)) ? Math.trunc(Number(value)) : 1
-  return Math.min(4, Math.max(1, count))
+  return Math.min(imageMaxN.value, Math.max(1, count))
 }
 
 function positiveImageDimension(value: unknown) {

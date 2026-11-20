@@ -1,4 +1,5 @@
 import base64
+import binascii
 import hashlib
 import json
 import mimetypes
@@ -19,12 +20,15 @@ from services.proxy_service import proxy_settings
 from utils.log import logger
 from utils.remote_image import fetch_public_image
 
-# 2.5 系列是兼容名，走 ChatGPT Web 的 auto 路由，不强制特定画图引擎。
+# 2.5、2.6 系列是兼容名，走 ChatGPT Web 的 auto 路由，不强制特定画图引擎。
 WEB_IMAGE_MODELS = (
     "gpt-image-2",
     "gpt-image-2.5",
     "gpt-image-2.5-flare",
     "gpt-image-2.5-sunburst",
+    "gpt-image-2.6",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.6-sunburst",
 )
 BASE_IMAGE_MODELS = {*WEB_IMAGE_MODELS, "codex-gpt-image-2"}
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
@@ -717,6 +721,19 @@ def parse_image_count(raw_value: object) -> int:
     return value
 
 
+def _b64_image_mime(b64_json: str) -> str:
+    """按 base64 开头识别结果图类型（output_format 转换后可能是 JPEG / WebP），默认 PNG。"""
+    if b64_json.startswith("/9j/"):
+        return "image/jpeg"
+    if b64_json.startswith("UklGR"):
+        try:
+            if base64.b64decode(b64_json[:16])[8:12] == b"WEBP":
+                return "image/webp"
+        except (ValueError, binascii.Error):
+            pass
+    return "image/png"
+
+
 def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:
     image_items = image_result.get("data") if isinstance(image_result.get("data"), list) else []
     markdown_images: list[str] = []
@@ -729,5 +746,5 @@ def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:
             continue
         b64_json = str(item.get("b64_json") or "").strip()
         if b64_json:
-            markdown_images.append(f"![image_{index}](data:image/png;base64,{b64_json})")
+            markdown_images.append(f"![image_{index}](data:{_b64_image_mime(b64_json)};base64,{b64_json})")
     return "\n\n".join(markdown_images) if markdown_images else "Image generation completed."

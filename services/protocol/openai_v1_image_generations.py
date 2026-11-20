@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
+from services.image_output_format import normalize_image_output_format
 from services.protocol.conversation import (
     ConversationRequest,
     collect_image_outputs,
@@ -19,6 +20,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     n = int(body.get("n") or 1)
     size = body.get("size")
     quality = str(body.get("quality") or "auto")
+    output_format = normalize_image_output_format(body.get("output_format"))
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
@@ -28,6 +30,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         n=n,
         size=size,
         quality=quality,
+        output_format=output_format,
         response_format=stream_response_format(response_format) if body.get("stream") else response_format,
         base_url=base_url,
         message_as_error=True,
