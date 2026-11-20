@@ -186,6 +186,30 @@ def rescue_view(
     }
 
 
+def memory_view(account: dict[str, Any]) -> dict[str, Any]:
+    """官网记忆的处理状态（account_memory_service 写入）：已关闭 / 处理失败 / 待处理。"""
+    disabled_at = timestamp_seconds(account.get("memory_disabled_at"))
+    error = diagnostic(account.get("memory_check_error"), account, 300) or None
+    if disabled_at:
+        code, label = "disabled", "已关闭"
+    elif error:
+        code, label = "failed", "关闭失败"
+    else:
+        code, label = "pending", "待处理"
+    try:
+        cleared = max(0, int(account.get("memory_cleared") or 0))
+    except (TypeError, ValueError):
+        cleared = 0
+    return {
+        "memory_code": code,
+        "memory_label": label,
+        "memory_disabled_at": disabled_at,
+        "memory_cleared": cleared,
+        "memory_check_error": error,
+        "memory_check_error_at": timestamp_seconds(account.get("memory_check_error_at")),
+    }
+
+
 def quota_view(account: dict[str, Any], schedule: dict[str, Any] | None = None) -> dict[str, Any]:
     """额度展示：状态/标签、数值来源（远程同步 / 本地估算）、重置时间及其是否只是“查询时刻 + 24h”。"""
     quota_unknown = bool(account.get("image_quota_unknown"))
@@ -341,6 +365,7 @@ def account_display_fields(
         **lifecycle,
         **rescue_view(account, lifecycle, has_outlook=has_outlook, mail=context.get("mail")),
         **quota_view(account, schedule),
+        **memory_view(account),
         "group_name": group["name"] if group else "",
         "egress": egress,
         "proxy_label": egress["label"],

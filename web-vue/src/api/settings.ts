@@ -137,6 +137,7 @@ const SETTINGS_SAVE_KEYS = [
   'text_account_concurrency',
   'account_failure_cooldown_secs',
   'account_relogin_enabled',
+  'account_memory_auto_disable',
   'account_relogin_interval_secs',
   'account_relogin_concurrency',
   'image_parallel_generation',
@@ -200,7 +201,7 @@ type PoolTuning = Pick<Settings,
   | 'image_account_retry_enabled' | 'image_max_account_attempts' | 'image_max_n'
   | 'image_stream_post_tool_wait_secs' | 'image_poll_adaptive' | 'image_warm_enabled'
   | 'chat_sentinel_vm_enabled' | 'chat_temporary_mode' | 'image_stream_direct_resolve' | 'image_drop_extra_variants'
-  | 'image_upscale_enabled' | 'image_upscale_engine' | 'account_auto_pause_strikes' | 'account_auto_pause_hours' | 'account_relogin_enabled'
+  | 'image_upscale_enabled' | 'image_upscale_engine' | 'account_auto_pause_strikes' | 'account_auto_pause_hours' | 'account_relogin_enabled' | 'account_memory_auto_disable'
   | 'account_relogin_interval_secs' | 'account_relogin_concurrency'
   | 'new_account_cooldown_hours' | 'new_account_ramp_days' | 'new_account_ramp_daily_images'
   | 'text_account_concurrency' | 'account_failure_cooldown_secs'
@@ -231,6 +232,7 @@ function normalizePoolTuning(source: RawSettings): Required<PoolTuning> {
     text_account_concurrency: clampNumber(source.text_account_concurrency, 3, 1, 20),
     account_failure_cooldown_secs: clampNumber(source.account_failure_cooldown_secs, 300, 0, 3600),
     account_relogin_enabled: boolValue(source.account_relogin_enabled, true),
+    account_memory_auto_disable: boolValue(source.account_memory_auto_disable, true),
     account_relogin_interval_secs: clampNumber(source.account_relogin_interval_secs, 300, 60, 3600),
     account_relogin_concurrency: clampNumber(source.account_relogin_concurrency, 1, 1, 4),
     console_request_timeout_secs: clampNumber(source.console_request_timeout_secs, 600, 30, 3600),

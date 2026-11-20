@@ -122,6 +122,7 @@ export interface Settings {
   text_account_concurrency?: number
   account_failure_cooldown_secs?: number
   account_relogin_enabled?: boolean
+  account_memory_auto_disable?: boolean
   account_relogin_interval_secs?: number
   account_relogin_concurrency?: number
   image_parallel_generation?: boolean

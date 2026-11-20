@@ -119,6 +119,28 @@
               </div>
             </dl>
           </section>
+
+          <section v-if="item.memory_label" class="border-t border-border/70 pt-2.5">
+            <div class="mb-1.5 text-[11px] font-semibold text-foreground">官网记忆</div>
+            <dl class="space-y-1">
+              <div class="flex items-start justify-between gap-4">
+                <dt class="text-muted-foreground">状态</dt>
+                <dd class="text-right font-medium" :class="memoryClass">{{ item.memory_label }}</dd>
+              </div>
+              <div v-if="item.memory_disabled_at" class="flex items-start justify-between gap-4">
+                <dt class="text-muted-foreground">关闭时间</dt>
+                <dd class="text-right tabular-nums text-foreground">{{ formatAccountDate(item.memory_disabled_at) }}</dd>
+              </div>
+              <div v-if="item.memory_disabled_at" class="flex items-start justify-between gap-4">
+                <dt class="text-muted-foreground">清空记忆</dt>
+                <dd class="text-right tabular-nums text-foreground">{{ item.memory_cleared || 0 }} 条</dd>
+              </div>
+              <div v-if="item.memory_check_error" class="flex items-start justify-between gap-4">
+                <dt class="shrink-0 text-muted-foreground">失败原因</dt>
+                <dd class="break-words text-right text-foreground">{{ item.memory_check_error }}</dd>
+              </div>
+            </dl>
+          </section>
         </div>
       </template>
     </HoverCard>
@@ -163,4 +185,6 @@ const rescueClass = computed(() => {
   if (tone === 'warning') return 'is-warning'
   return ''
 })
+
+const memoryClass = computed(() => (props.item.memory_code === 'failed' ? 'is-warning' : ''))
 </script>

@@ -682,6 +682,7 @@ SETTINGS_UPDATE_KEYS = {
     "text_account_concurrency",
     "account_failure_cooldown_secs",
     "account_relogin_enabled",
+    "account_memory_auto_disable",
     "account_relogin_interval_secs",
     "account_relogin_concurrency",
     "image_parallel_generation",
@@ -1043,6 +1044,11 @@ class ConfigStore:
         return _normalize_bool(self.data.get("account_relogin_enabled"), True)
 
     @property
+    def account_memory_auto_disable(self) -> bool:
+        """账号入池后自动关闭官网记忆并清空已存记忆（号池共用，避免存下用户提示词）；默认开启。"""
+        return _normalize_bool(self.data.get("account_memory_auto_disable"), True)
+
+    @property
     def account_relogin_interval_secs(self) -> int:
         """自动重新登录的扫描间隔。"""
         try:
@@ -1256,6 +1262,7 @@ class ConfigStore:
             data["text_account_concurrency"] = self.text_account_concurrency
             data["account_failure_cooldown_secs"] = self.account_failure_cooldown_secs
             data["account_relogin_enabled"] = self.account_relogin_enabled
+            data["account_memory_auto_disable"] = self.account_memory_auto_disable
             data["account_relogin_interval_secs"] = self.account_relogin_interval_secs
             data["account_relogin_concurrency"] = self.account_relogin_concurrency
             data["image_parallel_generation"] = self.image_parallel_generation

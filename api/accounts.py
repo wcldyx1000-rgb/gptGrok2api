@@ -1367,6 +1367,7 @@ def create_router() -> APIRouter:
                     )
                 result["added"] = int(result.get("added") or 0) + int(extra_result.get("added") or 0)
                 result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
+                result["merged"] = int(result.get("merged") or 0) + int(extra_result.get("merged") or 0)
         elif target_group_id is None:
             result = account_service.add_accounts(tokens, return_items=body.return_items)
         else:
@@ -1453,6 +1454,8 @@ def create_router() -> APIRouter:
             "parsed": len(payloads),
             "added": int(result.get("added") or 0),
             "skipped": int(result.get("skipped") or 0),
+            # 同一上游账号换了令牌再次导入时并进原记录，不算新增。
+            "merged": int(result.get("merged") or 0),
             "refreshed": refreshed,
             "errors": errors,
             "items": _accounts_for_api(result.get("items", [])) if body.return_items else [],

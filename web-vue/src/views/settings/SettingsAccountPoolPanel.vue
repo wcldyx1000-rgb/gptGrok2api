@@ -78,6 +78,17 @@
         </FormField>
       </div>
     </FormSection>
+
+    <FormSection title="账号记忆">
+      <div class="settings-check-grid settings-check-grid--single">
+        <div class="settings-check-item">
+          <div class="settings-check-control">
+            <Checkbox v-model="settings.account_memory_auto_disable">自动关闭账号的官网记忆并清空已存记忆</Checkbox>
+            <HelpTip text="默认开启。号池账号被很多用户共用，官网记忆开着时，用户的提示词（含生图）会被存进账号记忆。后台会逐个关闭新入池和存量账号的“启用记忆”并清空已存记忆，处理结果显示在账号详情里。请求里带“不要记住”参数实测挡不住写入，只有关掉开关才有效。" />
+          </div>
+        </div>
+      </div>
+    </FormSection>
   </div>
 </template>
 

@@ -220,6 +220,11 @@ class AccountService:
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
         self._backfill_management_ids()
+        try:
+            # 早期按令牌去重时，同一个号换一组令牌再导入会多出一条记录；启动时并掉。
+            self.merge_duplicate_accounts()
+        except Exception:
+            pass
 
     def _get_cumulative_file(self) -> Path:
         storage_path = getattr(self.storage, "file_path", None)
@@ -2987,6 +2992,122 @@ class AccountService:
             for token in tokens
         ], return_items=return_items)
 
+    # 同一个上游账号的凭据字段：合并重复记录时整组取较新的一方。
+    _CREDENTIAL_KEYS = ("refresh_token", "id_token", "session_token", "expired")
+    # 合并时累加的计数字段。
+    _MERGE_SUM_KEYS = ("success", "fail")
+
+    @classmethod
+    def account_identity(cls, access_token: str) -> str:
+        """从 access_token 的 JWT 声明里取上游账号身份：用户 ID + 工作区 ID。
+
+        同一个用户在个人空间和 Team 空间是两个号，所以要连工作区一起比。取不到用户 ID 时返回空串，不参与去重。
+        """
+        payload = cls._decode_jwt_payload(access_token)
+        auth = payload.get("https://api.openai.com/auth")
+        auth = auth if isinstance(auth, dict) else {}
+        user_id = str(auth.get("chatgpt_user_id") or auth.get("user_id") or "").strip()
+        if not user_id:
+            return ""
+        return f"{user_id}|{str(auth.get('chatgpt_account_id') or '').strip()}"
+
+    @classmethod
+    def _token_issued_ts(cls, access_token: str) -> float:
+        issued = cls._token_issued_at(access_token)
+        return issued.timestamp() if issued else 0.0
+
+    @classmethod
+    def _merge_duplicate_records(cls, records: list[tuple[str, dict]]) -> tuple[str, dict]:
+        """把同一个上游账号的多条记录合成一条，返回 (保留的 access_token, 合并后的记录)。
+
+        凭据（AT 及配套的 RT/ID token）取签发时间最新的一条；其余字段以它为准，
+        空字段用其它记录补齐（例如另一条才有的密码、2FA 密钥、邮箱凭据）；成功/失败次数累加；
+        管理 ID 和创建时间取最早创建的那条，账号在列表里的身份不变。
+        """
+        newest_token, newest = max(records, key=lambda pair: cls._token_issued_ts(pair[0]))
+        merged = dict(newest)
+        for token, record in records:
+            if token == newest_token:
+                continue
+            for key, value in record.items():
+                if key in cls._CREDENTIAL_KEYS or key == "access_token":
+                    continue
+                if not cls._has_value(merged.get(key)) and cls._has_value(value):
+                    merged[key] = value
+            if not cls._has_value(merged.get("refresh_token")) and cls._has_value(record.get("refresh_token")):
+                # 较新的一方只有 AT：沿用另一条的 RT，它和 AT 互相独立，仍可续期。
+                merged["refresh_token"] = record.get("refresh_token")
+        for key in cls._MERGE_SUM_KEYS:
+            merged[key] = sum(int(record.get(key) or 0) for _, record in records)
+        oldest = min(
+            (record for _, record in records),
+            key=lambda record: str(record.get("created_at") or "9999"),
+        )
+        if oldest.get("management_id"):
+            merged["management_id"] = oldest["management_id"]
+        if oldest.get("created_at"):
+            merged["created_at"] = oldest["created_at"]
+        merged["access_token"] = newest_token
+        return newest_token, merged
+
+    def _identity_index_locked(self) -> dict[str, str]:
+        index: dict[str, str] = {}
+        for token in self._accounts:
+            identity = self.account_identity(token)
+            if identity:
+                index.setdefault(identity, token)
+        return index
+
+    def _fold_into_existing_locked(self, existing_token: str, incoming_token: str) -> str:
+        """池里已有同一上游账号（existing_token），刚写入的 incoming_token 是它的另一份记录：合并成一条。"""
+        records = [(existing_token, self._accounts[existing_token]), (incoming_token, self._accounts[incoming_token])]
+        keep_token, merged = self._merge_duplicate_records(records)
+        drop_token = incoming_token if keep_token == existing_token else existing_token
+        if keep_token == incoming_token:
+            # 凭据换成了新导入的那组：旧凭据留下的失败痕迹不再适用。
+            self._clear_credential_failure_state_locked(keep_token, merged)
+        account = self._normalize_account(merged)
+        if account is None:
+            return existing_token
+        self._accounts[keep_token] = account
+        self._migrate_token_state_locked(drop_token, keep_token)
+        return keep_token
+
+    def merge_duplicate_accounts(self) -> dict:
+        """把池里属于同一上游账号的多条记录合并（启动时执行一次，也可手动调用）。返回合并的组数与删掉的记录数。"""
+        with self._image_slot_condition:
+            groups: dict[str, list[str]] = {}
+            for token in self._accounts:
+                identity = self.account_identity(token)
+                if identity:
+                    groups.setdefault(identity, []).append(token)
+            duplicate_groups = [tokens for tokens in groups.values() if len(tokens) > 1]
+            if not duplicate_groups:
+                return {"groups": 0, "removed": 0}
+            snapshot = dict(self._accounts)
+            removed = 0
+            for tokens in duplicate_groups:
+                keep_token, merged = self._merge_duplicate_records([(token, self._accounts[token]) for token in tokens])
+                account = self._normalize_account(merged)
+                if account is None:
+                    continue
+                self._accounts[keep_token] = account
+                for token in tokens:
+                    if token != keep_token:
+                        self._migrate_token_state_locked(token, keep_token)
+                        removed += 1
+            try:
+                self._save_accounts()
+            except Exception:
+                self._accounts = snapshot
+                raise
+            self._image_scheduler.prune(self._accounts)
+            self._text_scheduler.prune(self._accounts)
+            self._image_slot_condition.notify_all()
+        log_service.add(LOG_TYPE_ACCOUNT, f"合并重复账号 {len(duplicate_groups)} 组",
+                        {"groups": len(duplicate_groups), "removed": removed})
+        return {"groups": len(duplicate_groups), "removed": removed}
+
     def _add_account_payloads(self, payloads: list[dict], return_items: bool = True) -> dict:
         deduped: dict[str, dict] = {}
         for payload in payloads:
@@ -3004,13 +3125,19 @@ class AccountService:
         with self._lock:
             added = 0
             skipped = 0
+            merged = 0
+            new_tokens: list[str] = []
+            identity_index = self._identity_index_locked()
             for access_token, payload in deduped.items():
                 current = self._accounts.get(access_token)
                 current_is_new = current is None
+                identity = self.account_identity(access_token) if current_is_new else ""
+                duplicate_of = identity_index.get(identity, "") if identity else ""
                 if current is None:
-                    added += 1
-                    self._cumulative_total += 1
-                    self._save_cumulative_total()
+                    if not duplicate_of:
+                        added += 1
+                        self._cumulative_total += 1
+                        self._save_cumulative_total()
                     current = {"created_at": self._now()}
                 else:
                     skipped += 1
@@ -3036,11 +3163,34 @@ class AccountService:
                             access_token, account.get("management_id"), used_ids
                         )
                     self._accounts[access_token] = account
+                    if duplicate_of and duplicate_of in self._accounts:
+                        # 同一上游账号换了一组令牌又导入一次：并进原记录，不另占一个号位。
+                        keep_token = self._fold_into_existing_locked(duplicate_of, access_token)
+                        identity_index[identity] = keep_token
+                        merged += 1
+                    elif current_is_new:
+                        if identity:
+                            identity_index[identity] = access_token
+                        new_tokens.append(access_token)
             self._save_accounts()
+            if merged:
+                self._image_scheduler.prune(self._accounts)
+                self._text_scheduler.prune(self._accounts)
             items = [dict(item) for item in self._accounts.values()] if return_items else []
-            log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
-                            {"added": added, "skipped": skipped})
-        return {"added": added, "skipped": skipped, "items": items}
+            log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，合并 {merged} 个，跳过 {skipped} 个",
+                            {"added": added, "merged": merged, "skipped": skipped})
+        if new_tokens:
+            self._notify_accounts_added(new_tokens)
+        return {"added": added, "merged": merged, "skipped": skipped, "items": items}
+
+    @staticmethod
+    def _notify_accounts_added(tokens: list[str]) -> None:
+        """新账号入池后唤醒记忆关闭服务（失败不影响导入）。"""
+        try:
+            from services.account_memory_service import account_memory_service
+            account_memory_service.wake()
+        except Exception:
+            pass
 
     def delete_accounts(self, tokens: list[str], return_items: bool = True) -> dict:
         target_set = set(token for token in tokens if token)

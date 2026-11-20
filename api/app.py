@@ -37,6 +37,7 @@ from services.config import config
 from services.dashboard_metrics_service import dashboard_metrics_service
 from services.retention_cleanup_service import start_retention_cleanup_scheduler
 from services.account_relogin_service import account_relogin_service
+from services.account_memory_service import account_memory_service
 from services.account_service import account_service
 from services.image_warm_pool import image_warm_pool
 from services.model_catalog_service import upstream_chat_models
@@ -85,6 +86,7 @@ def create_app() -> FastAPI:
             register_service.start_grok_probe_scheduler(stop_event)
             openai_survival_thread = openai_survival_service.start_scheduler(stop_event)
             account_relogin_service.start(stop_event)
+            account_memory_service.start(stop_event)
             try:
                 # 上次进程退出时遗留的 AT 失效待核验账号，重新排进核验，避免一直被挡在调度之外。
                 account_service.resume_pending_auth_verifications()
@@ -124,6 +126,7 @@ def create_app() -> FastAPI:
                 openai_survival_service.stop_scheduler()
                 openai_survival_thread.join(timeout=1)
                 account_relogin_service.stop(timeout=1)
+                account_memory_service.stop(timeout=1)
                 egress_slots.reconciler.stop()
                 free_proxy_scheduler.stop()
                 proxy_settings.shutdown()

@@ -229,6 +229,12 @@ export interface Account {
   has_totp?: boolean
   relogin_failures?: number
   relogin_last_error?: string | null
+  memory_code?: 'disabled' | 'failed' | 'pending'
+  memory_label?: string
+  memory_disabled_at?: number | null
+  memory_cleared?: number
+  memory_check_error?: string | null
+  memory_check_error_at?: number | null
   quota_remaining?: number
   quota_unknown?: boolean
   quota_unlimited?: boolean
@@ -510,6 +516,7 @@ type BackendAccountMutationResponse = {
   items?: BackendAccount[]
   added?: number
   skipped?: number
+  merged?: number
   refreshed?: number
   updated?: number
   removed?: number
@@ -782,6 +789,12 @@ function normalizeAccountDisplay(item: BackendAccount): Partial<Account> {
     has_password: Boolean(item.has_password),
     has_totp: Boolean(item.has_totp),
     relogin_failures: Math.max(0, Number(item.relogin_failures || 0) || 0),
+    memory_code: oneOf(item.memory_code, ['disabled', 'failed', 'pending'] as const),
+    memory_label: cleanString(item.memory_label),
+    memory_disabled_at: optionalTimestamp(item.memory_disabled_at),
+    memory_cleared: Math.max(0, Number(item.memory_cleared || 0) || 0),
+    memory_check_error: cleanString(item.memory_check_error) || null,
+    memory_check_error_at: optionalTimestamp(item.memory_check_error_at),
     relogin_last_error: cleanString(item.relogin_last_error) || null,
     quota_remaining: Math.max(0, Number(item.quota_remaining || 0) || 0),
     quota_unknown: Boolean(item.quota_unknown),
@@ -1305,7 +1318,8 @@ export const accountsApi = {
     return {
       status: 'ok',
       added: Number(response.added || 0),
-      skipped: Number(response.skipped || 0),
+      // 同一上游账号换了令牌再导入时后端并进原记录，前端按“跳过”统计。
+      skipped: Number(response.skipped || 0) + Number(response.merged || 0),
       refreshed: Number(response.refreshed || 0),
       verified: Number(response.verified || 0),
       rejected: Array.isArray(response.rejected) ? response.rejected : [],
@@ -1417,6 +1431,7 @@ export const accountsApi = {
       parsed?: number
       added?: number
       skipped?: number
+      merged?: number
       refreshed?: number
       errors?: BackendAccountMutationResponse['errors']
     }>('/api/accounts/import-sub2api-file', {
@@ -1427,7 +1442,7 @@ export const accountsApi = {
     return {
       parsed: Number(response.parsed || 0),
       added: Number(response.added || 0),
-      skipped: Number(response.skipped || 0),
+      skipped: Number(response.skipped || 0) + Number(response.merged || 0),
       refreshed: Number(response.refreshed || 0),
       errors: mutationErrors(response.errors),
     }

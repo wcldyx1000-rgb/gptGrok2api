@@ -1643,6 +1643,44 @@ class OpenAIBackendAPI:
         except Exception:
             return {}
 
+    # ── 账号记忆（官网“启用记忆”总开关 m3m） ─────────────────────────
+    def _settings_headers(self, path: str) -> Dict[str, str]:
+        return self._headers(path, {
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "Referer": f"{self.base_url}/",
+        })
+
+    def get_memory_state(self, timeout_secs: float = 15.0) -> Dict[str, Any]:
+        """读记忆开关和已保存记忆条数：{"enabled": bool | None, "count": int}。"""
+        path = "/backend-api/settings/user"
+        response = self.session.get(self.base_url + path, headers=self._settings_headers(path), timeout=timeout_secs)
+        ensure_ok(response, path)
+        settings = (response.json() or {}).get("settings") or {}
+        enabled = settings.get("m3m")
+        path = "/backend-api/memories?include_memory_entries=true"
+        response = self.session.get(self.base_url + path, headers=self._settings_headers(path), timeout=timeout_secs)
+        ensure_ok(response, path)
+        memories = (response.json() or {}).get("memories") or []
+        return {"enabled": enabled if isinstance(enabled, bool) else None, "count": len(memories)}
+
+    def disable_memory(self, timeout_secs: float = 15.0) -> Dict[str, Any]:
+        """关闭记忆并清空已保存记忆。
+
+        号池账号被很多下游用户共用，开着记忆会把用户提示词存进账号；请求里带 is_do_not_remember 实测挡不住，
+        只有关掉 m3m 才行。返回 {"was_enabled", "cleared"}。
+        """
+        state = self.get_memory_state(timeout_secs)
+        if state["enabled"] is not False:
+            path = "/backend-api/settings/account_user_setting?feature=m3m&value=false"
+            response = self.session.patch(self.base_url + path, headers=self._settings_headers(path), timeout=timeout_secs)
+            ensure_ok(response, path)
+        if state["count"]:
+            path = "/backend-api/settings/clear_account_user_memory"
+            response = self.session.delete(self.base_url + path, headers=self._settings_headers(path), timeout=timeout_secs)
+            ensure_ok(response, path)
+        return {"was_enabled": state["enabled"] is not False, "cleared": int(state["count"])}
+
     def _list_recent_conversations(self, limit: int = 5, timeout_secs: float = 10.0) -> list[Dict[str, Any]]:
         """列出最近的对话列表，按更新时间倒序。
 
