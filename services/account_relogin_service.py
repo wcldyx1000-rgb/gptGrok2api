@@ -494,6 +494,40 @@ class AccountReloginService:
                 return self._stopped(stop_event)
         return True
 
+    def sweep_dead_accounts(self) -> int:
+        """移除已确认救不回来的账号：RT 被官方作废，且重登用完或没有重登手段。
+
+        “自动移除异常账号”开启时，这类板上钉钉的失效不再等访问令牌过期、被巡检或请求碰到才处理。
+        还有重登机会的账号（relogin_holds）、正在重登的账号和被禁用的账号都不动。
+        """
+        if not config.auto_remove_invalid_accounts:
+            return 0
+        accounts = self.accounts
+        mail = _mail_settings()
+        with self._lock:
+            running = set(self._running)
+        doomed: dict[str, str] = {}
+        for item in accounts.list_accounts():
+            token = _clean(item.get("access_token"))
+            if not token or token in running or not refresh_token_dead(item) or relogin_holds(item, mail):
+                continue
+            doomed[token] = _clean(item.get("relogin_reason") or item.get("last_token_refresh_error")) or "refresh token unavailable"
+        if not doomed:
+            return 0
+        removed = int(accounts.delete_accounts(list(doomed), return_items=False).get("removed") or 0)
+        if removed:
+            from services.log_service import LOG_TYPE_ACCOUNT, log_service
+            from utils.helper import anonymize_token
+
+            for token, reason in doomed.items():
+                log_service.add(LOG_TYPE_ACCOUNT, "自动移除异常账号", {
+                    "source": "relogin_sweep",
+                    "token": anonymize_token(token),
+                    "error": reason[:200],
+                })
+            logger.info({"event": "account_dead_swept", "removed": removed})
+        return removed
+
     def _loop(self, stop_event: threading.Event | None) -> None:
         if self._wait(RELOGIN_STARTUP_DELAY_SECS, stop_event):
             return
@@ -501,6 +535,7 @@ class AccountReloginService:
             try:
                 if config.account_relogin_enabled:
                     self.run_due(stop_event)
+                self.sweep_dead_accounts()
             except Exception as exc:
                 logger.warning({"event": "account_relogin_loop_error", "error": str(exc)[:200]})
             if self._wait(float(config.account_relogin_interval_secs), stop_event):

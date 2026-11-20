@@ -2593,7 +2593,7 @@ class PlatformRegistrar:
         if not factor_id:
             raise RuntimeError("login_mfa_no_factor: 两步验证页没给 TOTP factor id")
         challenge_url = self._continue_url_from(data, None) or f"{auth_base}/mfa-challenge/{factor_id}"
-        last_detail = ""
+        first_detail = ""
         # 当前码优先，失败再试相邻周期的码，容忍时钟误差。
         for attempt, code in enumerate(totp_util.generate_window(secret, spread=1)):
             step(index, "提交两步验证码" + (f"（第 {attempt + 1} 次）" if attempt else ""))
@@ -2611,11 +2611,19 @@ class PlatformRegistrar:
                 if continue_url:
                     step(index, "两步验证通过")
                     return continue_url
-            last_detail = _response_debug_detail(resp)
+            detail = _response_debug_detail(resp)
+            first_detail = first_detail or detail
             err = mfa_data.get("error") if isinstance(mfa_data.get("error"), dict) else {}
-            if status not in (400, 401, 403) and "code" not in str(err.get("code") or "").lower():
+            err_code = str(err.get("code") or "").lower()
+            # 账号被停用：验证码已经对了，换码重试只会把会话作废（invalid_state）并盖掉真实原因。
+            if "account_deactivated" in err_code or _is_openai_account_deactivated_error(detail):
+                raise RuntimeError(f"account_deactivated: 账号已被 OpenAI 停用, detail={detail}")
+            # 会话已作废，再换码也没用。
+            if err_code == "invalid_state":
                 break
-        raise RuntimeError(f"login_mfa_failed: 两步验证没通过（密钥或时钟可能不对）, detail={last_detail}")
+            if status not in (400, 401, 403) and "code" not in err_code:
+                break
+        raise RuntimeError(f"login_mfa_failed: 两步验证没通过, detail={first_detail}")
 
 
 def login_existing_account(email: str, password: str, totp_secret: str = "", *, proxy: str = "", index: int = 1) -> dict:

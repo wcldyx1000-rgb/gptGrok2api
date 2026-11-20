@@ -81,6 +81,10 @@ class FakeAccounts:
         self.items[access_token].update(updates)
         return dict(self.items[access_token])
 
+    def delete_accounts(self, tokens: list[str], return_items: bool = True) -> dict:
+        removed = sum(self.items.pop(token, None) is not None for token in tokens)
+        return {"removed": removed, "items": []}
+
 
 class ConfigOverride:
     def __init__(self, **values) -> None:
@@ -245,6 +249,45 @@ class ReloginServiceTest(unittest.TestCase):
         self.assertFalse(service.relogin({"access_token": "at-old"}))
         self.assertEqual(accounts.get_account("at-old")["relogin_attempts"], relogin.RELOGIN_MAX_FAILURES)
         self.assertEqual(len(accounts.failures), 1)
+
+    def _dead(self, token: str, **overrides) -> dict:
+        base = {
+            "access_token": token,
+            "relogin_needed_at": _ago(3600),
+            "outlook_client_id": "",
+            "outlook_refresh_token": "",
+        }
+        base.update(overrides)
+        return _dead_account(**base)
+
+    def test_sweep_removes_confirmed_dead_accounts_when_switch_on(self) -> None:
+        exhausted = self._dead("at-exhausted", password="pw", relogin_attempts=relogin.RELOGIN_MAX_FAILURES)
+        no_creds = self._dead("at-no-creds")
+        accounts = FakeAccounts([exhausted, no_creds])
+        service = AccountReloginService(accounts=accounts)
+        with ConfigOverride(auto_remove_invalid_accounts=True, account_relogin_enabled=True):
+            self.assertEqual(service.sweep_dead_accounts(), 2)
+        self.assertEqual(accounts.items, {})
+
+    def test_sweep_keeps_accounts_that_can_still_relogin(self) -> None:
+        retriable = self._dead("at-retry", password="pw", relogin_attempts=1)
+        healthy = _dead_account(access_token="at-ok", last_token_refresh_error="")
+        disabled = self._dead("at-off", status="禁用")
+        accounts = FakeAccounts([retriable, healthy, disabled])
+        service = AccountReloginService(accounts=accounts)
+        with ConfigOverride(auto_remove_invalid_accounts=True, account_relogin_enabled=True):
+            self.assertEqual(service.sweep_dead_accounts(), 0)
+        self.assertEqual(set(accounts.items), {"at-retry", "at-ok", "at-off"})
+
+    def test_sweep_does_nothing_when_switch_off_or_account_running(self) -> None:
+        accounts = FakeAccounts([self._dead("at-no-creds")])
+        service = AccountReloginService(accounts=accounts)
+        with ConfigOverride(auto_remove_invalid_accounts=False, account_relogin_enabled=True):
+            self.assertEqual(service.sweep_dead_accounts(), 0)
+        service._running.add("at-no-creds")
+        with ConfigOverride(auto_remove_invalid_accounts=True, account_relogin_enabled=True):
+            self.assertEqual(service.sweep_dead_accounts(), 0)
+        self.assertIn("at-no-creds", accounts.items)
 
     def test_deferred_login_does_not_count_as_failure(self) -> None:
         accounts = FakeAccounts([_dead_account()])

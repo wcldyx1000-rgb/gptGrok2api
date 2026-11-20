@@ -175,6 +175,41 @@ class PlatformRegistrarAuthorizationStepTest(unittest.TestCase):
         self.assertEqual(registrar.last_otp_continue_url, "/about-you")
         registrar._authorize_continue.assert_called_once_with("/about-you", 1)
 
+    def _mfa_page(self) -> dict:
+        return {"page": {"type": "mfa_challenge", "payload": {"factor_id": "f1", "factors": [{"id": "f1", "factor_type": "totp"}]}}}
+
+    def test_login_mfa_deactivated_account_stops_after_first_code(self) -> None:
+        registrar = self._registrar()
+        deactivated = self._response({"error": {"code": "account_deactivated", "message": "deactivated"}}, 403)
+        registrar._post_auth = MagicMock(return_value=(deactivated, ""))
+
+        with self.assertRaises(RuntimeError) as raised:
+            registrar._submit_login_mfa("JBSWY3DPEHPK3PXP", self._mfa_page(), 1)
+
+        self.assertIn("account_deactivated", str(raised.exception))
+        self.assertEqual(registrar._post_auth.call_count, 1)
+
+    def test_login_mfa_wrong_code_tries_adjacent_codes_and_keeps_first_error(self) -> None:
+        registrar = self._registrar()
+        wrong = self._response({"error": {"code": "wrong_email_otp_code", "message": "wrong"}}, 400)
+        registrar._post_auth = MagicMock(return_value=(wrong, ""))
+
+        with self.assertRaises(RuntimeError) as raised:
+            registrar._submit_login_mfa("JBSWY3DPEHPK3PXP", self._mfa_page(), 1)
+
+        self.assertIn("login_mfa_failed", str(raised.exception))
+        self.assertGreater(registrar._post_auth.call_count, 1)
+
+    def test_login_mfa_invalid_state_does_not_retry_other_codes(self) -> None:
+        registrar = self._registrar()
+        stale = self._response({"error": {"code": "invalid_state", "message": "no longer valid"}}, 409)
+        registrar._post_auth = MagicMock(return_value=(stale, ""))
+
+        with self.assertRaises(RuntimeError):
+            registrar._submit_login_mfa("JBSWY3DPEHPK3PXP", self._mfa_page(), 1)
+
+        self.assertEqual(registrar._post_auth.call_count, 1)
+
     def test_authorize_continue_returns_callback_url(self) -> None:
         registrar = self._registrar()
         registrar._navigate_headers = MagicMock(return_value={})
