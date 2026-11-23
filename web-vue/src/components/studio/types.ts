@@ -83,6 +83,8 @@ export interface StudioImageForm {
   size: string
   quality: string
   n: number
+  /** 输出格式：'' 原图，或 png / jpeg / webp / gif。 */
+  outputFormat: string
 }
 
 export interface StudioPreviewImage {

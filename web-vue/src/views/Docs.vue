@@ -148,7 +148,7 @@ const tabs = [
 ]
 
 const primaryChatModel = computed(() => chatModels.value[0] || 'gpt-5-mini')
-const primaryImageModel = computed(() => imageModels.value[0] || 'gpt-image-2')
+const primaryImageModel = computed(() => imageModels.value[0] || 'gpt-image-2.6')
 const primaryImageEditModel = computed(() => imageEditModels.value[0] || primaryImageModel.value)
 
 const chatCompletionExample = computed(() => `curl -X POST "http://localhost:7860/v1/chat/completions" \\

@@ -176,6 +176,22 @@
                     </div>
                   </div>
                   <div class="studio-size-section">
+                    <div class="studio-size-label">格式</div>
+                    <div class="studio-choice-grid is-format">
+                      <Button
+                        v-for="option in IMAGE_OUTPUT_FORMAT_OPTIONS"
+                        :key="option.value || 'original'"
+                        size="sm"
+                        :variant="(imageForm.outputFormat || '') === option.value ? 'primary' : 'outline'"
+                        block
+                        root-class="studio-choice-button"
+                        @click="$emit('update:imageOutputFormat', option.value)"
+                      >
+                        {{ option.label }}
+                      </Button>
+                    </div>
+                  </div>
+                  <div class="studio-size-section">
                     <div class="studio-size-label">数量</div>
                     <div class="studio-choice-grid is-count">
                       <Button
@@ -275,6 +291,7 @@ import StudioToolbarSelectButton from '@/components/studio/StudioToolbarSelectBu
 import {
   DEFAULT_IMAGE_SIZE,
   IMAGE_COUNT_OPTIONS,
+  IMAGE_OUTPUT_FORMAT_OPTIONS,
   IMAGE_QUALITY_OPTIONS,
   formatImageSizeLabel,
   resolveImageSizePresets,
@@ -309,6 +326,7 @@ const emit = defineEmits<{
   'update:imageModel': [model: string]
   'update:imageSize': [size: string]
   'update:imageQuality': [quality: string]
+  'update:imageOutputFormat': [format: string]
   'update:imageCount': [count: number]
   submit: []
   stop: []
@@ -1006,6 +1024,10 @@ onBeforeUnmount(() => {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.studio-choice-grid.is-format {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
 .studio-choice-button {
   min-width: 0;
 }
@@ -1082,6 +1104,10 @@ onBeforeUnmount(() => {
   .studio-choice-grid,
   .studio-choice-grid.is-ratio {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .studio-choice-grid.is-format {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .chat-input {

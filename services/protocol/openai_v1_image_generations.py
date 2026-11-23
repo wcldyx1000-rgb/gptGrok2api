@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
-from services.image_output_format import normalize_image_output_format
+from services.image_output_format import image_output_options
 from services.protocol.conversation import (
     ConversationRequest,
     collect_image_outputs,
@@ -16,11 +16,11 @@ from utils.image_tokens import count_image_output_items_tokens, image_usage
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     prompt = str(body.get("prompt") or "")
-    model = str(body.get("model") or "gpt-image-2")
+    model = str(body.get("model") or "gpt-image-2.6")
     n = int(body.get("n") or 1)
     size = body.get("size")
     quality = str(body.get("quality") or "auto")
-    output_format = normalize_image_output_format(body.get("output_format"))
+    output_options = image_output_options(body)
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
@@ -30,7 +30,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         n=n,
         size=size,
         quality=quality,
-        output_format=output_format,
+        **output_options,
         response_format=stream_response_format(response_format) if body.get("stream") else response_format,
         base_url=base_url,
         message_as_error=True,

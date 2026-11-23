@@ -1,6 +1,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import {
   DEFAULT_IMAGE_MODEL,
+  LEGACY_IMAGE_MODELS,
   DEFAULT_IMAGE_QUALITY,
   DEFAULT_IMAGE_SIZE,
   isImageSizeSupportedByModel,
@@ -18,15 +19,20 @@ export type StudioModelFormRuntimeInput = {
   settingsStore: ReturnType<typeof useSettingsStore>
 }
 
+function currentImageModel(saved: string): string {
+  return !saved || LEGACY_IMAGE_MODELS.includes(saved) ? DEFAULT_IMAGE_MODEL : saved
+}
+
 export function useStudioModelFormRuntime(input: StudioModelFormRuntimeInput) {
   const { chatModels, imageModels, loadModelCatalog } = useModelCatalog(() => input.settingsStore.settings)
   const chatModel = ref(getStringPreference(preferenceKeys.studioChatModel, 'auto') || 'auto')
   const chatReasoningEffort = ref(getStringPreference(preferenceKeys.studioChatReasoningEffort, ''))
   const imageForm = reactive<StudioImageForm>({
-    model: getStringPreference(preferenceKeys.studioImageModel, DEFAULT_IMAGE_MODEL) || DEFAULT_IMAGE_MODEL,
+    model: currentImageModel(getStringPreference(preferenceKeys.studioImageModel, DEFAULT_IMAGE_MODEL)),
     size: DEFAULT_IMAGE_SIZE,
     quality: DEFAULT_IMAGE_QUALITY,
     n: 1,
+    outputFormat: '',
   })
 
   const chatModelOptions = computed(() => uniqueStrings(['auto', ...chatModels.value]))

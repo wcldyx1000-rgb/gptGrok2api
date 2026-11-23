@@ -9,7 +9,7 @@ from typing import Any
 
 from services.account_service import account_service
 from services.config import config
-from utils.helper import CODEX_IMAGE_MODEL, WEB_IMAGE_MODELS
+from utils.helper import CODEX_IMAGE_MODEL, DEFAULT_IMAGE_MODEL, WEB_IMAGE_MODELS
 from utils.log import logger
 
 
@@ -279,7 +279,7 @@ def get_model_catalog() -> dict[str, Any]:
     ]
     defaults = {
         "chat_model": "auto" if "auto" in chat_models else (chat_models[0] if chat_models else ""),
-        "image_model": "gpt-image-2" if "gpt-image-2" in image_models else (image_models[0] if image_models else ""),
+        "image_model": DEFAULT_IMAGE_MODEL if DEFAULT_IMAGE_MODEL in image_models else (image_models[0] if image_models else ""),
     }
     capabilities = {
         "image_upscale": bool(settings.get("image_upscale_enabled")),

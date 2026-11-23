@@ -90,7 +90,7 @@ const openAIBaseUrl = computed(() => `${serviceBaseUrl.value.replace(/\/$/, '')}
 const currentApiKey = computed(() => getAuthToken() || '<当前密钥>')
 const { chatModels, imageModels, imageEditModels, loadModelCatalog } = useModelCatalog(() => props.settings)
 const primaryChatModel = computed(() => chatModels.value.find(model => model !== 'auto') || chatModels.value[0] || 'gpt-5-mini')
-const primaryImageModel = computed(() => imageModels.value[0] || 'gpt-image-2')
+const primaryImageModel = computed(() => imageModels.value[0] || 'gpt-image-2.6')
 const primaryImageEditModel = computed(() => imageEditModels.value[0] || primaryImageModel.value)
 const accessItems = computed(() => [
   { label: '服务地址', value: serviceBaseUrl.value },

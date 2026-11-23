@@ -37,6 +37,9 @@
 | 单次生图张数上限可配置 `image_max_n`，范围 1–10，默认 4；Grok 仍为 10 | `services/config.py`、`services/image_count.py`、`api/ai.py`、`services/image_task_service.py`、设置页"单次最多生图张数" |
 | 输出格式 `output_format`：png、jpeg（jpg 为别名）、webp | `services/image_output_format.py`，生图/编辑/chat/responses 各入口，任务记录，存储扩展名与 WebDAV Content-Type |
 | 聊天 markdown 里的图片按实际格式写 data URI 的 MIME | `utils/helper.py` 的 `_b64_image_mime` |
+| GIF 动图输出：`output_format=gif`，可选 `frame_count`（2–60）、`frame_duration_ms`（20–5000）；提示词附"生成格式为 gif。"由官网直接画动图，网关不放大、不转换、存 `.gif`。未照搬上游的 `gif_models` 白名单（所有网页生图模型名路由相同，白名单没有意义） | `services/image_output_format.py`、`services/protocol/conversation.py` 的 `build_image_prompt` / `format_image_result`、各入口 |
+| 不再列出 `gpt-image-2`（仍接受），默认改为 `gpt-image-2.6` | `utils/helper.py` 的 `DEFAULT_IMAGE_MODEL`、`LEGACY_IMAGE_MODELS` |
+| Studio 生图设置加"格式"选项（原图 / PNG / JPEG / WebP / GIF） | `web-vue/src/components/studio/StudioComposer.vue` |
 
 ## 未补（可做，未排期）
 
@@ -45,7 +48,6 @@
 - 通用的长操作进度抽屉。
 - 请求详情里的细分耗时，以及逐次尝试时间线。
 - 真实联网链路的端到端验证。
-- Studio 里的"输出格式"选择按钮（后端已支持）。
 
 ## 明确不做（已与维护者确认）
 
@@ -55,6 +57,6 @@
 | 参考项目的内部文档本身 | 只吸收其中的经验 |
 | 免费代理源扩展、OpenVPN 网关、按出口限速默认值 | 不需要 |
 | ChatGPT 与 Grok 并行注册、推广弹窗、新的批量注册规避手段 | 不做 |
-| 上游的 GIF/SVG 输出 | 不是生图主路径，价值低 |
+| 上游的静态 SVG 输出 | 不是生图主路径，价值低 |
 | 照搬上游的完整记忆管理界面 | 网关不需要记忆；改为"账号关闭记忆"的轻量方案，见 [chatgpt-web-api.md](chatgpt-web-api.md) |
 | 自定义域名邮箱的测试与前端 | 只保留后端，不推荐启用 |

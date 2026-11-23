@@ -7,7 +7,7 @@ from typing import Any, Iterable, Iterator
 from fastapi import HTTPException
 
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
-from services.image_output_format import normalize_image_output_format
+from services.image_output_format import image_output_options
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
@@ -460,7 +460,7 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     prompt = extract_response_prompt(body.get("input"))
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "input text is required"})
-    model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
+    model = str(body.get("model") or "gpt-image-2.6").strip() or "gpt-image-2.6"
     image_info = extract_response_image(body.get("input"))
     if image_info:
         image_data, mime_type = image_info
@@ -469,13 +469,13 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         images = None
     input_image_tokens = count_image_content_tokens(_input_image_parts(body.get("input")), model)
     tool = response_image_tool(body)
-    output_format = normalize_image_output_format(tool.get("output_format"))
+    output_options = image_output_options(tool)
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         size=tool.get("size"),
         quality=str(tool.get("quality") or "auto"),
-        output_format=output_format,
+        **output_options,
         response_format="b64_json",
         images=images,
         message_as_error=True,

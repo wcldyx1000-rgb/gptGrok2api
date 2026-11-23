@@ -267,7 +267,7 @@ export function buildApiDocItems(
   const cleanServiceBaseUrl = String(serviceBaseUrl || '').replace(/\/$/, '')
   const openAIBaseUrl = `${cleanServiceBaseUrl}/v1`
   const chatModel = models.chat || 'gpt-5-mini'
-  const imageModel = models.image || 'gpt-image-2'
+  const imageModel = models.image || 'gpt-image-2.6'
   const imageEditModel = models.imageEdit || imageModel
   return [
     {

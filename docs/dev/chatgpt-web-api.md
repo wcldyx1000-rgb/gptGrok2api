@@ -47,6 +47,14 @@ access_token 的 JWT 声明 `https://api.openai.com/auth` 里有 `chatgpt_user_i
 
 官网前端会在对话请求里带这个字段；本项目文字请求固定发 `False`（`services/openai_backend_api.py` 的 `_web_conversation_common`）。实测它不影响记忆写入，改成 `True` 没有意义。
 
+## 生图模型名
+
+网页生图的所有模型名（`gpt-image-2.6`、`2.5` 及 `-flare`、`-sunburst` 后缀）在 `_image_model_slug` 里都映射成 `auto` + `picture_v2`，由官网决定画图引擎，**模型名不影响结果**，只是给客户端选的名字。默认 `gpt-image-2.6`（`utils/helper.py` 的 `DEFAULT_IMAGE_MODEL`）。旧名 `gpt-image-2` 自 2026-11-20 起不再列出，但仍接受（`LEGACY_IMAGE_MODELS`）。Codex 生图链路里传给官方 API 的 `"model": "gpt-image-2"` 是真实模型名，不要改。
+
+## GIF 动图——2026-11-20 实测
+
+在生图提示词末尾加上"生成格式为 gif。"（可再加 `frame_count: 8`、`frame_duration_ms: 150` 两行），官网会直接返回多帧 GIF：实测 `gpt-image-2.6`、8 帧，帧数与要求一致。动图是官网画的，不是本地合成的；官网没给 GIF 时网关保留原图，不把单帧图硬转成 GIF。Codex 生图链路不支持。
+
 ## 生图会话残留
 
 生图对话会留在账号历史里。设置 `image_remove_conversation_after_result`（默认关，与上游一致）可在拿到结果后删除该对话，减少账号里累积的用户提示词。

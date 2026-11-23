@@ -36,7 +36,7 @@ from utils.timezone import beijing_datetime_from_timestamp, beijing_now, beijing
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 IMAGE_INDEX_LOCK = Lock()
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 IMAGE_SYNC_MERGE_BATCH_SIZE = 64
 IMAGE_MUTATION_BATCH_SIZE = 16
 IMAGE_ITEM_LOCK_STRIPES = 64
@@ -104,8 +104,10 @@ def _safe_relative_path(path: str) -> str:
 
 
 def _image_extension(payload: bytes) -> str:
-    """按文件头给结果图选扩展名：output_format 转换后可能是 JPEG / WebP，其余一律 .png（与历史一致）。"""
+    """按文件头给结果图选扩展名：可能是 JPEG / WebP / GIF 动图，其余一律 .png（与历史一致）。"""
     head = bytes(payload[:12]) if payload else b""
+    if head[:4] == b"GIF8":
+        return ".gif"
     if head.startswith(b"\xff\xd8\xff"):
         return ".jpg"
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":

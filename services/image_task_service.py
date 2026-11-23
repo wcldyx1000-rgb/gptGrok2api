@@ -257,6 +257,8 @@ class ImageTaskService:
         size: str | None = None,
         quality: str = "auto",
         output_format: str | None = None,
+        frame_count: int | None = None,
+        frame_duration_ms: int | None = None,
         base_url: str = "",
     ) -> dict[str, Any]:
         payload = {
@@ -266,6 +268,8 @@ class ImageTaskService:
             "size": size,
             "quality": quality,
             "output_format": output_format,
+            "frame_count": frame_count,
+            "frame_duration_ms": frame_duration_ms,
             "response_format": "url",
             "base_url": base_url,
         }
@@ -282,12 +286,14 @@ class ImageTaskService:
         size: str | None = None,
         quality: str = "auto",
         output_format: str | None = None,
+        frame_count: int | None = None,
+        frame_duration_ms: int | None = None,
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
         reservation: Any = None,
     ) -> dict[str, Any]:
-        selected_model = _clean(model, "gpt-image-2")
+        selected_model = _clean(model, "gpt-image-2.6")
         spec = _grok_model_spec(selected_model)
         if spec and spec.is_image():
             selected_model = GROK_IMAGE_EDIT_MODEL
@@ -302,6 +308,8 @@ class ImageTaskService:
             "size": "1024x1024" if grok_edit else size,
             "quality": quality,
             "output_format": output_format,
+            "frame_count": frame_count,
+            "frame_duration_ms": frame_duration_ms,
             "response_format": "url",
             "base_url": base_url,
         }
@@ -401,7 +409,7 @@ class ImageTaskService:
                 "owner_id": owner,
                 "status": TASK_STATUS_QUEUED,
                 "mode": mode,
-                "model": _clean(payload.get("model"), "gpt-image-2"),
+                "model": _clean(payload.get("model"), "gpt-image-2.6"),
                 "n": _image_count(payload.get("n")),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
@@ -426,7 +434,7 @@ class ImageTaskService:
                 mode,
                 payload,
                 dict(identity),
-                _clean(payload.get("model"), "gpt-image-2"),
+                _clean(payload.get("model"), "gpt-image-2.6"),
                 on_cancel=lambda exc: self._fail_unstarted_task(key, exc),
             )
             if not committed:
@@ -778,7 +786,7 @@ class ImageTaskService:
                 "owner_id": owner,
                 "status": status,
                 "mode": "edit" if item.get("mode") == "edit" else "generate",
-                "model": _clean(item.get("model"), "gpt-image-2"),
+                "model": _clean(item.get("model"), "gpt-image-2.6"),
                 "n": _image_count(item.get("n")),
                 "size": _clean(item.get("size")),
                 "quality": _clean(item.get("quality"), "auto"),
@@ -853,7 +861,7 @@ class ImageTaskService:
             if not conversation_id:
                 raise ValueError("task has no conversation_id")
             mode = task.get("mode", "generate")
-            model = task.get("model", "gpt-image-2")
+            model = task.get("model", "gpt-image-2.6")
             reservation = self.task_runner.reserve()
             if reservation is None:
                 raise ImageTaskQueueFullError("图片任务队列已满，请稍后再试")

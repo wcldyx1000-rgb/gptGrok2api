@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api import grok
-from services.image_output_format import normalize_image_output_format
+from services.image_output_format import image_output_options
 from services.image_count import parse_image_count
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
@@ -40,11 +40,14 @@ from utils.helper import is_image_chat_request
 
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
-    model: str = "gpt-image-2"
+    model: str = "gpt-image-2.6"
     n: object = 1
     size: str | None = None
     quality: str = "auto"
     output_format: str | None = None
+    # GIF 帧数与每帧时长（毫秒），只在 output_format=gif 时生效。
+    frame_count: int | str | None = None
+    frame_duration_ms: int | str | None = None
     response_format: str = "url"
     history_disabled: bool = True
     stream: bool | None = None
@@ -493,7 +496,7 @@ def create_router() -> APIRouter:
         payload = body.model_dump(mode="python")
         # Grok 图片模型沿用其 1..10 的上限；ChatGPT 图片模型上限取设置项 image_max_n（400 + invalid_n / n_too_large）。
         payload["n"] = parse_image_count(payload.get("n"), maximum=10 if grok.is_grok_model(body.model) else None)
-        payload["output_format"] = normalize_image_output_format(payload.get("output_format"))
+        payload.update(image_output_options(payload))
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         attach_trace_headers(call, request)

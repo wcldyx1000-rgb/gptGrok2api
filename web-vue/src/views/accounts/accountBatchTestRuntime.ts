@@ -12,7 +12,7 @@ const BATCH_TEST_CONCURRENCY = 2
 const REAL_TEST_CONCURRENCY = 1
 
 export const DEFAULT_CHAT_TEST_MODEL = 'auto'
-export const DEFAULT_IMAGE_TEST_MODEL = 'gpt-image-2'
+export const DEFAULT_IMAGE_TEST_MODEL = 'gpt-image-2.6'
 
 export type AccountBatchTestRow = {
   id: string

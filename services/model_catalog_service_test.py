@@ -17,7 +17,16 @@ class ModelCatalogServiceTest(unittest.TestCase):
 
         self.assertTrue({"auto", "gpt-6-t-mini", "gpt-6"}.issubset(catalog["chat_models"]))
         self.assertIn("gpt-6", catalog["all_models"])
-        self.assertIn("gpt-image-2", catalog["image_edit_models"])
+        self.assertIn("gpt-image-2.6", catalog["image_edit_models"])
+        # 旧名 gpt-image-2 不再列出，但仍被接受（见 test_legacy_image_model_still_accepted）。
+        self.assertNotIn("gpt-image-2", catalog["image_models"])
+        self.assertEqual(catalog["defaults"]["image_model"], "gpt-image-2.6")
+
+    def test_legacy_image_model_still_accepted(self) -> None:
+        from utils.helper import is_supported_image_model
+
+        self.assertTrue(is_supported_image_model("gpt-image-2"))
+        self.assertTrue(is_supported_image_model("gpt-image-2.6"))
 
     def test_openai_models_output_includes_gpt_5_6_from_catalog(self) -> None:
         catalog = {

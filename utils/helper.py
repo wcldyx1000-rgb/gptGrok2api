@@ -20,17 +20,20 @@ from services.proxy_service import proxy_settings
 from utils.log import logger
 from utils.remote_image import fetch_public_image
 
-# 2.5、2.6 系列是兼容名，走 ChatGPT Web 的 auto 路由，不强制特定画图引擎。
+# 对外列出的网页生图模型名。它们都走 ChatGPT Web 的 auto + picture_v2 路由，由官网决定画图引擎，
+# 模型名不影响结果；2.6 排第一，作为默认。
 WEB_IMAGE_MODELS = (
-    "gpt-image-2",
-    "gpt-image-2.5",
-    "gpt-image-2.5-flare",
-    "gpt-image-2.5-sunburst",
     "gpt-image-2.6",
     "gpt-image-2.6-flare",
     "gpt-image-2.6-sunburst",
+    "gpt-image-2.5",
+    "gpt-image-2.5-flare",
+    "gpt-image-2.5-sunburst",
 )
-BASE_IMAGE_MODELS = {*WEB_IMAGE_MODELS, "codex-gpt-image-2"}
+DEFAULT_IMAGE_MODEL = "gpt-image-2.6"
+# 不再列出但仍接受的旧名：已配置它的客户端（如 Sub2API）照常可用。
+LEGACY_IMAGE_MODELS = ("gpt-image-2",)
+BASE_IMAGE_MODELS = {*WEB_IMAGE_MODELS, *LEGACY_IMAGE_MODELS, "codex-gpt-image-2"}
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 PREFIXED_CODEX_IMAGE_MODELS = {
@@ -722,7 +725,9 @@ def parse_image_count(raw_value: object) -> int:
 
 
 def _b64_image_mime(b64_json: str) -> str:
-    """按 base64 开头识别结果图类型（output_format 转换后可能是 JPEG / WebP），默认 PNG。"""
+    """按 base64 开头识别结果图类型（可能是 JPEG / WebP / GIF 动图），默认 PNG。"""
+    if b64_json.startswith("R0lGOD"):
+        return "image/gif"
     if b64_json.startswith("/9j/"):
         return "image/jpeg"
     if b64_json.startswith("UklGR"):

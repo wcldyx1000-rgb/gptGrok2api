@@ -121,6 +121,7 @@
         @update:image-model="imageForm.model = $event"
         @update:image-size="imageForm.size = $event"
         @update:image-quality="imageForm.quality = $event"
+        @update:image-output-format="imageForm.outputFormat = $event"
         @update:image-count="imageForm.n = $event"
         @submit="sendMessage"
         @stop="stopStreaming"

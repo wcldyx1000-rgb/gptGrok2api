@@ -97,6 +97,7 @@ export async function createStudioImageTask(input: StudioImageTaskInput): Promis
   const n = normalizeImageCount(input.imageForm.n)
   const size = input.imageForm.size
   const quality = input.imageForm.quality || DEFAULT_IMAGE_QUALITY
+  const outputFormat = input.imageForm.outputFormat || undefined
 
   return input.files.length
     ? imageTasksApi.createEdit({
@@ -106,6 +107,7 @@ export async function createStudioImageTask(input: StudioImageTaskInput): Promis
       n,
       size,
       quality,
+      outputFormat,
     })
     : imageTasksApi.createGeneration({
       prompt: input.prompt,
@@ -113,6 +115,7 @@ export async function createStudioImageTask(input: StudioImageTaskInput): Promis
       n,
       size,
       quality,
+      outputFormat,
     })
 }
 

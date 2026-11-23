@@ -32,7 +32,7 @@ from services.protocol.web_search_tool import (
 )
 from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request
 from services.image_count import parse_image_count
-from services.image_output_format import normalize_image_output_format
+from services.image_output_format import image_output_options
 from utils.image_tokens import (
     chat_usage_from_image_usage,
     count_image_inputs_tokens,
@@ -171,7 +171,7 @@ def chat_messages_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[bytes, str, str]], str | None]:
-    model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
+    model = str(body.get("model") or "gpt-image-2.6").strip() or "gpt-image-2.6"
     prompt = extract_chat_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
@@ -241,13 +241,13 @@ def image_result_content(result: dict[str, Any]) -> str:
 
 def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     model, prompt, n, images, base_url = chat_image_args(body)
-    output_format = normalize_image_output_format(body.get("output_format"))
+    output_options = image_output_options(body)
     result = collect_image_outputs(stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
         response_format="b64_json",
-        output_format=output_format,
+        **output_options,
         images=encode_images(images) or None,
         base_url=base_url,
         message_as_error=True,
@@ -272,13 +272,13 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
 
 def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     model, prompt, n, images, base_url = chat_image_args(body)
-    output_format = normalize_image_output_format(body.get("output_format"))
+    output_options = image_output_options(body)
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
         response_format="b64_json",
-        output_format=output_format,
+        **output_options,
         images=encode_images(images) or None,
         base_url=base_url,
         message_as_error=True,

@@ -13,7 +13,7 @@ from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
-from services.image_output_format import normalize_image_output_format
+from services.image_output_format import image_output_options
 from services.image_count import parse_image_count
 from services.proxy_service import proxy_settings
 from utils.remote_image import fetch_public_image
@@ -73,11 +73,11 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
     payload = {
         "prompt": prompt,
-        "model": _clean(fields.get("model"), "gpt-image-2"),
+        "model": _clean(fields.get("model"), "gpt-image-2.6"),
         "n": _parse_count(fields.get("n")),
         "size": _clean(fields.get("size")) or None,
         "quality": _clean(fields.get("quality"), "auto"),
-        "output_format": normalize_image_output_format(fields.get("output_format")),
+        **image_output_options(fields),
         "response_format": _clean(fields.get("response_format"), "b64_json"),
         "stream": _parse_bool(fields.get("stream")),
     }
@@ -194,7 +194,7 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
 
     form = await request.form()
     fields: dict[str, Any] = {}
-    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "output_format", "response_format", "stream"):
+    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "output_format", "frame_count", "frame_duration_ms", "response_format", "stream"):
         value = form.get(key)
         if isinstance(value, str):
             fields[key] = value

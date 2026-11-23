@@ -86,6 +86,8 @@ export interface CreateGenerationTaskInput {
   n?: number
   size?: string
   quality?: string
+  /** 输出格式：空表示保持上游原样；gif 时由官网直接画动图。 */
+  outputFormat?: string
   clientTaskId?: string
 }
 
@@ -95,7 +97,9 @@ export interface CreateEditTaskInput extends CreateGenerationTaskInput {
   mask?: File
 }
 
-export const DEFAULT_IMAGE_MODEL = 'gpt-image-2'
+export const DEFAULT_IMAGE_MODEL = 'gpt-image-2.6'
+/** 不再列出的旧模型名：读到保存的偏好时换成默认模型。 */
+export const LEGACY_IMAGE_MODELS = ['gpt-image-2']
 export const DEFAULT_IMAGE_QUALITY = 'auto'
 export const DEFAULT_IMAGE_SIZE = 'auto'
 
@@ -220,6 +224,14 @@ export function isImageSizeSupportedByModel(size: string, model: string) {
   if (!size || size === DEFAULT_IMAGE_SIZE) return true
   return resolveImageSizeOptions(model).some((option) => option.value === size)
 }
+
+export const IMAGE_OUTPUT_FORMAT_OPTIONS = [
+  { label: '原图', value: '' },
+  { label: 'PNG', value: 'png' },
+  { label: 'JPEG', value: 'jpeg' },
+  { label: 'WebP', value: 'webp' },
+  { label: 'GIF', value: 'gif' },
+]
 
 export const IMAGE_QUALITY_OPTIONS = [
   { label: '自动', value: 'auto' },
@@ -370,6 +382,7 @@ function createEditForm(input: CreateEditTaskInput) {
   form.append('model', input.model || DEFAULT_IMAGE_MODEL)
   form.append('n', String(normalizeImageCount(input.n)))
   form.append('quality', input.quality || DEFAULT_IMAGE_QUALITY)
+  if (input.outputFormat) form.append('output_format', input.outputFormat)
   const size = requestSize(input.size)
   if (size) form.append('size', size)
 
@@ -474,6 +487,7 @@ export const imageTasksApi = {
       n: normalizeImageCount(input.n),
       size: requestSize(input.size),
       quality: input.quality || DEFAULT_IMAGE_QUALITY,
+      ...(input.outputFormat ? { output_format: input.outputFormat } : {}),
     })
     return normalizeTask(response)
   },

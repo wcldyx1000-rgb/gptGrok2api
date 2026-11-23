@@ -41,7 +41,7 @@ from services.image_failure import (
     text_says_image_quota_exhausted,
     upstream_error_reply_failure,
 )
-from services.image_output_format import convert_image_bytes
+from services.image_output_format import convert_image_bytes, gif_prompt_hints, is_gif_bytes
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import (
     ImageContentPolicyError,
@@ -556,13 +556,24 @@ def assistant_history_messages(messages: list[dict[str, Any]]) -> list[str]:
     return [str(item.get("content") or "") for item in messages if item.get("role") == "assistant" and item.get("content")]
 
 
-def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> str:
+def build_image_prompt(
+    prompt: str,
+    size: str | None,
+    quality: str = "auto",
+    output_format: str | None = None,
+    frame_count: int | None = None,
+    frame_duration_ms: int | None = None,
+) -> str:
     hints = []
     if size:
         hints.append(f"输出图片尺寸为 {size}。")
     if quality:
         hints.append(f"输出图片质量为 {quality}。")
-    return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
+    suffix = "".join(hints)
+    gif_lines = gif_prompt_hints(output_format, frame_count, frame_duration_ms)
+    if gif_lines:
+        suffix += ("\n" if suffix else "") + "\n".join(gif_lines)
+    return f"{prompt.strip()}\n\n{suffix}" if suffix else prompt
 
 
 def encoding_for_model(model: str):
@@ -631,7 +642,9 @@ def format_image_result(
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         image_bytes = base64.b64decode(b64_json)
         # 先放大再转格式：放大会按 PNG 重新编码，转格式放最后才能保证返回的是请求的格式。
-        processed = convert_image_bytes(upscale_image_if_needed(image_bytes, requested_size), output_format)
+        # GIF 动图不放大，否则会被重新编码成单帧 PNG。
+        upscaled = image_bytes if is_gif_bytes(image_bytes) else upscale_image_if_needed(image_bytes, requested_size)
+        processed = convert_image_bytes(upscaled, output_format)
         if processed is not image_bytes:
             image_bytes = processed
             b64_json = base64.b64encode(image_bytes).decode("ascii")
@@ -666,8 +679,11 @@ class ConversationRequest:
     size: str | None = None
     quality: str = "auto"
     response_format: str = "b64_json"
-    # 结果图输出格式 png / jpeg / webp（入口已校验并归一化）；None 表示保持上游原样。
+    # 结果图输出格式 png / jpeg / webp / gif（入口已校验并归一化）；None 表示保持上游原样。
     output_format: str | None = None
+    # GIF 帧数与每帧时长（毫秒），只在 output_format=gif 时附进提示词。
+    frame_count: int | None = None
+    frame_duration_ms: int | None = None
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
@@ -1152,12 +1168,17 @@ def conversation_events(
     size: str | None = None,
     quality: str = "auto",
     thinking_effort: str = "",
+    output_format: str | None = None,
+    frame_count: int | None = None,
+    frame_duration_ms: int | None = None,
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
     history_text = "" if image_model else assistant_history_text(normalized)
     history_messages = [] if image_model else assistant_history_messages(normalized)
-    final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality)) if image_model else prompt
+    final_prompt = prompt_with_global_system(
+        build_image_prompt(prompt, size, quality, output_format, frame_count, frame_duration_ms)
+    ) if image_model else prompt
     payloads = backend.stream_conversation(
         messages=normalized,
         model=model,
@@ -1820,6 +1841,9 @@ def stream_image_outputs(
                 images=request.images or [],
                 size=request.size,
                 quality=request.quality,
+                output_format=request.output_format,
+                frame_count=request.frame_count,
+                frame_duration_ms=request.frame_duration_ms,
         ):
             last = event
             if event.get("type") == "conversation.delta":
